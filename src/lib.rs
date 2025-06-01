@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+#![no_std]
 #![warn(missing_docs, missing_debug_implementations)]
 //! A plenty of utlity for HTTP operation.
 //! # Example
@@ -15,6 +16,9 @@
 //! echo(request).await?;
 //!
 //! ```
+//!
+extern crate alloc;
+
 #[macro_use]
 mod macros;
 
@@ -22,6 +26,7 @@ mod error;
 pub use error::{Error, Result, ResultExt};
 
 mod body;
+
 #[cfg(feature = "fs")]
 pub(crate) mod mime_guess;
 pub use body::Body;
@@ -30,17 +35,12 @@ pub use body::Error as BodyError;
 pub mod middleware;
 pub use middleware::Middleware;
 
-mod endpoint;
+pub mod endpoint;
 pub use endpoint::Endpoint;
-
-mod hook;
-pub use hook::Hook;
-mod app;
-pub use app::App;
 
 mod request;
 pub use request::Request;
 mod response;
 pub use response::Response;
 
-pub use http::{header, method, uri, version, Extensions, Method, StatusCode, Uri, Version};
+pub use http::{Extensions, Method, StatusCode, Uri, Version, header, method, uri, version};

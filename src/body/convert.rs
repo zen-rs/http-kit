@@ -1,28 +1,23 @@
-use std::{borrow::Cow, pin::Pin};
-
+use alloc::{borrow::Cow, boxed::Box, string::String, vec::Vec};
 use bytes::Bytes;
 use bytestr::ByteStr;
+use core::pin::Pin;
 use futures_lite::AsyncBufRead;
 
 use super::{Body, BodyInner};
 
-impl From<Bytes> for Body {
-    fn from(data: Bytes) -> Self {
-        Body::from_bytes(data)
-    }
+macro_rules! from_bytes {
+    ($($ty:ty),*) => {
+        $(
+            impl From<$ty> for Body {
+                fn from(data: $ty) -> Self {
+                    Body::from_bytes(data)
+                }
+            }
+        )*
+    };
 }
-
-impl From<Vec<u8>> for Body {
-    fn from(data: Vec<u8>) -> Self {
-        Body::from_bytes(data)
-    }
-}
-
-impl From<Box<[u8]>> for Body {
-    fn from(data: Box<[u8]>) -> Self {
-        Body::from_bytes(data)
-    }
-}
+from_bytes!(Bytes, Vec<u8>, Box<[u8]>, ByteStr, String);
 
 impl<'a> From<Cow<'a, [u8]>> for Body {
     fn from(data: Cow<[u8]>) -> Self {
@@ -33,18 +28,6 @@ impl<'a> From<Cow<'a, [u8]>> for Body {
 impl From<&[u8]> for Body {
     fn from(data: &[u8]) -> Self {
         Body::from_bytes(data.to_vec())
-    }
-}
-
-impl From<ByteStr> for Body {
-    fn from(data: ByteStr) -> Self {
-        Body::from_bytes(data)
-    }
-}
-
-impl From<String> for Body {
-    fn from(data: String) -> Self {
-        data.into_bytes().into()
     }
 }
 

@@ -1,10 +1,45 @@
-use std::fmt::Debug;
+//! A HTTP response.
+//!
+//! This module provides the [`Response`] type which represents an HTTP response including
+//! headers, status code, version, and body. It offers comprehensive methods for:
+//!
+//! - Creating responses with different body types
+//! - Manipulating headers and status codes
+//! - Handling body content in various formats (bytes, string, JSON, form data)
+//! - Managing HTTP extensions
+//! - Setting MIME types and content type headers
+//!
+//! The [`Response`] type implements conversions from common body types like `String`, `Vec<u8>`,
+//! `Bytes` etc. It also integrates with the `http` crate's types.
+//!
+//! # Examples
+//!
+//! ```
+//! # use http_kit::{Response, StatusCode};
+//! let mut response = Response::new(StatusCode::OK, "Hello World!");
+//! response.set_status(StatusCode::CREATED);
+//! response.insert_header("X-Custom", "value");
+//! ```
+//!
+//! JSON responses (requires `json` feature):
+//!
+//! ```
+//! # use http_kit::Response;
+//! # use serde::Serialize;
+//! #[derive(Serialize)]
+//! struct User { name: String }
+//!
+//! let user = User { name: "Alice".into() };
+//! let response = Response::empty().json(&user)?;
+//! ```
+use core::fmt::Debug;
 
+use crate::{Body, BodyError, body::BodyFrozen};
+use alloc::string::String;
+use alloc::vec::Vec;
 use bytes::Bytes;
 use bytestr::ByteStr;
-use http::{header::HeaderName, Extensions, HeaderMap, HeaderValue, StatusCode, Version};
-
-use crate::{body::BodyFrozen, Body, BodyError};
+use http::{Extensions, HeaderMap, HeaderValue, StatusCode, Version, header::HeaderName};
 
 /// The HTTP response parts.
 pub type ResponseParts = http::response::Parts;
@@ -65,51 +100,51 @@ impl Response {
         self.parts.status
     }
     /// Return the mutable reference of status code.
-
     pub fn status_mut(&mut self) -> &mut StatusCode {
         &mut self.parts.status
     }
+
     /// Set the status code.
     pub fn set_status(&mut self, status: StatusCode) {
         *self.status_mut() = status;
     }
-    /// Return the HTTP version.
 
+    /// Return the HTTP version.
     pub const fn version(&self) -> Version {
         self.parts.version
     }
-    /// Return the mutable reference of HTTP version.
 
+    /// Return the mutable reference of HTTP version.
     pub fn version_mut(&mut self) -> &mut Version {
         &mut self.parts.version
     }
-    /// Set the HTTP version by `version`
 
+    /// Set the HTTP version by `version`
     pub fn set_version(&mut self, version: Version) {
         *self.version_mut() = version;
     }
-    /// Return the reference of the HTTP header.
 
+    /// Return the reference of the HTTP header.
     pub const fn headers(&self) -> &HeaderMap {
         &self.parts.headers
     }
-    /// Return the mutable reference of the HTTP header.
 
+    /// Return the mutable reference of the HTTP header.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.parts.headers
     }
-    /// Acquire the first value of header by header name.
 
+    /// Acquire the first value of header by header name.
     pub fn get_header(&self, name: HeaderName) -> Option<&HeaderValue> {
         self.headers().get(name)
     }
-    /// Append a header,the previous header (if exists) wouldn't be removed.
 
+    /// Append a header,the previous header (if exists) wouldn't be removed.
     pub fn append_header(&mut self, name: HeaderName, value: HeaderValue) {
         self.headers_mut().append(name, value);
     }
-    /// Insert a header,if the header already exists,the previous header will be removed.
 
+    /// Insert a header,if the header already exists,the previous header will be removed.
     pub fn insert_header(&mut self, name: HeaderName, value: HeaderValue) -> Option<HeaderValue> {
         self.headers_mut().insert(name, value)
     }
@@ -125,17 +160,16 @@ impl Response {
     }
 
     /// Return the reference of the extension.
-
     pub const fn extensions(&self) -> &Extensions {
         &self.parts.extensions
     }
-    /// Return the mutable reference of the extension.
 
+    /// Return the mutable reference of the extension.
     pub fn extensions_mut(&mut self) -> &mut Extensions {
         &mut self.parts.extensions
     }
-    /// Returns a refernece of associated extension.
 
+    /// Returns a refernece of associated extension.
     pub fn get_extension<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.extensions().get()
     }
@@ -144,14 +178,17 @@ impl Response {
     pub fn get_mut_extension<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
         self.extensions_mut().get_mut()
     }
-    /// Remove a type from extensions.
 
+    /// Remove a type from extensions.
     pub fn remove_extension<T: Send + Sync + 'static>(&mut self) -> Option<T> {
         self.extensions_mut().remove()
     }
-    /// Insert a type into extensions,if the type already exists,the old value will be returned.
 
-    pub fn insert_extension<T: Send + Sync + 'static>(&mut self, extension: T) -> Option<T> {
+    /// Insert a type into extensions,if the type already exists,the old value will be returned.
+    pub fn insert_extension<T: Send + Sync + Clone + 'static>(
+        &mut self,
+        extension: T,
+    ) -> Option<T> {
         self.extensions_mut().insert(extension)
     }
 
@@ -159,8 +196,8 @@ impl Response {
     pub fn take_body(&mut self) -> Result<Body, BodyFrozen> {
         self.body.take()
     }
-    /// Replace the value of the response body and return the old body.
 
+    /// Replace the value of the response body and return the old body.
     pub fn replace_body(&mut self, body: impl Into<Body>) -> Body {
         self.body.replace(body.into())
     }
@@ -196,8 +233,11 @@ impl Response {
     /// Set the body from a file.
     /// This method will try to guess MIME by the extension of file.
     #[cfg(feature = "fs")]
-    pub async fn file(mut self, path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
-        use std::os::unix::ffi::OsStrExt;
+    pub async fn file(
+        mut self,
+        path: impl AsRef<core::path::Path>,
+    ) -> Result<Self, core::io::Error> {
+        use core::os::unix::ffi::OsStrExt;
 
         let path = path.as_ref();
         let extension = path.extension().unwrap_or_default().as_bytes();
@@ -277,7 +317,7 @@ impl Response {
     #[cfg(feature = "mime")]
     pub fn get_mime(&self) -> Option<mime::Mime> {
         Some(
-            std::str::from_utf8(self.get_header(http::header::CONTENT_TYPE)?.as_bytes())
+            core::str::from_utf8(self.get_header(http::header::CONTENT_TYPE)?.as_bytes())
                 .ok()?
                 .parse()
                 .ok()?,

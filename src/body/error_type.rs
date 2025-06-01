@@ -1,15 +1,18 @@
-use super::{BodyFrozen, BoxStdError};
-use std::error::Error as StdError;
-use std::fmt::Display;
-use std::io;
-use std::str::Utf8Error;
+#[cfg(feature = "std")]
+extern crate std;
+
+use super::{BodyFrozen, BoxcoreError};
+use core::error::Error as coreError;
+use core::fmt::Display;
+use core::str::Utf8Error;
 
 /// Error type around `Body`.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
     /// An Error caused by a inner I/O error.
-    Io(io::Error),
+    #[cfg(feature = "std")]
+    Io(std::io::Error),
     /// The inner object provides a illgal UTF-8 chunk.
     Utf8(Utf8Error),
     /// The body has been consumed and can not provide data anymore.It is distinguished from a normal empty body.
@@ -24,7 +27,7 @@ pub enum Error {
     /// Fail to deserialize a form to object.
     DeserializeForm(serde_urlencoded::de::Error),
     /// Other inner error.
-    Other(BoxStdError),
+    Other(BoxcoreError),
 }
 
 macro_rules! impl_body_error {
@@ -39,7 +42,7 @@ macro_rules! impl_body_error {
         )*
 
         impl Display for Error {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 match self {
                     $(
                         $(#[cfg(feature = $feature)])*
@@ -50,8 +53,8 @@ macro_rules! impl_body_error {
             }
         }
 
-        impl StdError for Error {
-            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        impl coreError for Error {
+            fn source(&self) -> Option<&(dyn coreError + 'static)> {
                 match self {
                     $(
                         $(#[cfg(feature = $feature)])*
@@ -65,10 +68,20 @@ macro_rules! impl_body_error {
     };
 }
 
+#[cfg(feature = "std")]
 impl_body_error![
-    (Io, io::Error),
+    (Io, std::io::Error),
     (Utf8, Utf8Error),
-    (Other, BoxStdError),
+    (Other, BoxcoreError),
+    (JsonError, serde_json::Error, "json"),
+    (SerializeForm, serde_urlencoded::ser::Error, "form"),
+    (DeserializeForm, serde_urlencoded::de::Error, "form")
+];
+
+#[cfg(not(feature = "std"))]
+impl_body_error![
+    (Utf8, Utf8Error),
+    (Other, BoxcoreError),
     (JsonError, serde_json::Error, "json"),
     (SerializeForm, serde_urlencoded::ser::Error, "form"),
     (DeserializeForm, serde_urlencoded::de::Error, "form")

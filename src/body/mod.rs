@@ -1,8 +1,39 @@
+//! HTTP request/response body.
+//!
+//! This module provides a flexible body type that can represent HTTP request and response bodies.
+//! The body can hold data in different forms:
+//!
+//! - Bytes: For simple in-memory bodies
+//! - AsyncReader: For streaming from files or other sources
+//! - Stream: For general async streaming data
+//!
+//! The body type also provides convenient methods for working with common formats like:
+//!
+//! - JSON (with `json` feature)
+//! - URL-encoded forms (with `form` feature)
+//! - Files (with `fs` feature)
+//!
+//! # Examples
+//!
+//! ```rust
+//! use http_kit::Body;
+//!
+//! // Create empty body
+//! let empty = Body::empty();
+//!
+//! // Create from bytes
+//! let bytes = Body::from_bytes("Hello world!");
+//!
+//! // Create from file
+//! let file = Body::from_file("index.html").await?;
+//!
+//! // Create from JSON
+//! let json = Body::from_json(&my_struct)?;
 mod convert;
 mod error_type;
 mod utils;
 pub use error_type::Error;
-use futures_lite::{ready, Stream, StreamExt};
+use futures_lite::{Stream, StreamExt, ready};
 
 use self::utils::IntoAsyncRead;
 use bytestr::ByteStr;
@@ -10,14 +41,15 @@ use bytestr::ByteStr;
 use bytes::Bytes;
 use futures_lite::{AsyncBufRead, AsyncBufReadExt};
 
-use std::fmt::Debug;
-use std::mem::{replace, swap, take};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-type BoxStdError = Box<dyn std::error::Error + Send + Sync + 'static>;
+use alloc::{boxed::Box, vec::Vec};
+use core::fmt::Debug;
+use core::mem::{replace, swap, take};
+use core::pin::Pin;
+use core::task::{Context, Poll};
+type BoxcoreError = Box<dyn core::error::Error + Send + Sync + 'static>;
 
 // A boxed steam object.
-type BoxStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxStdError>> + Send + Sync + 'static>>;
+type BoxStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxcoreError>> + Send + Sync + 'static>>;
 
 // A boxed bufreader object.
 type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>;
@@ -31,7 +63,7 @@ pub struct Body {
 }
 
 impl Debug for Body {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Body")
     }
 }
@@ -77,8 +109,8 @@ impl Body {
     /// from a file or any other source that implements the `AsyncBufRead` trait.
     /// #Example
     /// ```rust
-    /// use async_std::fs::File;
-    /// use async_std::io::BufReader;
+    /// use async_core::fs::File;
+    /// use async_core::io::BufReader;
     /// use http_util::Body;
     /// let file = BufReader::new(File::open("index.html").await?);
     /// Body::from_reader(file,file.metadata().await?.len())
@@ -99,7 +131,7 @@ impl Body {
     pub fn from_stream<T, E, S>(stream: S) -> Self
     where
         T: Into<Bytes> + Send + 'static,
-        E: Into<BoxStdError>,
+        E: Into<BoxcoreError>,
         S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
     {
         Self {
@@ -117,7 +149,7 @@ impl Body {
 
     /// Create a body from a file.
     #[cfg(feature = "fs")]
-    pub async fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
+    pub async fn from_file(path: impl AsRef<core::path::Path>) -> Result<Self, core::io::Error> {
         let file = async_fs::File::open(path).await?;
         let len = file.metadata().await?.len() as usize;
         Ok(Self::from_reader(
@@ -150,11 +182,7 @@ impl Body {
     /// Returns true if `Body` has a length of zero bytes.
     pub const fn is_empty(&self) -> Option<bool> {
         if let Some(len) = self.len() {
-            if len == 0 {
-                Some(true)
-            } else {
-                Some(false)
-            }
+            if len == 0 { Some(true) } else { Some(false) }
         } else {
             None
         }
@@ -223,7 +251,7 @@ impl Body {
     /// Prepare a chunk of bytes in the inner representation, then return a string slice.
     pub async fn as_str(&mut self) -> Result<&str, Error> {
         let data = self.as_bytes().await?;
-        Ok(std::str::from_utf8(data)?)
+        Ok(core::str::from_utf8(data)?)
     }
 
     /// Prepare data in the inner representation,then try to read the body as JSON.
@@ -292,7 +320,7 @@ impl Default for Body {
 }
 
 impl Stream for Body {
-    type Item = Result<Bytes, BoxStdError>;
+    type Item = Result<Bytes, BoxcoreError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match &mut self.inner {
@@ -334,7 +362,7 @@ impl Stream for Body {
 impl HttpBody for Body {
     type Data = Bytes;
 
-    type Error = BoxStdError;
+    type Error = BoxcoreError;
 
     fn poll_data(
         self: Pin<&mut Self>,

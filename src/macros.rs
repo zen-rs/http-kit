@@ -12,13 +12,13 @@ macro_rules! impl_error {
             }
         }
 
-        impl std::fmt::Display for $ty {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        impl core::fmt::Display for $ty {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 f.write_str($message)
             }
         }
 
-        impl std::error::Error for $ty {}
+        impl core::error::Error for $ty {}
     };
 }
 

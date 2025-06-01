@@ -1,109 +1,135 @@
-//! Middleware allows you modify and read request or response during the request handling process.
+//! Middleware functionality for HTTP request and response processing.
 //!
-//! # Example
+//! This module provides the core infrastructure for implementing middleware in the HTTP processing
+//! pipeline. Middleware allows you to modify or inspect HTTP requests and responses during processing,
+//! enabling functionality like:
+//!
+//! - Request/response logging
+//! - Authentication and authorization
+//! - Request timeouts
+//! - Response compression
+//! - Custom headers
+//! - Request/response transformation
+//!
+//! # Usage
+//!
+//! Implement the [`Middleware`] trait to create custom middleware:
+//!
 //! ```rust
-//! // An implement of timeout middleware
-//! use async_std::future::timeout;
-//! use std::time::Duration;
-//! use async_trait::async_trait;
-//! use http_kit::{Request,Response,middleware::{Middleware,Next}};
-//! struct TimeOut(Duration);
+//! use http_kit::{Request, Response, Result, middleware::Middleware};
 //!
-//! #[async_trait]
-//! impl Middleware for TimeOut{
-//!     async fn call_middleware(&self, request: &mut Request, next: Next<'_>) -> http_kit::Result<Response>{
-//!         timeout(self.duration,next.run(request)).await?
+//! struct MyMiddleware;
+//!
+//! impl Middleware for MyMiddleware {
+//!     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+//!         // Pre-processing
+//!         let response = next.respond(request).await?;
+//!         // Post-processing
+//!         Ok(response)
 //!     }
 //! }
 //! ```
+//!
+//! The middleware can then be composed with endpoints using [`WithMiddleware`].
+//! Multiple middleware can be chained together using tuples like `(Middleware1, Middleware2)`.
 
-use crate::{Endpoint, Request, Response, Result};
-use async_trait::async_trait;
-use std::{any::type_name, fmt::Debug, future::Future, ops::Deref, pin::Pin, sync::Arc};
-
-/// Shared middleware object.
-pub type SharedMiddleware = Arc<dyn Middleware>;
-/// Boxed middleware object.
-pub type BoxMiddleware = Box<dyn Middleware>;
-
+use crate::{
+    Endpoint, Request, Response, Result,
+    endpoint::{EndpointImpl, WithMiddleware},
+};
+use alloc::boxed::Box;
+use core::{any::type_name, fmt::Debug, pin::Pin};
 /// Middleware allows reading and modifying requests or responses during the request handling process.
 /// It is often used to implement functionalities such as timeouts, compression, etc.
-#[async_trait]
 pub trait Middleware: Send + Sync {
     /// Handle this request and return a response.Call `next` method of `Next` to handle remain middleware chain.
-    async fn call_middleware(&self, request: &mut Request, next: Next<'_>) -> Result<Response>;
-    /// Get the name of the middleware, which will default to the type name of this middleware.
+    fn handle(
+        &self,
+        request: &mut Request,
+        next: impl Endpoint,
+    ) -> impl Future<Output = Result<Response>> + Send + Sync;
+}
+
+pub(crate) trait MiddlewareImpl: Send + Sync {
+    fn handle_inner<'this, 'req, 'next, 'fut>(
+        &'this self,
+        request: &'req mut Request,
+        next: &'next dyn EndpointImpl,
+    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send + Sync>>
+    where
+        'this: 'fut,
+        'req: 'fut,
+        'next: 'fut;
     fn name(&self) -> &'static str {
         type_name::<Self>()
     }
 }
 
-/// Represents the remaining part of the request handling chain.
-pub struct Next<'a> {
-    remain: &'a [SharedMiddleware],
-    endpoint: &'a dyn Endpoint,
-}
-
-impl Debug for Next<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Next").finish()
+impl Endpoint for &dyn EndpointImpl {
+    async fn respond(&self, request: &mut Request) -> Result<Response> {
+        self.respond_inner(request).await
     }
 }
 
-impl<'a> Next<'a> {
-    /// Create a new `Next` instance ( normally having a complete handling chain).
-    pub fn new(remain: &'a [SharedMiddleware], endpoint: &'a dyn Endpoint) -> Self {
-        Self { remain, endpoint }
-    }
-
-    /// Execute the remain part of the handling chain.
-    pub async fn run(self, request: &mut Request) -> Result<Response> {
-        if let Some((last, remain)) = self.remain.split_last() {
-            last.call_middleware(request, Next::new(remain, self.endpoint))
-                .await
-        } else {
-            self.endpoint.call_endpoint(request).await
-        }
+impl<T: Middleware> MiddlewareImpl for T {
+    fn handle_inner<'this, 'req, 'next, 'fut>(
+        &'this self,
+        request: &'req mut Request,
+        next: &'next dyn EndpointImpl,
+    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send + Sync>>
+    where
+        'this: 'fut,
+        'req: 'fut,
+        'next: 'fut,
+    {
+        Box::pin(self.handle(request, next))
     }
 }
 
-macro_rules! impl_middleware {
-    ($($ty:ty),*) => {
-        $(
-            impl Middleware for $ty {
-                fn call_middleware<'life0, 'life1, 'life2, 'async_trait>(
-                    &'life0 self,
-                    request: &'life1 mut Request,
-                    next: Next<'life2>,
-                ) -> Pin<Box<dyn Future<Output = crate::Result<Response>>+Send+ 'async_trait>,>
-                where
-                    'life0: 'async_trait,
-                    'life1: 'async_trait,
-                    'life2: 'async_trait,
-
-                    Self: 'async_trait
-                {
-                    self.deref().call_middleware(request,next)
-                }
-                fn name(&self) -> &'static str{
-                    self.deref().name()
-                }
-            }
-        )*
-    };
+impl<T: Middleware> Middleware for &T {
+    async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+        Middleware::handle(*self, request, next).await
+    }
 }
 
-impl_middleware![SharedMiddleware, BoxMiddleware];
+impl<T1: Middleware, T2: Middleware> Middleware for (T1, T2) {
+    async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+        self.0
+            .handle(request, WithMiddleware::new(next, &self.1))
+            .await
+    }
+}
 
-#[async_trait]
+/// Type erased middleware which allows storing different middleware implementations behind a
+/// common interface.
+pub struct AnyMiddleware(Box<dyn MiddlewareImpl>);
+
+impl Debug for AnyMiddleware {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!("AnyMiddleware[{}]", self.name()))
+    }
+}
+
+impl AnyMiddleware {
+    /// Creates a new type-erased middleware wrapper around the given middleware implementation.
+    pub fn new(middleware: impl Middleware + 'static) -> Self {
+        AnyMiddleware(Box::new(middleware))
+    }
+
+    /// Returns the type name of the underlying middleware implementation.
+    pub fn name(&self) -> &'static str {
+        self.0.name()
+    }
+}
+
+impl Middleware for AnyMiddleware {
+    async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+        self.0.handle_inner(request, &next).await
+    }
+}
+
 impl Middleware for () {
-    async fn call_middleware(&self, _request: &mut Request, _next: Next<'_>) -> Result<Response> {
-        Ok(Response::empty())
-    }
-}
-
-impl Debug for dyn Middleware {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
+    async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+        next.respond(request).await
     }
 }

@@ -1,10 +1,13 @@
+#[cfg(feature = "std")]
+extern crate std;
+
 use bytes::buf::Reader;
 use bytes::{Buf, Bytes};
+use core::ops::DerefMut;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use futures_lite::ready;
-use std::io::{BufRead, Read};
-use std::ops::DerefMut;
-use std::task::{Context, Poll};
-use std::{io, pin::Pin};
+use std::io::{self, BufRead, Read};
 
 use futures_lite::{AsyncBufRead, AsyncRead};
 
@@ -52,7 +55,7 @@ fn poll_data(
 
     if let Some(data) = ready!(stream.as_mut().poll_next(cx))
         .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+        .map_err(io::Error::other)?
     {
         if data.is_empty() {
             return poll_data(optional_stream, buf, cx);
@@ -79,10 +82,7 @@ impl AsyncRead for IntoAsyncRead {
                 ready!(poll_data(stream, buf, cx))?;
                 Poll::Ready(buf.read(read_buf))
             }
-            Self::Freeze => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                super::Error::BodyFrozen,
-            ))),
+            Self::Freeze => Poll::Ready(Err(io::Error::other(super::Error::BodyFrozen))),
         }
     }
 }
@@ -96,10 +96,7 @@ impl AsyncBufRead for IntoAsyncRead {
                 ready!(poll_data(stream, buf, cx))?;
                 Poll::Ready(buf.fill_buf())
             }
-            Self::Freeze => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                super::Error::BodyFrozen,
-            ))),
+            Self::Freeze => Poll::Ready(Err(io::Error::other(super::Error::BodyFrozen))),
         }
     }
 

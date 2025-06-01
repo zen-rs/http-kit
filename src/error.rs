@@ -1,7 +1,32 @@
+//! Error types and utilities.
+//!
+//! This module provides the core error handling infrastructure. The main types are:
+//!
+//! - [`Error`] - The main error type used throughout HTTP operations
+//! - [`Result`] - A specialized Result type alias for HTTP operations
+//! - [`ResultExt`] - Extension trait that adds HTTP status code handling
+//!
+//! The error types integrate with standard Rust error handling while adding HTTP-specific
+//! functionality like status codes.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use http_kit::{Error, Result, ResultExt};
+//! use http::StatusCode;
+//!
+//! // Create an error with a status code
+//! let err = Error::new("not found", StatusCode::NOT_FOUND);
+//!
+//! // Add status code to existing Result
+//! let result: Result<()> = Ok(()).status(StatusCode::OK);
+//! ```use alloc::boxed::Box;
+use alloc::boxed::Box;
+use core::{
+    fmt,
+    ops::{Deref, DerefMut},
+};
 use http::StatusCode;
-use std::error::Error as StdError;
-use std::fmt;
-use std::ops::{Deref, DerefMut};
 
 /// The error type for HTTP operations.
 pub struct Error {
@@ -10,7 +35,7 @@ pub struct Error {
 }
 
 /// A specialized Result type for http operations.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;
 
 impl Error {
     /// Create an `Error` object from any error type with the given status code.
@@ -59,9 +84,9 @@ impl Error {
     }
 
     /// Try to downcast the inner error type and return `Box<E>`.
-    pub fn downcast<E>(self) -> std::result::Result<Box<E>, Self>
+    pub fn downcast<E>(self) -> core::result::Result<Box<E>, Self>
     where
-        E: StdError + Send + Sync + 'static,
+        E: core::error::Error + Send + Sync + 'static,
     {
         let Self { status, error } = self;
         error.downcast().map_err(|error| Self { status, error })
@@ -70,7 +95,7 @@ impl Error {
     /// Try to downcast the inner error type and return the reference of the mutable reference of `E`.
     pub fn downcast_ref<E>(&self) -> Option<&E>
     where
-        E: StdError + Send + Sync + 'static,
+        E: core::error::Error + Send + Sync + 'static,
     {
         self.error.downcast_ref()
     }
@@ -78,13 +103,13 @@ impl Error {
     /// Try to downcast the inner error type and return `E`.
     pub fn downcast_mut<E>(&mut self) -> Option<&mut E>
     where
-        E: StdError + Send + Sync + 'static,
+        E: core::error::Error + Send + Sync + 'static,
     {
         self.error.downcast_mut()
     }
 
     /// Discard the status code and return the inner error type.
-    pub fn into_inner(self) -> Box<dyn StdError + Send + Sync + 'static> {
+    pub fn into_inner(self) -> Box<dyn core::error::Error + Send + Sync + 'static> {
         self.error.into()
     }
 }
@@ -95,7 +120,7 @@ impl<E: Into<anyhow::Error>> From<E> for Error {
     }
 }
 
-impl From<Error> for Box<dyn StdError> {
+impl From<Error> for Box<dyn core::error::Error> {
     fn from(error: Error) -> Self {
         error.error.into()
     }
@@ -113,20 +138,20 @@ impl fmt::Display for Error {
     }
 }
 
-impl AsRef<dyn StdError + Send + 'static> for Error {
-    fn as_ref(&self) -> &(dyn StdError + Send + 'static) {
+impl AsRef<dyn core::error::Error + Send + 'static> for Error {
+    fn as_ref(&self) -> &(dyn core::error::Error + Send + 'static) {
         self.deref()
     }
 }
 
-impl AsMut<dyn StdError + Send + 'static> for Error {
-    fn as_mut(&mut self) -> &mut (dyn StdError + Send + 'static) {
+impl AsMut<dyn core::error::Error + Send + 'static> for Error {
+    fn as_mut(&mut self) -> &mut (dyn core::error::Error + Send + 'static) {
         self.deref_mut()
     }
 }
 
 impl Deref for Error {
-    type Target = dyn StdError + Send + 'static;
+    type Target = dyn core::error::Error + Send + 'static;
 
     fn deref(&self) -> &Self::Target {
         self.error.deref()
@@ -147,7 +172,6 @@ where
     /// Wrap the error type with status code.
     /// # Example
     /// ```
-    /// use std::fs::File;
     /// use std::io::prelude::*;
     /// use http_kit::{Body,ResultExt};
     /// use async_fs::File;
@@ -161,9 +185,9 @@ where
         S::Error: fmt::Debug;
 }
 
-impl<T, E> ResultExt<T> for std::result::Result<T, E>
+impl<T, E> ResultExt<T> for core::result::Result<T, E>
 where
-    E: StdError + Send + Sync + 'static,
+    E: core::error::Error + Send + Sync + 'static,
 {
     fn status<S>(self, status: S) -> Result<T>
     where

@@ -1,8 +1,39 @@
-use crate::{body::BodyFrozen, Body, BodyError};
+//! HTTP request implementation.
+//!
+//! This module provides the [`Request`] type representing an HTTP request with methods to:
+//!
+//! - Create requests for different HTTP methods (GET, POST, PUT, DELETE)
+//! - Manipulate request headers and body
+//! - Access and modify extensions
+//! - Perform conversions between body formats (JSON, form-data, files)
+//!
+//! The module integrates with common serialization formats and provides convenience
+//! methods for handling request data in various formats.
+//!
+//! # Features
+//!
+//! The following features gates are available:
+//!
+//! - `json` - Enables JSON serialization/deserialization support via serde_json
+//! - `form` - Enables form data handling via serde_urlencoded
+//! - `fs` - Enables file upload support with MIME type detection
+//! - `mime` - Enables MIME type parsing and manipulation
+//!
+//! # Examples
+//!
+//! ```rust,no_run
+//! use http_kit::Request;
+//!
+//! let req = Request::get("https://api.example.com")
+//!     .header("Accept", "application/json")
+//!     .header("User-Agent", "http-kit");
+//! ```
+//!
+use crate::{Body, BodyError, body::BodyFrozen};
 use bytes::Bytes;
 use bytestr::ByteStr;
-use http::{header::HeaderName, Extensions, HeaderMap, HeaderValue, Method, Uri, Version};
-use std::fmt::Debug;
+use core::fmt::Debug;
+use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, Version, header::HeaderName};
 
 type RequestParts = http::request::Parts;
 
@@ -49,8 +80,8 @@ impl Request {
     {
         Self::new(Method::GET, uri)
     }
-    /// Create a POST `Request`.
 
+    /// Create a POST `Request`.
     pub fn post<U>(uri: U) -> Self
     where
         U: TryInto<Uri>,
@@ -58,8 +89,8 @@ impl Request {
     {
         Self::new(Method::POST, uri)
     }
-    /// Create a PUT `Request`.
 
+    /// Create a PUT `Request`.
     pub fn put<U>(uri: U) -> Self
     where
         U: TryInto<Uri>,
@@ -67,8 +98,8 @@ impl Request {
     {
         Self::new(Method::PUT, uri)
     }
-    /// Create a DELETE `Request`.
 
+    /// Create a DELETE `Request`.
     pub fn delete<U>(uri: U) -> Self
     where
         U: TryInto<Uri>,
@@ -80,14 +111,13 @@ impl Request {
     pub const fn parts(&self) -> &RequestParts {
         &self.parts
     }
-    /// Return the mutable reference of request parts.
 
+    /// Return the mutable reference of request parts.
     pub fn parts_mut(&mut self) -> &mut RequestParts {
         &mut self.parts
     }
 
     /// Return the reference of request method.
-
     pub const fn method(&self) -> &Method {
         &self.parts.method
     }
@@ -106,8 +136,8 @@ impl Request {
     pub const fn uri(&self) -> &Uri {
         &self.parts.uri
     }
-    /// Return the mutable reference of URI.
 
+    /// Return the mutable reference of URI.
     pub fn uri_mut(&mut self) -> &mut Uri {
         &mut self.parts.uri
     }
@@ -120,13 +150,12 @@ impl Request {
     pub const fn version(&self) -> Version {
         self.parts.version
     }
-    /// Return the mutable reference of the HTTP version.
 
+    /// Return the mutable reference of the HTTP version.
     pub fn version_mut(&mut self) -> &mut Version {
         &mut self.parts.version
     }
     /// Set the HTTP version by `version`.
-
     pub fn set_version(&mut self, version: Version) {
         *self.version_mut() = version;
     }
@@ -142,12 +171,11 @@ impl Request {
     }
 
     /// Return the reference of the HTTP header.
-
     pub const fn headers(&self) -> &HeaderMap {
         &self.parts.headers
     }
-    /// Return the mutable reference of the HTTP header.
 
+    /// Return the mutable reference of the HTTP header.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.parts.headers
     }
@@ -168,13 +196,11 @@ impl Request {
     }
 
     /// Return the reference of the extension.
-
     pub const fn extensions(&self) -> &Extensions {
         &self.parts.extensions
     }
 
     /// Return the mutable reference of the extension.
-
     pub fn extensions_mut(&mut self) -> &mut Extensions {
         &mut self.parts.extensions
     }
@@ -195,7 +221,10 @@ impl Request {
     }
 
     /// Insert a type into extensions,if the type already exists,the old value will be returned.
-    pub fn insert_extension<T: Send + Sync + 'static>(&mut self, extension: T) -> Option<T> {
+    pub fn insert_extension<T: Send + Sync + Clone + 'static>(
+        &mut self,
+        extension: T,
+    ) -> Option<T> {
         self.extensions_mut().insert(extension)
     }
 
@@ -257,8 +286,11 @@ impl Request {
     /// Set the body from a file.
     /// This method will try to guess MIME by the extension of file.
     #[cfg(feature = "fs")]
-    pub async fn file(mut self, path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
-        use std::os::unix::ffi::OsStrExt;
+    pub async fn file(
+        mut self,
+        path: impl AsRef<core::path::Path>,
+    ) -> Result<Self, core::io::Error> {
+        use core::os::unix::ffi::OsStrExt;
 
         let path = path.as_ref();
         let extension = path.extension().unwrap_or_default().as_bytes();
@@ -322,7 +354,7 @@ impl Request {
     #[cfg(feature = "mime")]
     pub fn get_mime(&self) -> Option<mime::Mime> {
         Some(
-            std::str::from_utf8(self.get_header(http::header::CONTENT_TYPE)?.as_bytes())
+            core::str::from_utf8(self.get_header(http::header::CONTENT_TYPE)?.as_bytes())
                 .ok()?
                 .parse()
                 .ok()?,
