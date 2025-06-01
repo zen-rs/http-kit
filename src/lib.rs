@@ -39,6 +39,7 @@ pub mod endpoint;
 pub use endpoint::Endpoint;
 
 mod request;
+pub mod utils;
 pub use request::Request;
 mod response;
 pub use response::Response;
