@@ -77,7 +77,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use bytes::Bytes;
 use bytestr::ByteStr;
-use http::{header::HeaderName, Extensions, HeaderMap, HeaderValue, StatusCode, Version};
+use http::{
+    header::{GetAll, HeaderName},
+    Extensions, HeaderMap, HeaderValue, StatusCode, Version,
+};
 
 /// The HTTP response parts.
 pub type ResponseParts = http::response::Parts;
@@ -385,6 +388,33 @@ impl Response {
     /// ```
     pub fn get_header(&self, name: HeaderName) -> Option<&HeaderValue> {
         self.headers().get(name)
+    }
+
+    /// Returns an iterator over all values for a given header name.
+    ///
+    /// This method retrieves all values associated with a header name, since
+    /// HTTP headers can have multiple values. The returned iterator will yield
+    /// each value in the order they were added.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The header name to get values for
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Response;
+    ///
+    /// let response = Response::new(200, "OK")
+    ///     .header(http::header::SET_COOKIE, "session=123")
+    ///     .header(http::header::SET_COOKIE, "theme=dark");
+    ///
+    /// for cookie in response.get_headers(http::header::SET_COOKIE) {
+    ///     // Iterate over each Set-Cookie header value
+    /// }
+    /// ```
+    pub fn get_headers(&self, name: HeaderName) -> GetAll<'_, HeaderValue> {
+        self.headers().get_all(name)
     }
 
     /// Appends a header value without removing existing values.

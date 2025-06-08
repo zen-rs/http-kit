@@ -62,7 +62,10 @@ use crate::{body::BodyFrozen, Body, BodyError};
 use bytes::Bytes;
 use bytestr::ByteStr;
 use core::fmt::Debug;
-use http::{header::HeaderName, Extensions, HeaderMap, HeaderValue, Method, Uri, Version};
+use http::{
+    header::{GetAll, HeaderName},
+    Extensions, HeaderMap, HeaderValue, Method, Uri, Version,
+};
 
 type RequestParts = http::request::Parts;
 
@@ -560,6 +563,36 @@ impl Request {
     /// ```
     pub fn get_header(&self, name: HeaderName) -> Option<&HeaderValue> {
         self.headers().get(name)
+    }
+
+    /// Returns an iterator over all values for a header name.
+    ///
+    /// This method retrieves all values for a specific header, unlike [`get_header`]
+    /// which only returns the first value. This is useful for headers that can
+    /// have multiple values like `Accept` or `Set-Cookie`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The header name to get values for
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Request;
+    ///
+    /// let mut request = Request::get("/api/users");
+    /// request.append_header(http::header::ACCEPT, "text/html".parse().unwrap());
+    /// request.append_header(http::header::ACCEPT, "application/json".parse().unwrap());
+    ///
+    /// // Iterate over all Accept header values
+    /// for accept in request.get_headers(http::header::ACCEPT) {
+    ///     println!("Accept: {}", accept.to_str().unwrap());
+    /// }
+    /// ```
+    ///
+    /// [`get_header`]: Request::get_header
+    pub fn get_headers(&self, name: HeaderName) -> GetAll<'_, HeaderValue> {
+        self.headers().get_all(name)
     }
 
     /// Appends a header value without removing existing values.
