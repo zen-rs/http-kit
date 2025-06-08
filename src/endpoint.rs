@@ -66,7 +66,7 @@
 //! let endpoint_with_logging = WithMiddleware::new(MyEndpoint, LoggingMiddleware);
 //! ```
 
-use core::{any::type_name, fmt::Debug, pin::Pin, future::Future};
+use core::{any::type_name, fmt::Debug, future::Future, pin::Pin};
 
 use alloc::boxed::Box;
 
@@ -213,7 +213,7 @@ impl<T: Endpoint> Endpoint for &T {
 ///
 /// let timed_endpoint = WithMiddleware::new(HelloEndpoint, TimingMiddleware);
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WithMiddleware<E: Endpoint, M: Middleware> {
     endpoint: E,
     middleware: M,
