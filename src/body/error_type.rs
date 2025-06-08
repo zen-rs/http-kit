@@ -1,33 +1,73 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-use super::{BodyFrozen, BoxcoreError};
+use super::{BodyFrozen, BoxCoreError};
 use core::error::Error as coreError;
 use core::fmt::Display;
 use core::str::Utf8Error;
 
-/// Error type around `Body`.
+/// Error type for body operations.
+///
+/// This enum represents all possible errors that can occur when working with HTTP body data,
+/// including I/O errors, encoding issues, serialization failures, and body state errors.
+///
+/// # Examples
+///
+/// ```rust
+/// use http_kit::body::Error;
+///
+/// // Handle different error types
+/// match some_body_operation() {
+///     Err(Error::BodyFrozen) => println!("Body was already consumed"),
+///     #[cfg(feature = "json")]
+///     Err(Error::JsonError(e)) => println!("JSON error: {}", e),
+///     Err(e) => println!("Other error: {}", e),
+///     Ok(result) => println!("Success: {:?}", result),
+/// }
+/// # fn some_body_operation() -> Result<(), Error> { Ok(()) }
+/// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// An Error caused by a inner I/O error.
+    /// An I/O error occurred during body operations.
+    ///
+    /// This typically happens when reading from streams, files, or other I/O sources.
     #[cfg(feature = "std")]
     Io(std::io::Error),
-    /// The inner object provides a illgal UTF-8 chunk.
+    /// Invalid UTF-8 data was encountered when converting body to string.
+    ///
+    /// This error occurs when trying to interpret body bytes as UTF-8 text
+    /// but the bytes don't form valid UTF-8 sequences.
     Utf8(Utf8Error),
-    /// The body has been consumed and can not provide data anymore.It is distinguished from a normal empty body.
+    /// The body has been consumed and cannot provide data anymore.
+    ///
+    /// This is distinct from a normal empty body - it indicates that the body
+    /// was previously taken or frozen and is no longer available for operations.
+    /// This typically happens after calling `take()` on a body.
     BodyFrozen,
+    /// JSON serialization or deserialization failed.
+    ///
+    /// This error occurs when trying to convert between Rust types and JSON
+    /// using the `from_json()` or `into_json()` methods.
     #[cfg(feature = "json")]
-    /// Fail to serialize/deserialize object to JSON.
     JsonError(serde_json::Error),
+    /// Form data serialization failed.
+    ///
+    /// This error occurs when trying to serialize a Rust type to URL-encoded form data
+    /// using the `from_form()` method.
     #[cfg(feature = "form")]
-    /// Fail to serialize object to a form.
     SerializeForm(serde_urlencoded::ser::Error),
+    /// Form data deserialization failed.
+    ///
+    /// This error occurs when trying to deserialize URL-encoded form data
+    /// to a Rust type using the `into_form()` method.
     #[cfg(feature = "form")]
-    /// Fail to deserialize a form to object.
     DeserializeForm(serde_urlencoded::de::Error),
-    /// Other inner error.
-    Other(BoxcoreError),
+    /// Other error types not covered by specific variants.
+    ///
+    /// This is a catch-all for any other error that can occur during body operations,
+    /// typically errors from underlying libraries or custom implementations.
+    Other(BoxCoreError),
 }
 
 macro_rules! impl_body_error {
@@ -72,7 +112,7 @@ macro_rules! impl_body_error {
 impl_body_error![
     (Io, std::io::Error),
     (Utf8, Utf8Error),
-    (Other, BoxcoreError),
+    (Other, BoxCoreError),
     (JsonError, serde_json::Error, "json"),
     (SerializeForm, serde_urlencoded::ser::Error, "form"),
     (DeserializeForm, serde_urlencoded::de::Error, "form")

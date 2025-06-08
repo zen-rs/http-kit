@@ -1,7 +1,17 @@
 [package]
 name = "http-kit"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Lexo Liu <me@lexo.cool>"]
+license = "MIT"
+description = "A flexible and ergonomic HTTP toolkit for Rust with async support, middleware, and zero-copy body handling"
+documentation = "https://docs.rs/http-kit"
+repository = "https://github.com/lexoooooo/http-kit"
+homepage = "https://github.com/lexoooooo/http-kit"
+readme = "README.md"
+keywords = ["http", "async", "middleware", "body", "streaming"]
+categories = ["web-programming", "network-programming", "asynchronous"]
 
 [dependencies]
 http = "1.3"
@@ -34,11 +44,17 @@ optional = true
 version = "2.1"
 optional = true
 
+[dependencies.cookie]
+version = "0.18"
+optional = true
+
 [features]
-default = ["json", "form", "std"]
+default = ["json", "form", "std", "cookie", "mime"]
 std = []
+full = ["json", "form", "std", "cookie", "mime", "http_body", "fs"]
 mime = ["dep:mime"]
 http_body = ["dep:http-body"]
 json = ["dep:serde", "dep:serde_json"]
 form = ["dep:serde", "dep:serde_urlencoded"]
 fs = ["dep:async-fs"]
+cookie = ["dep:cookie"]

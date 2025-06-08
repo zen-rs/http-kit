@@ -1,19 +1,29 @@
-//! HTTP request/response body.
+//! HTTP request/response body handling.
 //!
-//! This module provides a flexible body type that can represent HTTP request and response bodies.
+//! This module provides a flexible [`Body`] type that can represent HTTP request and response bodies
+//! in various forms while maintaining efficiency and type safety.
+//!
+//! # Body Representation
+//!
 //! The body can hold data in different forms:
 //!
-//! - Bytes: For simple in-memory bodies
-//! - AsyncReader: For streaming from files or other sources
-//! - Stream: For general async streaming data
+//! - **Bytes**: For simple in-memory bodies that fit entirely in memory
+//! - **AsyncReader**: For streaming from files or other async sources
+//! - **Stream**: For general async streaming data with backpressure support
+//! - **Frozen**: For consumed bodies that can no longer provide data
 //!
-//! The body type also provides convenient methods for working with common formats like:
+//! # Format Support
 //!
-//! - JSON (with `json` feature)
-//! - URL-encoded forms (with `form` feature)
-//! - Files (with `fs` feature)
+//! The body type provides convenient methods for working with common formats:
+//!
+//! - **JSON** (with `json` feature): Serialize/deserialize to/from JSON
+//! - **URL-encoded forms** (with `form` feature): Handle form data
+//! - **Files** (with `fs` feature): Stream file contents with MIME detection
+//! - **Raw bytes**: Direct byte manipulation and string conversion
 //!
 //! # Examples
+//!
+//! ## Basic Usage
 //!
 //! ```rust
 //! use http_kit::Body;
@@ -21,14 +31,47 @@
 //! // Create empty body
 //! let empty = Body::empty();
 //!
-//! // Create from bytes
-//! let bytes = Body::from_bytes("Hello world!");
+//! // Create from string
+//! let text = Body::from_bytes("Hello world!");
 //!
-//! // Create from file
-//! let file = Body::from_file("index.html").await?;
+//! // Create from bytes
+//! let data = Body::from_bytes(vec![1, 2, 3, 4]);
+//! ```
+//!
+//! ## JSON Handling
+//!
+//! ```rust
+//! # #[cfg(feature = "json")]
+//! # {
+//! use http_kit::Body;
+//! use serde::{Serialize, Deserialize};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct User { name: String }
 //!
 //! // Create from JSON
-//! let json = Body::from_json(&my_struct)?;
+//! let user = User { name: "Alice".to_string() };
+//! let body = Body::from_json(&user)?;
+//!
+//! // Parse to JSON
+//! let mut body = Body::from_bytes(r#"{"name":"Bob"}"#);
+//! let user: User = body.into_json().await?;
+//! # }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! ## File Streaming
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "fs")]
+//! # {
+//! use http_kit::Body;
+//!
+//! // Stream file contents
+//! let body = Body::from_file("large_file.dat").await?;
+//! # }
+//! # Ok::<(), std::io::Error>(())
+//! ```
 mod convert;
 mod error_type;
 mod utils;
@@ -46,10 +89,10 @@ use core::fmt::Debug;
 use core::mem::{replace, swap, take};
 use core::pin::Pin;
 use core::task::{Context, Poll};
-type BoxcoreError = Box<dyn core::error::Error + Send + Sync + 'static>;
+type BoxCoreError = Box<dyn core::error::Error + Send + Sync + 'static>;
 
 // A boxed steam object.
-type BoxStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxcoreError>> + Send + Sync + 'static>>;
+type BoxStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxCoreError>> + Send + Sync + 'static>>;
 
 // A boxed bufreader object.
 type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>;
@@ -57,7 +100,34 @@ type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>;
 #[cfg(feature = "http_body")]
 pub use http_body::Body as HttpBody;
 
-/// Flexible HTTP body.
+/// Flexible HTTP body that can represent data in various forms.
+///
+/// `Body` is the core type for representing HTTP request and response bodies.
+/// It can efficiently handle different data sources:
+///
+/// - **In-memory data**: Bytes, strings, vectors
+/// - **Streaming data**: Files, network streams, async readers
+/// - **Structured data**: JSON, form data (with appropriate features)
+///
+/// The body automatically manages the underlying representation and provides
+/// zero-copy conversions where possible.
+///
+/// # Examples
+///
+/// ```rust
+/// use http_kit::Body;
+///
+/// // Create from string
+/// let body = Body::from_bytes("Hello, world!");
+///
+/// // Create empty body
+/// let empty = Body::empty();
+///
+/// // Check if empty (when size is known)
+/// if let Some(true) = body.is_empty() {
+///     println!("Body is empty");
+/// }
+/// ```
 pub struct Body {
     inner: BodyInner,
 }
@@ -90,30 +160,75 @@ impl Default for BodyInner {
 }
 
 impl Body {
-    /// Create a new empty body.
+    /// Creates a new empty body.
+    ///
+    /// This creates a body with zero bytes that can be used as a placeholder
+    /// or default value.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let body = Body::empty();
+    /// assert_eq!(body.len(), Some(0));
+    /// ```
     pub const fn empty() -> Self {
         Self {
             inner: BodyInner::Once(Bytes::new()),
         }
     }
 
-    /// Create a new frozen body.
+    /// Creates a new frozen body that cannot provide data.
+    ///
+    /// A frozen body represents a body that has been consumed and can no longer
+    /// provide data. This is typically used internally after a body has been
+    /// taken or consumed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let body = Body::frozen();
+    /// assert!(body.is_frozen());
+    /// ```
     pub const fn frozen() -> Self {
         Self {
             inner: BodyInner::Freeze,
         }
     }
 
-    /// Create a body from a object implement `AsyncBufRead`.
-    /// This method allows you to create a object implement `AsyncBufRead`, which is useful for reading data
-    /// from a file or any other source that implements the `AsyncBufRead` trait.
-    /// #Example
-    /// ```rust
-    /// use async_core::fs::File;
-    /// use async_core::io::BufReader;
-    /// use http_util::Body;
-    /// let file = BufReader::new(File::open("index.html").await?);
-    /// Body::from_reader(file,file.metadata().await?.len())
+    /// Creates a body from an async buffered reader.
+    ///
+    /// This method allows streaming data from any source that implements
+    /// `AsyncBufRead`, such as files, network connections, or in-memory buffers.
+    /// The optional length hint can improve performance for operations that
+    /// benefit from knowing the total size.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - Any type implementing `AsyncBufRead + Send + Sync + 'static`
+    /// * `length` - Optional hint about the total number of bytes to read
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "fs")]
+    /// # {
+    /// use http_kit::Body;
+    /// use async_fs::File;
+    /// use futures_lite::io::BufReader;
+    ///
+    /// # async fn example() -> Result<(), std::io::Error> {
+    /// let file = File::open("data.txt").await?;
+    /// let metadata = file.metadata().await?;
+    /// let reader = BufReader::new(file);
+    ///
+    /// let body = Body::from_reader(reader, metadata.len() as usize);
+    /// # Ok(())
+    /// # }
+    /// # }
     /// ```
     pub fn from_reader(
         reader: impl AsyncBufRead + Send + Sync + 'static,
@@ -127,11 +242,37 @@ impl Body {
         }
     }
 
-    /// Create a body from a steam.
+    /// Creates a body from an async stream of data chunks.
+    ///
+    /// This method allows creating a body from any stream that yields
+    /// `Result<T, E>` where `T` can be converted to `Bytes`. This is useful
+    /// for handling data from network sources, databases, or custom generators.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `T` - Data type that can be converted to `Bytes`
+    /// * `E` - Error type that can be converted to a boxed error
+    /// * `S` - Stream type yielding `Result<T, E>`
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    /// use futures_lite::stream;
+    ///
+    /// # async fn example() {
+    /// let data_stream = stream::iter(vec![
+    ///     Ok::<_, std::io::Error>("Hello, ".as_bytes()),
+    ///     Ok("world!".as_bytes()),
+    /// ]);
+    ///
+    /// let body = Body::from_stream(data_stream);
+    /// # }
+    /// ```
     pub fn from_stream<T, E, S>(stream: S) -> Self
     where
         T: Into<Bytes> + Send + 'static,
-        E: Into<BoxcoreError>,
+        E: Into<BoxCoreError>,
         S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
     {
         Self {
@@ -140,14 +281,64 @@ impl Body {
             )),
         }
     }
-    /// Create a body from a chunk of bytes.
+    /// Creates a body from bytes or byte-like data.
+    ///
+    /// This method accepts any type that can be converted to `Bytes`,
+    /// including `String`, `Vec<u8>`, `&str`, `&[u8]`, and `Bytes` itself.
+    /// The conversion is zero-copy when possible.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// // From string slice
+    /// let body1 = Body::from_bytes("Hello, world!");
+    ///
+    /// // From String
+    /// let body2 = Body::from_bytes("Hello, world!".to_string());
+    ///
+    /// // From byte vector
+    /// let body3 = Body::from_bytes(vec![72, 101, 108, 108, 111]);
+    ///
+    /// // From byte slice
+    /// let body4 = Body::from_bytes(&[72, 101, 108, 108, 111]);
+    /// ```
     pub fn from_bytes(data: impl Into<Bytes>) -> Self {
         Self {
             inner: BodyInner::Once(data.into()),
         }
     }
 
-    /// Create a body from a file.
+    /// Creates a body by streaming the contents of a file.
+    ///
+    /// This method opens a file and creates a streaming body that reads
+    /// the file contents on demand. The file size is determined automatically
+    /// and used as a length hint for optimization.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the file to read
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the file cannot be opened or its metadata
+    /// cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "fs")]
+    /// # {
+    /// use http_kit::Body;
+    ///
+    /// # async fn example() -> Result<(), std::io::Error> {
+    /// let body = Body::from_file("large_document.pdf").await?;
+    /// println!("File body created with {} bytes", body.len().unwrap_or(0));
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     #[cfg(feature = "fs")]
     pub async fn from_file(path: impl AsRef<core::path::Path>) -> Result<Self, core::io::Error> {
         let file = async_fs::File::open(path).await?;
@@ -158,19 +349,111 @@ impl Body {
         ))
     }
 
-    /// Create a body by serializing a object into JSON.
+    /// Creates a body by serializing an object to JSON.
+    ///
+    /// This method serializes any `Serialize` type to JSON and creates
+    /// a body containing the JSON string. The resulting body will have
+    /// UTF-8 encoded JSON content.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - Any type implementing `serde::Serialize`
+    ///
+    /// # Errors
+    ///
+    /// Returns `serde_json::Error` if serialization fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "json")]
+    /// # {
+    /// use http_kit::Body;
+    /// use serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct User {
+    ///     name: String,
+    ///     age: u32,
+    /// }
+    ///
+    /// let user = User {
+    ///     name: "Alice".to_string(),
+    ///     age: 30,
+    /// };
+    ///
+    /// let body = Body::from_json(&user)?;
+    /// # }
+    /// # Ok::<(), serde_json::Error>(())
+    /// ```
     #[cfg(feature = "json")]
     pub fn from_json<T: serde::Serialize>(value: T) -> Result<Self, serde_json::Error> {
         Ok(Self::from_bytes(serde_json::to_string(&value)?))
     }
 
-    /// Create a body by serializing a object into form.
+    /// Creates a body by serializing an object to URL-encoded form data.
+    ///
+    /// This method serializes any `Serialize` type to `application/x-www-form-urlencoded`
+    /// format, commonly used for HTML form submissions.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - Any type implementing `serde::Serialize`
+    ///
+    /// # Errors
+    ///
+    /// Returns `serde_urlencoded::ser::Error` if serialization fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "form")]
+    /// # {
+    /// use http_kit::Body;
+    /// use serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct LoginForm {
+    ///     username: String,
+    ///     password: String,
+    /// }
+    ///
+    /// let form = LoginForm {
+    ///     username: "user".to_string(),
+    ///     password: "pass".to_string(),
+    /// };
+    ///
+    /// let body = Body::from_form(&form)?;
+    /// # }
+    /// # Ok::<(), serde_urlencoded::ser::Error>(())
+    /// ```
     #[cfg(feature = "form")]
     pub fn from_form<T: serde::Serialize>(value: T) -> Result<Self, serde_urlencoded::ser::Error> {
         Ok(Self::from_bytes(serde_urlencoded::to_string(value)?))
     }
 
-    /// Try to get the length of the body.This method is primarily used in optimizations, but it is only an estimation,having no warranty of any kind.
+    /// Returns the length of the body in bytes, if known.
+    ///
+    /// This method returns `Some(length)` for in-memory bodies where the size
+    /// is immediately available. For streaming bodies (files, readers, streams),
+    /// it returns `None` since the total size may not be known until the entire
+    /// body is consumed.
+    ///
+    /// The returned length is primarily used for optimizations like setting
+    /// `Content-Length` headers, but should be considered a hint rather than
+    /// a guarantee.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let body = Body::from_bytes("Hello, world!");
+    /// assert_eq!(body.len(), Some(13));
+    ///
+    /// let empty = Body::empty();
+    /// assert_eq!(empty.len(), Some(0));
+    /// ```
     pub const fn len(&self) -> Option<usize> {
         if let BodyInner::Once(bytes) = &self.inner {
             Some(bytes.len())
@@ -179,7 +462,23 @@ impl Body {
         }
     }
 
-    /// Returns true if `Body` has a length of zero bytes.
+    /// Returns whether the body is empty, if the length is known.
+    ///
+    /// This method returns `Some(true)` if the body is known to be empty,
+    /// `Some(false)` if the body is known to contain data, and `None` if
+    /// the body length cannot be determined without consuming it.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let empty = Body::empty();
+    /// assert_eq!(empty.is_empty(), Some(true));
+    ///
+    /// let body = Body::from_bytes("data");
+    /// assert_eq!(body.is_empty(), Some(false));
+    /// ```
     pub const fn is_empty(&self) -> Option<bool> {
         if let Some(len) = self.len() {
             if len == 0 { Some(true) } else { Some(false) }
@@ -188,7 +487,31 @@ impl Body {
         }
     }
 
-    /// Try to read the body and return a `Bytes` object.
+    /// Consumes the body and returns all its data as `Bytes`.
+    ///
+    /// This method reads the entire body into memory and returns it as a
+    /// `Bytes` object. For large bodies or streams, this may consume significant
+    /// memory. For streaming bodies, all data will be read and concatenated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The body is frozen (already consumed)
+    /// - An I/O error occurs while reading streaming data
+    /// - The underlying stream produces an error
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// let body = Body::from_bytes("Hello, world!");
+    /// let bytes = body.into_bytes().await?;
+    /// assert_eq!(bytes, "Hello, world!");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn into_bytes(self) -> Result<Bytes, Error> {
         match self.inner {
             BodyInner::Once(bytes) => Ok(bytes),
@@ -229,17 +552,84 @@ impl Body {
         }
     }
 
-    /// Try to read the body as a UTF-8 string and return a `ByteStr`.
+    /// Consumes the body and returns its data as a UTF-8 string.
+    ///
+    /// This method reads the entire body into memory and converts it to a
+    /// UTF-8 string, returning a `ByteStr` which provides string-like operations
+    /// while maintaining the underlying byte representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The body is frozen (already consumed)
+    /// - An I/O error occurs while reading streaming data
+    /// - The body contains invalid UTF-8 sequences
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// let body = Body::from_bytes("Hello, world!");
+    /// let text = body.into_string().await?;
+    /// assert_eq!(text, "Hello, world!");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn into_string(self) -> Result<ByteStr, Error> {
         Ok(ByteStr::from_utf8(self.into_bytes().await?)?)
     }
 
-    /// Return a wrapper which implement `AsyncBufRead`.
+    /// Converts the body into an async buffered reader.
+    ///
+    /// This method wraps the body in a type that implements `AsyncBufRead`,
+    /// allowing it to be used anywhere that expects an async reader. This is
+    /// useful for streaming the body data to other async I/O operations.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    /// use futures_lite::AsyncBufReadExt;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let body = Body::from_bytes("line1\nline2\nline3");
+    /// let mut reader = body.into_reader();
+    /// let mut line = String::new();
+    /// reader.read_line(&mut line).await?;
+    /// assert_eq!(line, "line1\n");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn into_reader(self) -> impl AsyncBufRead + Send + Sync {
         IntoAsyncRead::new(self)
     }
 
-    /// Prepare a chunk of bytes in the inner representation, then return a reference to the bytes.
+    /// Returns a reference to the body data as bytes.
+    ///
+    /// This method ensures the body data is available as a byte slice and returns
+    /// a reference to it. For streaming bodies, this will consume and buffer all
+    /// data in memory. The body is modified to store the buffered data internally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The body is frozen (already consumed)
+    /// - An I/O error occurs while reading streaming data
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// let mut body = Body::from_bytes("Hello, world!");
+    /// let bytes = body.as_bytes().await?;
+    /// assert_eq!(bytes, b"Hello, world!");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn as_bytes(&mut self) -> Result<&[u8], Error> {
         self.inner = BodyInner::Once(self.take()?.into_bytes().await?);
         match self.inner {
@@ -248,16 +638,78 @@ impl Body {
         }
     }
 
-    /// Prepare a chunk of bytes in the inner representation, then return a string slice.
+    /// Returns a reference to the body data as a UTF-8 string slice.
+    ///
+    /// This method ensures the body data is available as a string slice and returns
+    /// a reference to it. For streaming bodies, this will consume and buffer all
+    /// data in memory first. The body is modified to store the buffered data internally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The body is frozen (already consumed)
+    /// - An I/O error occurs while reading streaming data
+    /// - The body contains invalid UTF-8 sequences
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// let mut body = Body::from_bytes("Hello, world!");
+    /// let text = body.as_str().await?;
+    /// assert_eq!(text, "Hello, world!");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn as_str(&mut self) -> Result<&str, Error> {
         let data = self.as_bytes().await?;
         Ok(core::str::from_utf8(data)?)
     }
 
-    /// Prepare data in the inner representation,then try to read the body as JSON.
-    /// This method allows you to deserialize data with zero copy.
+    /// Deserializes the body data as JSON into the specified type.
+    ///
+    /// This method reads the body data and attempts to deserialize it as JSON.
+    /// The deserialization is performed with zero-copy when possible by working
+    /// directly with the buffered byte data.
+    ///
     /// # Warning
-    /// This method wouldn't check MIME of this body, if you expect to reject mismatched MIME, use `Request::into_json` or `Response::into_json` instead.
+    ///
+    /// This method does not validate the `Content-Type` header. If you need
+    /// MIME type validation, use `Request::into_json()` or `Response::into_json()`
+    /// instead, which check for the `application/json` content type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The body is frozen (already consumed)
+    /// - An I/O error occurs while reading streaming data
+    /// - The JSON is malformed or doesn't match the target type
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "json")]
+    /// # {
+    /// use http_kit::Body;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize, PartialEq, Debug)]
+    /// struct User {
+    ///     name: String,
+    ///     age: u32,
+    /// }
+    ///
+    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// let json_data = r#"{"name": "Alice", "age": 30}"#;
+    /// let mut body = Body::from_bytes(json_data);
+    /// let user: User = body.into_json().await?;
+    /// assert_eq!(user.name, "Alice");
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     #[cfg(feature = "json")]
     pub async fn into_json<'a, T>(&'a mut self) -> Result<T, Error>
     where
@@ -266,10 +718,48 @@ impl Body {
         Ok(serde_json::from_slice(self.as_bytes().await?)?)
     }
 
-    /// Prepare data in the inner representation,then try to read the body as a form.
-    /// This method allows you to deserialize data with zero copy.
+    /// Deserializes the body data as URL-encoded form data into the specified type.
+    ///
+    /// This method reads the body data and attempts to deserialize it as
+    /// `application/x-www-form-urlencoded` data. The deserialization is performed
+    /// with zero-copy when possible by working directly with the buffered byte data.
+    ///
     /// # Warning
-    /// This method wouldn't check MIME of this body, if you expect to reject mismatched MIME, use `Request::into_form` or `Response::into_form` instead.
+    ///
+    /// This method does not validate the `Content-Type` header. If you need
+    /// MIME type validation, use `Request::into_form()` or `Response::into_form()`
+    /// instead, which check for the `application/x-www-form-urlencoded` content type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The body is frozen (already consumed)
+    /// - An I/O error occurs while reading streaming data
+    /// - The form data is malformed or doesn't match the target type
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "form")]
+    /// # {
+    /// use http_kit::Body;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize, PartialEq, Debug)]
+    /// struct LoginForm {
+    ///     username: String,
+    ///     password: String,
+    /// }
+    ///
+    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// let form_data = "username=alice&password=secret123";
+    /// let mut body = Body::from_bytes(form_data);
+    /// let form: LoginForm = body.into_form().await?;
+    /// assert_eq!(form.username, "alice");
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     #[cfg(feature = "form")]
     pub async fn into_form<'a, T>(&'a mut self) -> Result<T, Error>
     where
@@ -278,12 +768,50 @@ impl Body {
         Ok(serde_urlencoded::from_bytes(self.as_bytes().await?)?)
     }
 
-    /// Replace the value of the body and return the old body.
+    /// Replaces this body with a new body and returns the old body.
+    ///
+    /// This method swaps the current body with the provided body, returning
+    /// the original body value. This can be useful for chaining operations
+    /// or temporarily substituting body content.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let mut body = Body::from_bytes("original");
+    /// let old_body = body.replace(Body::from_bytes("replacement"));
+    /// 
+    /// // `body` now contains "replacement"
+    /// // `old_body` contains "original"
+    /// ```
     pub fn replace(&mut self, body: Body) -> Body {
         replace(self, body)
     }
 
-    /// Swap the value of the body with another body if the orginal body is not frozen.
+    /// Swaps the contents of this body with another body.
+    ///
+    /// This method exchanges the contents of two bodies, provided that this
+    /// body is not frozen. If the body is frozen (already consumed), the
+    /// operation fails and returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BodyFrozen` if this body has been frozen/consumed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let mut body1 = Body::from_bytes("first");
+    /// let mut body2 = Body::from_bytes("second");
+    /// 
+    /// body1.swap(&mut body2)?;
+    /// 
+    /// // Now body1 contains "second" and body2 contains "first"
+    /// # Ok::<(), http_kit::body::BodyFrozen>(())
+    /// ```
     pub fn swap(&mut self, body: &mut Body) -> Result<(), BodyFrozen> {
         if self.is_frozen() {
             Err(BodyFrozen::new())
@@ -293,7 +821,29 @@ impl Body {
         }
     }
 
-    /// Freeze the orginal body and return its value.
+    /// Consumes and takes the body, leaving a frozen body in its place.
+    ///
+    /// This method extracts the body content and replaces it with a frozen
+    /// (unusable) body. This is useful when you need to move the body to
+    /// another location while ensuring the original cannot be used again.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BodyFrozen` if the body is already frozen.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let mut body = Body::from_bytes("Hello, world!");
+    /// let taken_body = body.take()?;
+    /// 
+    /// // `taken_body` contains the original data
+    /// // `body` is now frozen and cannot be used
+    /// assert!(body.is_frozen());
+    /// # Ok::<(), http_kit::body::BodyFrozen>(())
+    /// ```
     pub fn take(&mut self) -> Result<Self, BodyFrozen> {
         if self.is_frozen() {
             Err(BodyFrozen::new())
@@ -302,12 +852,47 @@ impl Body {
         }
     }
 
-    /// Return `true` if the body if frozen,and `false` otherwise.
+    /// Returns `true` if the body is frozen (consumed), `false` otherwise.
+    ///
+    /// A frozen body is one that has been consumed by operations like `take()`
+    /// and can no longer provide data. This is different from an empty body,
+    /// which still has a valid state but contains no data.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let mut body = Body::from_bytes("data");
+    /// assert!(!body.is_frozen());
+    /// 
+    /// let _taken = body.take().unwrap();
+    /// assert!(body.is_frozen());
+    /// 
+    /// let frozen = Body::frozen();
+    /// assert!(frozen.is_frozen());
+    /// ```
     pub const fn is_frozen(&self) -> bool {
         matches!(self.inner, BodyInner::Freeze)
     }
 
-    /// Freeze the body,so that it can not be consumed anymore.The original value of the body will be dropped.
+    /// Freezes the body, making it unusable and dropping its content.
+    ///
+    /// This method converts the body to a frozen state, discarding any data
+    /// it contained. After freezing, the body cannot be used for any operations
+    /// and will return errors if accessed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let mut body = Body::from_bytes("Hello, world!");
+    /// body.freeze();
+    /// 
+    /// assert!(body.is_frozen());
+    /// // Any further operations on `body` will fail
+    /// ```
     pub fn freeze(&mut self) {
         self.replace(Self::frozen());
     }
@@ -320,7 +905,7 @@ impl Default for Body {
 }
 
 impl Stream for Body {
-    type Item = Result<Bytes, BoxcoreError>;
+    type Item = Result<Bytes, BoxCoreError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match &mut self.inner {

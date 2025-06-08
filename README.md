@@ -10,7 +10,6 @@ A flexible and ergonomic HTTP toolkit for Rust that provides high-level abstract
 - **Streaming support** - Efficient handling of large payloads through streaming interfaces
 - **Body transformations** - Convert between different body formats (JSON, form data, files) with zero-copy when possible
 - **Middleware system** - Extensible middleware architecture for request/response processing
-- **No-std compatible** - Core functionality works without the standard library
 - **Async/await ready** - Built on top of `futures-lite` for async I/O operations
 
 ## Optional Features
