@@ -61,7 +61,7 @@
 //! async fn create_user(mut request: Request) -> Result<Response> {
 //!     let user: User = request.into_json().await?;
 //!     // Process user...
-//!     Response::empty().json(&user)
+//!     Ok(Response::empty().json(&user)?)
 //! }
 //! # }
 //! ```

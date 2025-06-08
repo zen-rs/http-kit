@@ -40,43 +40,45 @@
 //!
 //! ## JSON Handling
 //!
-//! ```rust
-//! # #[cfg(feature = "json")]
-//! # {
-//! use http_kit::Body;
-//! use serde::{Serialize, Deserialize};
-//!
-//! #[derive(Serialize, Deserialize)]
-//! struct User { name: String }
-//!
-//! // Create from JSON
-//! let user = User { name: "Alice".to_string() };
-//! let body = Body::from_json(&user)?;
-//!
-//! // Parse to JSON
-//! let mut body = Body::from_bytes(r#"{"name":"Bob"}"#);
-//! let user: User = body.into_json().await?;
-//! # }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! ## File Streaming
-//!
-//! ```rust,no_run
-//! # #[cfg(feature = "fs")]
-//! # {
-//! use http_kit::Body;
-//!
-//! // Stream file contents
-//! let body = Body::from_file("large_file.dat").await?;
-//! # }
-//! # Ok::<(), std::io::Error>(())
-//! ```
+/// ```rust
+/// # #[cfg(feature = "json")]
+/// # {
+/// use http_kit::Body;
+/// use serde::{Serialize, Deserialize};
+///
+/// #[derive(Serialize, Deserialize)]
+/// struct User { name: String }
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create from JSON
+/// let user = User { name: "Alice".to_string() };
+/// let body = Body::from_json(&user)?;
+///
+/// // Parse to JSON
+/// let mut body = Body::from_bytes(r#"{"name":"Bob"}"#);
+/// let user: User = body.into_json().await?;
+/// # Ok(())
+/// # }
+/// # }
+/// ```
+//
+// ## File Streaming
+//
+// ```rust,no_run
+// # #[cfg(feature = "fs")]
+// # {
+// use http_kit::Body;
+//
+// // Stream file contents
+// let body = Body::from_file("large_file.dat").await?;
+// # }
+// # Ok::<(), std::io::Error>(())
+// ```
 mod convert;
 mod error_type;
 mod utils;
 pub use error_type::Error;
-use futures_lite::{Stream, StreamExt, ready};
+use futures_lite::{ready, Stream, StreamExt};
 
 use self::utils::IntoAsyncRead;
 use bytestr::ByteStr;
@@ -220,7 +222,7 @@ impl Body {
     /// use async_fs::File;
     /// use futures_lite::io::BufReader;
     ///
-    /// # async fn example() -> Result<(), std::io::Error> {
+    /// # async fn example() -> Result<(), http_kit::BodyError> {
     /// let file = File::open("data.txt").await?;
     /// let metadata = file.metadata().await?;
     /// let reader = BufReader::new(file);
@@ -300,9 +302,6 @@ impl Body {
     ///
     /// // From byte vector
     /// let body3 = Body::from_bytes(vec![72, 101, 108, 108, 111]);
-    ///
-    /// // From byte slice
-    /// let body4 = Body::from_bytes(&[72, 101, 108, 108, 111]);
     /// ```
     pub fn from_bytes(data: impl Into<Bytes>) -> Self {
         Self {
@@ -481,7 +480,11 @@ impl Body {
     /// ```
     pub const fn is_empty(&self) -> Option<bool> {
         if let Some(len) = self.len() {
-            if len == 0 { Some(true) } else { Some(false) }
+            if len == 0 {
+                Some(true)
+            } else {
+                Some(false)
+            }
         } else {
             None
         }
@@ -505,7 +508,7 @@ impl Body {
     /// ```rust
     /// use http_kit::Body;
     ///
-    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// # async fn example() -> Result<(), http_kit::BodyError> {
     /// let body = Body::from_bytes("Hello, world!");
     /// let bytes = body.into_bytes().await?;
     /// assert_eq!(bytes, "Hello, world!");
@@ -570,7 +573,7 @@ impl Body {
     /// ```rust
     /// use http_kit::Body;
     ///
-    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// # async fn example() -> Result<(), http_kit::BodyError> {
     /// let body = Body::from_bytes("Hello, world!");
     /// let text = body.into_string().await?;
     /// assert_eq!(text, "Hello, world!");
@@ -623,7 +626,7 @@ impl Body {
     /// ```rust
     /// use http_kit::Body;
     ///
-    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// # async fn example() -> Result<(), http_kit::BodyError> {
     /// let mut body = Body::from_bytes("Hello, world!");
     /// let bytes = body.as_bytes().await?;
     /// assert_eq!(bytes, b"Hello, world!");
@@ -656,7 +659,7 @@ impl Body {
     /// ```rust
     /// use http_kit::Body;
     ///
-    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// # async fn example() -> Result<(), http_kit::BodyError> {
     /// let mut body = Body::from_bytes("Hello, world!");
     /// let text = body.as_str().await?;
     /// assert_eq!(text, "Hello, world!");
@@ -701,7 +704,7 @@ impl Body {
     ///     age: u32,
     /// }
     ///
-    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// # async fn example() -> Result<(), http_kit::BodyError> {
     /// let json_data = r#"{"name": "Alice", "age": 30}"#;
     /// let mut body = Body::from_bytes(json_data);
     /// let user: User = body.into_json().await?;
@@ -751,7 +754,7 @@ impl Body {
     ///     password: String,
     /// }
     ///
-    /// # async fn example() -> Result<(), http_kit::body::Error> {
+    /// # async fn example() -> Result<(), http_kit::BodyError> {
     /// let form_data = "username=alice&password=secret123";
     /// let mut body = Body::from_bytes(form_data);
     /// let form: LoginForm = body.into_form().await?;
@@ -781,7 +784,7 @@ impl Body {
     ///
     /// let mut body = Body::from_bytes("original");
     /// let old_body = body.replace(Body::from_bytes("replacement"));
-    /// 
+    ///
     /// // `body` now contains "replacement"
     /// // `old_body` contains "original"
     /// ```
@@ -806,11 +809,11 @@ impl Body {
     ///
     /// let mut body1 = Body::from_bytes("first");
     /// let mut body2 = Body::from_bytes("second");
-    /// 
+    ///
     /// body1.swap(&mut body2)?;
-    /// 
+    ///
     /// // Now body1 contains "second" and body2 contains "first"
-    /// # Ok::<(), http_kit::body::BodyFrozen>(())
+    /// # Ok::<(), http_kit::BodyError>(())
     /// ```
     pub fn swap(&mut self, body: &mut Body) -> Result<(), BodyFrozen> {
         if self.is_frozen() {
@@ -838,11 +841,11 @@ impl Body {
     ///
     /// let mut body = Body::from_bytes("Hello, world!");
     /// let taken_body = body.take()?;
-    /// 
+    ///
     /// // `taken_body` contains the original data
     /// // `body` is now frozen and cannot be used
     /// assert!(body.is_frozen());
-    /// # Ok::<(), http_kit::body::BodyFrozen>(())
+    /// # Ok::<(), http_kit::BodyError>(())
     /// ```
     pub fn take(&mut self) -> Result<Self, BodyFrozen> {
         if self.is_frozen() {
@@ -865,10 +868,10 @@ impl Body {
     ///
     /// let mut body = Body::from_bytes("data");
     /// assert!(!body.is_frozen());
-    /// 
+    ///
     /// let _taken = body.take().unwrap();
     /// assert!(body.is_frozen());
-    /// 
+    ///
     /// let frozen = Body::frozen();
     /// assert!(frozen.is_frozen());
     /// ```
@@ -889,7 +892,7 @@ impl Body {
     ///
     /// let mut body = Body::from_bytes("Hello, world!");
     /// body.freeze();
-    /// 
+    ///
     /// assert!(body.is_frozen());
     /// // Any further operations on `body` will fail
     /// ```

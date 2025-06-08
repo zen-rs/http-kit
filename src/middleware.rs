@@ -16,7 +16,7 @@
 //! Implement the [`Middleware`] trait to create custom middleware:
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, middleware::Middleware};
+//! use http_kit::{Request, Response, Result, Endpoint, middleware::Middleware};
 //!
 //! struct MyMiddleware;
 //!
@@ -32,7 +32,6 @@
 //!
 //! The middleware can then be composed with endpoints using [`WithMiddleware`].
 //! Multiple middleware can be chained together using tuples like `(Middleware1, Middleware2)`.
-
 use crate::{
     endpoint::{EndpointImpl, WithMiddleware},
     Endpoint, Request, Response, Result,

@@ -58,3 +58,6 @@ json = ["dep:serde", "dep:serde_json"]
 form = ["dep:serde", "dep:serde_urlencoded"]
 fs = ["dep:async-fs"]
 cookie = ["dep:cookie"]
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }

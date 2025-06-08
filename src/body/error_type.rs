@@ -14,17 +14,17 @@ use core::str::Utf8Error;
 /// # Examples
 ///
 /// ```rust
-/// use http_kit::body::Error;
+/// use http_kit::BodyError;
 ///
 /// // Handle different error types
 /// match some_body_operation() {
-///     Err(Error::BodyFrozen) => println!("Body was already consumed"),
+///     Err(BodyError::BodyFrozen) => println!("Body was already consumed"),
 ///     #[cfg(feature = "json")]
-///     Err(Error::JsonError(e)) => println!("JSON error: {}", e),
+///     Err(BodyError::JsonError(e)) => println!("JSON error: {}", e),
 ///     Err(e) => println!("Other error: {}", e),
 ///     Ok(result) => println!("Success: {:?}", result),
 /// }
-/// # fn some_body_operation() -> Result<(), Error> { Ok(()) }
+/// # fn some_body_operation() -> Result<(), BodyError> { Ok(()) }
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]

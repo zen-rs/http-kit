@@ -16,10 +16,10 @@
 //! use http::StatusCode;
 //!
 //! // Create an error with a status code
-//! let err = Error::new("not found", StatusCode::NOT_FOUND);
+//! let err = Error::msg("not found").set_status(StatusCode::NOT_FOUND);
 //!
 //! // Add status code to existing Result
-//! let result: Result<()> = Ok(()).status(StatusCode::OK);
+//! let result: Result<()> = Ok::<(), std::convert::Infallible>(()).status(StatusCode::OK);
 //! ```
 //!
 use alloc::boxed::Box;
@@ -45,7 +45,7 @@ use http::StatusCode;
 /// let err = Error::msg("Something went wrong");
 ///
 /// // Create with a specific status code
-/// let err = Error::new("Not found", StatusCode::NOT_FOUND);
+/// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
 /// ```
 pub struct Error {
     error: anyhow::Error,
@@ -68,7 +68,7 @@ pub struct Error {
 /// }
 ///
 /// fn failing_function() -> Result<()> {
-///     Err(Error::new("failed", StatusCode::INTERNAL_SERVER_ERROR))
+///     Err(Error::msg("failed").set_status(StatusCode::INTERNAL_SERVER_ERROR))
 /// }
 /// ```
 pub type Result<T> = core::result::Result<T, Error>;
@@ -177,7 +177,7 @@ impl Error {
     /// use http_kit::Error;
     /// use http::StatusCode;
     ///
-    /// let err = Error::new("not found", StatusCode::NOT_FOUND);
+    /// let err = Error::msg("not found").set_status(StatusCode::NOT_FOUND);
     /// assert_eq!(err.status(), StatusCode::NOT_FOUND);
     /// ```
     pub fn status(&self) -> StatusCode {
@@ -269,7 +269,7 @@ impl Error {
     /// use http_kit::Error;
     /// use http::StatusCode;
     ///
-    /// let err = Error::new("some error", StatusCode::BAD_REQUEST);
+    /// let err = Error::msg("some error").set_status(StatusCode::BAD_REQUEST);
     /// let inner = err.into_inner();
     /// ```
     pub fn into_inner(self) -> Box<dyn core::error::Error + Send + Sync + 'static> {

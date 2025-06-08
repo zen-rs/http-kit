@@ -122,12 +122,12 @@ use crate::{Middleware, Request, Response, Result};
 ///         match request.method().as_str() {
 ///             "GET" => {
 ///                 let user = User { name: "Alice".into(), age: 30 };
-///                 Response::empty().json(&user)
+///                 Ok(Response::empty().json(&user)?)
 ///             }
 ///             "POST" => {
 ///                 let user: User = request.into_json().await?;
 ///                 // Process user...
-///                 Response::empty().json(&user)
+///                 Ok(Response::empty().json(&user)?)
 ///             }
 ///             _ => Ok(Response::new(405, "Method Not Allowed"))
 ///         }
@@ -352,7 +352,7 @@ impl AnyEndpoint {
     ///
     /// impl Endpoint for MyEndpoint {
     ///     async fn respond(&self, _request: &mut Request) -> Result<Response> {
-    ///         Ok(Response::new(200, &self.message))
+    ///         Ok(Response::new(200, self.message.as_str()))
     ///     }
     /// }
     ///

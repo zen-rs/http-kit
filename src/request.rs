@@ -783,7 +783,7 @@ impl Request {
     ///
     /// let body = request.take_body()?;
     /// // request.take_body() would now return an error
-    /// # Ok::<(), http_kit::body::BodyFrozen>(())
+    /// # Ok::<(), http_kit::BodyError>(())
     /// ```
     pub fn take_body(&mut self) -> Result<Body, BodyFrozen> {
         self.body.take()
@@ -841,7 +841,7 @@ impl Request {
     ///
     /// // Now request contains "Other content"
     /// // and other_body contains "Request content"
-    /// # Ok::<(), http_kit::body::BodyFrozen>(())
+    /// # Ok::<(), http_kit::BodyError>(())
     /// ```
     pub fn swap_body(&mut self, body: &mut Body) -> Result<(), BodyFrozen> {
         self.body.swap(body)
