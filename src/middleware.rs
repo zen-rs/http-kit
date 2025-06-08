@@ -37,7 +37,7 @@ use crate::{
     Endpoint, Request, Response, Result,
 };
 use alloc::boxed::Box;
-use core::{any::type_name, fmt::Debug, future::Future, pin::Pin};
+use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
 /// Trait for implementing middleware that can process HTTP requests and responses.
 ///
 /// Middleware sits between the initial request and the final endpoint, allowing you to
@@ -166,7 +166,7 @@ pub trait Middleware: Send + Sync {
     /// }
     /// ```
     fn handle(
-        &self,
+        &mut self,
         request: &mut Request,
         next: impl Endpoint,
     ) -> impl Future<Output = Result<Response>> + Send + Sync;
@@ -174,7 +174,7 @@ pub trait Middleware: Send + Sync {
 
 pub(crate) trait MiddlewareImpl: Send + Sync {
     fn handle_inner<'this, 'req, 'next, 'fut>(
-        &'this self,
+        &'this mut self,
         request: &'req mut Request,
         next: &'next dyn EndpointImpl,
     ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send + Sync>>
@@ -188,14 +188,14 @@ pub(crate) trait MiddlewareImpl: Send + Sync {
 }
 
 impl Endpoint for &dyn EndpointImpl {
-    async fn respond(&self, request: &mut Request) -> Result<Response> {
+    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
         self.respond_inner(request).await
     }
 }
 
 impl<T: Middleware> MiddlewareImpl for T {
     fn handle_inner<'this, 'req, 'next, 'fut>(
-        &'this self,
+        &'this mut self,
         request: &'req mut Request,
         next: &'next dyn EndpointImpl,
     ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send + Sync>>
@@ -208,9 +208,15 @@ impl<T: Middleware> MiddlewareImpl for T {
     }
 }
 
-impl<T: Middleware> Middleware for &T {
-    async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+impl<M: Middleware> Middleware for &mut M {
+    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
         Middleware::handle(*self, request, next).await
+    }
+}
+
+impl<M: Middleware> Middleware for Box<M> {
+    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+        Middleware::handle(self.deref_mut(), request, next).await
     }
 }
 
@@ -250,9 +256,9 @@ impl<T: Middleware> Middleware for &T {
 /// // Execution order: LoggingMiddleware → TimingMiddleware → endpoint
 /// ```
 impl<T1: Middleware, T2: Middleware> Middleware for (T1, T2) {
-    async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
         self.0
-            .handle(request, WithMiddleware::new(next, &self.1))
+            .handle(request, WithMiddleware::new(next, &mut self.1))
             .await
     }
 }
@@ -403,7 +409,7 @@ impl AnyMiddleware {
 }
 
 impl Middleware for AnyMiddleware {
-    async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
         self.0.handle_inner(request, &next).await
     }
 }
@@ -416,7 +422,7 @@ impl Middleware for AnyMiddleware {
 /// - Conditional middleware application
 /// - Testing scenarios where middleware is optional
 impl Middleware for () {
-    async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
         next.respond(request).await
     }
 }

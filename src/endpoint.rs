@@ -66,7 +66,7 @@
 //! let endpoint_with_logging = WithMiddleware::new(MyEndpoint, LoggingMiddleware);
 //! ```
 
-use core::{any::type_name, fmt::Debug, future::Future, pin::Pin};
+use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
 
 use alloc::boxed::Box;
 
@@ -165,14 +165,20 @@ pub trait Endpoint: Send + Sync {
     /// }
     /// ```
     fn respond(
-        &self,
+        &mut self,
         request: &mut Request,
     ) -> impl Future<Output = Result<Response>> + Send + Sync;
 }
 
-impl<T: Endpoint> Endpoint for &T {
-    async fn respond(&self, request: &mut Request) -> Result<Response> {
+impl<E: Endpoint> Endpoint for &mut E {
+    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
         Endpoint::respond(*self, request).await
+    }
+}
+
+impl<E: Endpoint> Endpoint for Box<E> {
+    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+        Endpoint::respond(self.deref_mut(), request).await
     }
 }
 
@@ -267,14 +273,14 @@ impl<E: Endpoint, M: Middleware> WithMiddleware<E, M> {
 }
 
 impl<E: Endpoint, M: Middleware> Endpoint for WithMiddleware<E, M> {
-    async fn respond(&self, request: &mut Request) -> Result<Response> {
-        self.middleware.handle(request, &self.endpoint).await
+    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+        self.middleware.handle(request, &mut self.endpoint).await
     }
 }
 
 pub(crate) trait EndpointImpl: Send + Sync {
     fn respond_inner<'this, 'req, 'fut>(
-        &'this self,
+        &'this mut self,
         request: &'req mut Request,
     ) -> Pin<Box<dyn 'fut + Send + Sync + Future<Output = Result<Response>>>>
     where
@@ -389,7 +395,7 @@ impl AnyEndpoint {
 
 impl<E: Endpoint> EndpointImpl for E {
     fn respond_inner<'this, 'req, 'fut>(
-        &'this self,
+        &'this mut self,
         request: &'req mut Request,
     ) -> Pin<Box<dyn 'fut + Send + Sync + Future<Output = Result<Response>>>>
     where
@@ -401,7 +407,7 @@ impl<E: Endpoint> EndpointImpl for E {
 }
 
 impl Endpoint for AnyEndpoint {
-    async fn respond(&self, request: &mut Request) -> Result<Response> {
+    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
         self.0.respond_inner(request).await
     }
 }
