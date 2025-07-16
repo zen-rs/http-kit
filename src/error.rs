@@ -406,3 +406,47 @@ impl<T> ResultExt<T> for Option<T> {
         self.ok_or(Error::msg("None Error").set_status(status))
     }
 }
+
+/// Constructs an error with a formatted message and an associated HTTP status code.
+///
+/// This macro simplifies the creation of error values that include both a custom message
+/// (formatted using the standard Rust formatting syntax) and an HTTP status code. The status
+/// code is converted into a [`StatusCode`] type, and the message is wrapped in an [`Error`].
+/// The resulting error has its status set accordingly.
+///
+/// # Arguments
+///
+/// * `$fmt` - A format string, as used in [`format!`], describing how to format the error message.
+/// * `$status` - An expression that can be converted into a [`StatusCode`]. If the conversion fails,
+///   the macro will panic with "Invalid status code".
+/// * `$args` - Zero or more additional arguments for the format string.
+///
+/// # Example
+///
+/// ```rust
+/// msg!("Resource not found: {}", 404, resource_id);
+/// ```
+///
+/// This will create an error with the message "Resource not found: {resource_id}" and set the status code to 404.
+///
+/// # Panics
+///
+/// Panics if `$status` cannot be converted into a valid [`StatusCode`].
+///
+/// # Notes
+///
+/// - The macro requires that `$crate::StatusCode` and `$crate::Error` are available in scope.
+/// - The macro uses `alloc::format!` for message formatting, so it requires the `alloc` crate.
+///
+/// [`StatusCode`]: crate::StatusCode
+/// [`Error`]: crate::Error
+/// [`format!`]: https://doc.rust-lang.org/std/macro.format.html
+#[macro_export]
+macro_rules! msg {
+    ($fmt:expr,$status:expr $(, $args:expr)* $(,)?) => {
+        let status: $crate::StatusCode = $status.try_into().expect("Invalid status code");
+        let message = alloc::format!($fmt $(, $args)*);
+        let error = $crate::Error::msg(message);
+        error.set_status(status)
+    };
+}
