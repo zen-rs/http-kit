@@ -950,19 +950,13 @@ impl Stream for Body {
 impl HttpBody for Body {
     type Data = Bytes;
 
-    type Error = BoxcoreError;
+    type Error = BoxCoreError;
 
-    fn poll_data(
+    fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         self.poll_next(cx)
-    }
-
-    fn poll_trailers(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
-        Poll::Ready(Ok(None))
+            .map(|opt| opt.map(|result| result.map(http_body::Frame::data)))
     }
 }
