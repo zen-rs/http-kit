@@ -1,4 +1,3 @@
-#![deny(unsafe_code)]
 #![no_std]
 #![warn(missing_docs, missing_debug_implementations)]
 //! A flexible and ergonomic HTTP toolkit for Rust.
@@ -92,11 +91,10 @@ mod error;
 pub use error::{Error, Result, ResultExt};
 
 mod body;
-
-#[cfg(feature = "fs")]
-pub(crate) mod mime_guess;
 pub use body::Body;
-pub use body::Error as BodyError;
+
+#[cfg(feature = "mime")]
+pub(crate) mod mime_guess;
 
 pub mod middleware;
 #[doc(inline)]
@@ -106,11 +104,9 @@ pub mod endpoint;
 #[doc(inline)]
 pub use endpoint::Endpoint;
 
-mod request;
 pub mod utils;
-pub use request::Request;
-mod response;
-pub use response::Response;
+pub use http::Request;
+pub use http::Response;
 
 #[cfg(feature = "cookie")]
 pub use cookie;

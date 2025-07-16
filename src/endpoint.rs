@@ -66,9 +66,21 @@
 //! let endpoint_with_logging = WithMiddleware::new(MyEndpoint, LoggingMiddleware);
 //! ```
 
-use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
+use core::{
+    any::type_name,
+    fmt::{Debug, Display},
+    future::Future,
+    ops::DerefMut,
+    pin::Pin,
+};
 
+use crate::{
+    body::{self, erased, AnyBody},
+    Body,
+};
 use alloc::boxed::Box;
+use bytes::{Buf, Bytes};
+use http_body_util::{combinators::BoxBody, BodyExt};
 
 use crate::{Middleware, Request, Response, Result};
 
@@ -166,18 +178,18 @@ pub trait Endpoint: Send + Sync {
     /// ```
     fn respond(
         &mut self,
-        request: &mut Request,
-    ) -> impl Future<Output = Result<Response>> + Send + Sync;
+        request: &mut Request<impl Body>,
+    ) -> impl Future<Output = Result<Response<impl Body>>> + Send + Sync;
 }
 
 impl<E: Endpoint> Endpoint for &mut E {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    async fn respond(&mut self, request: &mut Request<impl Body>) -> Result<Response<impl Body>> {
         Endpoint::respond(*self, request).await
     }
 }
 
 impl<E: Endpoint> Endpoint for Box<E> {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    async fn respond(&mut self, request: &mut Request<impl Body>) -> Result<Response<impl Body>> {
         Endpoint::respond(self.deref_mut(), request).await
     }
 }
@@ -273,7 +285,7 @@ impl<E: Endpoint, M: Middleware> WithMiddleware<E, M> {
 }
 
 impl<E: Endpoint, M: Middleware> Endpoint for WithMiddleware<E, M> {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    async fn respond(&mut self, request: &mut Request<impl Body>) -> Result<Response<impl Body>> {
         self.middleware.handle(request, &mut self.endpoint).await
     }
 }
@@ -281,8 +293,8 @@ impl<E: Endpoint, M: Middleware> Endpoint for WithMiddleware<E, M> {
 pub(crate) trait EndpointImpl: Send + Sync {
     fn respond_inner<'this, 'req, 'fut>(
         &'this mut self,
-        request: &'req mut Request,
-    ) -> Pin<Box<dyn 'fut + Send + Sync + Future<Output = Result<Response>>>>
+        request: &'req mut Request<AnyBody>,
+    ) -> Pin<Box<dyn 'fut + Send + Sync + Future<Output = Result<Response<AnyBody>>>>>
     where
         'this: 'fut,
         'req: 'fut;
@@ -393,21 +405,66 @@ impl AnyEndpoint {
     }
 }
 
+pub(crate) struct AnyError(anyhow::Error);
+
+impl AnyError {
+    pub fn new<E: core::error::Error + Send + Sync + 'static>(error: E) -> Self {
+        Self(anyhow::Error::new(error))
+    }
+}
+
+impl Display for AnyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Debug for AnyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl core::error::Error for AnyError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
 impl<E: Endpoint> EndpointImpl for E {
     fn respond_inner<'this, 'req, 'fut>(
         &'this mut self,
-        request: &'req mut Request,
-    ) -> Pin<Box<dyn 'fut + Send + Sync + Future<Output = Result<Response>>>>
+        request: &'req mut Request<AnyBody>,
+    ) -> Pin<Box<dyn 'fut + Send + Sync + Future<Output = Result<Response<AnyBody>>>>>
     where
         'this: 'fut,
         'req: 'fut,
     {
-        Box::pin(self.respond(request))
+        Box::pin(async {
+            let response = self.respond(request).await?;
+            let response = response.map(|body| erased(body));
+            Ok(response)
+        })
     }
 }
 
 impl Endpoint for AnyEndpoint {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
-        self.0.respond_inner(request).await
+    async fn respond(&mut self, request: &mut Request<impl Body>) -> Result<Response<impl Body>> {
+        let fut;
+        take_mut::take(request, |req| {
+            let req = erase_request(req);
+            fut = self.0.respond_inner(&mut req);
+            downcast_request(req)
+        });
+        fut.await;
+        todo!()
     }
+}
+
+fn erase_request<T: Body>(request: Request<T>) -> Request<AnyBody> {
+    request.map(body::erased)
+}
+
+fn downcast_request<T: Body>(request: Request<AnyBody>) -> Request<T> {
+    request.map(|body| *body.downcast::<T>().unwrap())
 }
