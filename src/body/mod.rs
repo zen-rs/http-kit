@@ -77,8 +77,11 @@
 mod convert;
 mod error_type;
 mod utils;
+use crate::sse::{Event, SseStream};
 pub use error_type::Error;
 use futures_lite::{ready, Stream, StreamExt};
+use http_body::Frame;
+use http_body_util::{BodyExt, StreamBody};
 
 use self::utils::IntoAsyncRead;
 use bytestr::ByteStr;
@@ -91,15 +94,14 @@ use core::fmt::Debug;
 use core::mem::{replace, swap, take};
 use core::pin::Pin;
 use core::task::{Context, Poll};
-type BoxCoreError = Box<dyn core::error::Error + Send + Sync + 'static>;
-
-// A boxed steam object.
-type BoxStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxCoreError>> + Send + Sync + 'static>>;
+type BoxError = Box<dyn core::error::Error + Send + Sync + 'static>;
 
 // A boxed bufreader object.
 type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>;
 
-#[cfg(feature = "http_body")]
+type BoxHttpBody =
+    Pin<Box<dyn http_body::Body<Data = Bytes, Error = BoxError> + Send + Sync + 'static>>;
+
 pub use http_body::Body as HttpBody;
 
 /// Flexible HTTP body that can represent data in various forms.
@@ -151,7 +153,7 @@ enum BodyInner {
         reader: BoxBufReader,
         length: Option<usize>,
     },
-    Stream(BoxStream),
+    HttpBody(BoxHttpBody),
     Freeze,
 }
 
@@ -181,7 +183,46 @@ impl Body {
         }
     }
 
+    /// Creates a new body from any type implementing `http_body::Body`.
+    ///
+    /// This method allows wrapping any HTTP body implementation into this
+    /// `Body` type, providing a unified interface for different body sources.
+    /// The body data will be converted to `Bytes` and errors will be boxed.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `B` - The body type implementing `http_body::Body`
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    /// use http_body_util::Full;
+    /// use bytes::Bytes;
+    ///
+    /// let http_body = Full::new(Bytes::from("Hello, world!"));
+    /// let body = Body::new(http_body);
+    /// ```
+    pub fn new<B>(body: B) -> Self
+    where
+        B: Send + Sync + http_body::Body + 'static,
+        B::Data: Into<Bytes>,
+        B::Error: core::error::Error + Send + Sync,
+    {
+        Self {
+            inner: BodyInner::HttpBody(Box::pin(
+                body.map_frame(|result| result.map_data(|data| data.into()))
+                    .map_err(|e| {
+                        let b: BoxError = Box::new(e);
+                        b
+                    }),
+            )),
+        }
+    }
+
     /// Creates a new frozen body that cannot provide data.
+    ///
+    ///
     ///
     /// A frozen body represents a body that has been consumed and can no longer
     /// provide data. This is typically used internally after a body has been
@@ -274,13 +315,15 @@ impl Body {
     pub fn from_stream<T, E, S>(stream: S) -> Self
     where
         T: Into<Bytes> + Send + 'static,
-        E: Into<BoxCoreError>,
+        E: Into<BoxError>,
         S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
     {
         Self {
-            inner: BodyInner::Stream(Box::pin(
-                stream.map(|result| result.map(|data| data.into()).map_err(|error| error.into())),
-            )),
+            inner: BodyInner::HttpBody(Box::pin(StreamBody::new(stream.map(|result| {
+                result
+                    .map(|data| Frame::data(data.into()))
+                    .map_err(|error| error.into())
+            })))),
         }
     }
     /// Creates a body from bytes or byte-like data.
@@ -431,6 +474,46 @@ impl Body {
         Ok(Self::from_bytes(serde_urlencoded::to_string(value)?))
     }
 
+    /// Creates a body from a stream of Server-Sent Events (SSE).
+    ///
+    /// This method converts a stream of SSE events into a body that can be used
+    /// for HTTP responses. The events are formatted according to the SSE specification
+    /// and can be consumed by EventSource clients.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `S` - Stream type yielding `Result<Event, E>`
+    /// * `E` - Error type that can be converted to a boxed error
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::{Body, sse::Event};
+    /// use futures_lite::stream;
+    ///
+    /// # async fn example() {
+    /// let events = stream::iter(vec![
+    ///     Ok::<_, std::io::Error>(Event::default().data("Hello")),
+    ///     Ok(Event::default().data("World")),
+    /// ]);
+    ///
+    /// let body = Body::from_sse(events);
+    /// # }
+    /// ```
+    pub fn from_sse<S, E>(s: S) -> Self
+    where
+        S: Stream<Item = Result<Event, E>> + Send + Sync + 'static,
+        E: Into<BoxError> + Send + Sync + 'static,
+    {
+        Self {
+            inner: BodyInner::HttpBody(Box::pin(
+                crate::sse::into_body(s)
+                    .map_frame(|result| result.map_data(|data| data))
+                    .map_err(|e| e.into()),
+            )),
+        }
+    }
+
     /// Returns the length of the body in bytes, if known.
     ///
     /// This method returns `Some(length)` for in-memory bodies where the size
@@ -525,13 +608,17 @@ impl Body {
                     if data.is_empty() {
                         break;
                     } else {
+                        let len = data.len();
                         vec.extend_from_slice(data);
+                        reader.as_mut().consume(len);
                     }
                 }
                 Ok(vec.into())
             }
 
-            BodyInner::Stream(mut body) => {
+            BodyInner::HttpBody(body) => {
+                let mut body = body.into_data_stream();
+
                 let first = body.try_next().await?.unwrap_or_default();
                 let second = body.try_next().await?;
                 if let Some(second) = second {
@@ -607,6 +694,14 @@ impl Body {
     /// ```
     pub fn into_reader(self) -> impl AsyncBufRead + Send + Sync {
         IntoAsyncRead::new(self)
+    }
+
+    /// Converts the body into a Server-Sent Events (SSE) stream.
+    ///
+    /// This method transforms the body into a stream of SSE events, which can be used
+    /// to handle eventsource responses in HTTP servers or clients.
+    pub fn into_sse(self) -> SseStream {
+        SseStream::new(self)
     }
 
     /// Returns a reference to the body data as bytes.
@@ -908,7 +1003,7 @@ impl Default for Body {
 }
 
 impl Stream for Body {
-    type Item = Result<Bytes, BoxCoreError>;
+    type Item = Result<Bytes, BoxError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match &mut self.inner {
@@ -931,7 +1026,10 @@ impl Stream for Body {
                 }
                 Poll::Ready(Some(Ok(data)))
             }
-            BodyInner::Stream(stream) => stream.as_mut().poll_next(cx),
+            BodyInner::HttpBody(stream) => stream
+                .as_mut()
+                .poll_frame(cx)
+                .map_ok(|frame| frame.into_data().unwrap_or_default()),
             BodyInner::Freeze => Poll::Ready(Some(Err(Error::BodyFrozen.into()))),
         }
     }
@@ -940,17 +1038,19 @@ impl Stream for Body {
         match &self.inner {
             BodyInner::Once(bytes) => (bytes.len(), Some(bytes.len())),
             BodyInner::Reader { length, .. } => (0, *length),
-            BodyInner::Stream(body) => body.size_hint(),
+            BodyInner::HttpBody(body) => {
+                let hint = body.size_hint();
+                (hint.lower() as usize, hint.upper().map(|u| u as usize))
+            }
             BodyInner::Freeze => (0, None),
         }
     }
 }
 
-#[cfg(feature = "http_body")]
-impl HttpBody for Body {
+impl http_body::Body for Body {
     type Data = Bytes;
 
-    type Error = BoxCoreError;
+    type Error = Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -958,5 +1058,6 @@ impl HttpBody for Body {
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         self.poll_next(cx)
             .map(|opt| opt.map(|result| result.map(http_body::Frame::data)))
+            .map_err(Error::Other)
     }
 }

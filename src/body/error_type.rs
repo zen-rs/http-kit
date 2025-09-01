@@ -1,7 +1,7 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-use super::{BodyFrozen, BoxCoreError};
+use super::{BodyFrozen, BoxError};
 use core::error::Error as coreError;
 use core::fmt::Display;
 use core::str::Utf8Error;
@@ -67,7 +67,7 @@ pub enum Error {
     ///
     /// This is a catch-all for any other error that can occur during body operations,
     /// typically errors from underlying libraries or custom implementations.
-    Other(BoxCoreError),
+    Other(BoxError),
 }
 
 macro_rules! impl_body_error {
@@ -112,7 +112,7 @@ macro_rules! impl_body_error {
 impl_body_error![
     (Io, std::io::Error),
     (Utf8, Utf8Error),
-    (Other, BoxCoreError),
+    (Other, BoxError),
     (JsonError, serde_json::Error, "json"),
     (SerializeForm, serde_urlencoded::ser::Error, "form"),
     (DeserializeForm, serde_urlencoded::de::Error, "form")

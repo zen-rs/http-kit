@@ -11,13 +11,15 @@ use std::io::{self, BufRead, Read};
 
 use futures_lite::{AsyncBufRead, AsyncRead};
 
-use super::{Body, BodyInner, BoxBufReader, BoxStream};
+use crate::body::BoxHttpBody;
+
+use super::{Body, BodyInner, BoxBufReader};
 
 pub(crate) enum IntoAsyncRead {
     Once(Reader<Bytes>),
     Reader(BoxBufReader),
     Stream {
-        stream: Option<BoxStream>,
+        stream: Option<BoxHttpBody>,
         buf: Reader<Bytes>,
     },
     Freeze,
@@ -28,7 +30,7 @@ impl IntoAsyncRead {
         match body.inner {
             BodyInner::Once(data) => Self::Once(data.reader()),
             BodyInner::Reader { reader, .. } => Self::Reader(reader),
-            BodyInner::Stream(stream) => Self::Stream {
+            BodyInner::HttpBody(stream) => Self::Stream {
                 stream: Some(stream),
                 buf: Bytes::new().reader(),
             },
@@ -38,7 +40,7 @@ impl IntoAsyncRead {
 }
 
 fn poll_data(
-    optional_stream: &mut Option<BoxStream>,
+    optional_stream: &mut Option<BoxHttpBody>,
     buf: &mut Reader<Bytes>,
     cx: &mut Context<'_>,
 ) -> Poll<io::Result<()>> {
@@ -53,10 +55,14 @@ fn poll_data(
         return Poll::Ready(Ok(()));
     }
 
-    if let Some(data) = ready!(stream.as_mut().poll_next(cx))
+    if let Some(frame) = ready!(stream.as_mut().poll_frame(cx))
         .transpose()
         .map_err(io::Error::other)?
     {
+        let data = match frame.into_data() {
+            Ok(data) => data,
+            Err(_) => return Poll::Ready(Ok(())),
+        };
         if data.is_empty() {
             return poll_data(optional_stream, buf, cx);
         }

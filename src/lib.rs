@@ -88,9 +88,10 @@ extern crate alloc;
 #[macro_use]
 mod macros;
 
+pub mod sse;
+
 mod error;
 pub use error::{Error, Result, ResultExt};
-
 mod body;
 
 #[cfg(feature = "fs")]
@@ -106,11 +107,11 @@ pub mod endpoint;
 #[doc(inline)]
 pub use endpoint::Endpoint;
 
-mod request;
 pub mod utils;
-pub use request::Request;
-mod response;
-pub use response::Response;
+/// A type alias for HTTP requests with a custom `Body` type.
+pub type Request = http::Request<Body>;
+/// A type alias for HTTP responses with a custom `Body` type.
+pub type Response = http::Response<Body>;
 
 #[cfg(feature = "cookie")]
 pub use cookie;
