@@ -21,7 +21,7 @@
 //! struct MyMiddleware;
 //!
 //! impl Middleware for MyMiddleware {
-//!     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+//!     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 //!         // Pre-processing
 //!         let response = next.respond(request).await?;
 //!         // Post-processing
@@ -63,12 +63,12 @@ use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
 /// ## Request Logging Middleware
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint};
+/// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body};
 ///
 /// struct LoggingMiddleware;
 ///
 /// impl Middleware for LoggingMiddleware {
-///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 ///         println!("Incoming: {} {}", request.method(), request.uri());
 ///
 ///         let response = next.respond(request).await?;
@@ -82,21 +82,21 @@ use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
 /// ## Authentication Middleware
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint, StatusCode};
+/// use http_kit::{Request, Response, Result, Middleware, Endpoint, StatusCode, Body};
 ///
 /// struct AuthMiddleware {
 ///     required_token: String,
 /// }
 ///
 /// impl Middleware for AuthMiddleware {
-///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
-///         if let Some(auth_header) = request.get_header(http::header::AUTHORIZATION) {
+///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+///         if let Some(auth_header) = request.headers().get(http::header::AUTHORIZATION) {
 ///             if auth_header.as_bytes() == self.required_token.as_bytes() {
 ///                 return next.respond(request).await;
 ///             }
 ///         }
 ///
-///         Ok(Response::new(StatusCode::UNAUTHORIZED, "Authentication required"))
+///         Ok(Response::new(Body::from_bytes("Authentication required")))
 ///     }
 /// }
 /// ```
@@ -104,15 +104,15 @@ use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
 /// ## Response Header Middleware
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint};
+/// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body};
 ///
 /// struct HeaderMiddleware;
 ///
 /// impl Middleware for HeaderMiddleware {
-///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 ///         let mut response = next.respond(request).await?;
 ///
-///         response.insert_header(
+///         response.headers_mut().insert(
 ///             http::header::SERVER,
 ///             http::HeaderValue::from_static("http-kit/1.0")
 ///         );
@@ -147,12 +147,12 @@ pub trait Middleware: Send + Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Middleware, Endpoint};
+    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body};
     ///
     /// struct TimingMiddleware;
     ///
     /// impl Middleware for TimingMiddleware {
-    ///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+    ///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
     ///         let start = std::time::Instant::now();
     ///
     ///         // Call the next middleware or endpoint
@@ -229,11 +229,11 @@ impl<M: Middleware> Middleware for Box<M> {
 /// # Examples
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint};
+/// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body};
 ///
 /// struct LoggingMiddleware;
 /// impl Middleware for LoggingMiddleware {
-///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 ///         println!("Before request");
 ///         let response = next.respond(request).await;
 ///         println!("After request");
@@ -243,7 +243,7 @@ impl<M: Middleware> Middleware for Box<M> {
 ///
 /// struct TimingMiddleware;
 /// impl Middleware for TimingMiddleware {
-///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 ///         let start = std::time::Instant::now();
 ///         let response = next.respond(request).await;
 ///         println!("Elapsed: {:?}", start.elapsed());
@@ -286,11 +286,11 @@ impl<T1: Middleware, T2: Middleware> Middleware for (T1, T2) {
 /// ## Storing Mixed Middleware Types
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware};
+/// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body};
 ///
 /// struct LoggingMiddleware;
 /// impl Middleware for LoggingMiddleware {
-///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 ///         println!("Request: {}", request.uri());
 ///         next.respond(request).await
 ///     }
@@ -298,7 +298,7 @@ impl<T1: Middleware, T2: Middleware> Middleware for (T1, T2) {
 ///
 /// struct TimingMiddleware;
 /// impl Middleware for TimingMiddleware {
-///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 ///         let start = std::time::Instant::now();
 ///         let response = next.respond(request).await;
 ///         println!("Duration: {:?}", start.elapsed());
@@ -316,7 +316,7 @@ impl<T1: Middleware, T2: Middleware> Middleware for (T1, T2) {
 /// ## Dynamic Middleware Configuration
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware};
+/// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body};
 ///
 /// fn create_middleware(name: &str) -> Option<AnyMiddleware> {
 ///     match name {
@@ -328,13 +328,13 @@ impl<T1: Middleware, T2: Middleware> Middleware for (T1, T2) {
 ///
 /// # struct LoggingMiddleware;
 /// # impl Middleware for LoggingMiddleware {
-/// #     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+/// #     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 /// #         next.respond(request).await
 /// #     }
 /// # }
 /// # struct TimingMiddleware;
 /// # impl Middleware for TimingMiddleware {
-/// #     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+/// #     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 /// #         next.respond(request).await
 /// #     }
 /// # }
@@ -361,14 +361,14 @@ impl AnyMiddleware {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware};
+    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body};
     ///
     /// struct CustomMiddleware {
     ///     prefix: String,
     /// }
     ///
     /// impl Middleware for CustomMiddleware {
-    ///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+    ///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
     ///         println!("{}: Processing {}", self.prefix, request.uri());
     ///         next.respond(request).await
     ///     }
@@ -390,11 +390,11 @@ impl AnyMiddleware {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware};
+    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body};
     ///
     /// struct MyMiddleware;
     /// impl Middleware for MyMiddleware {
-    ///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+    ///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
     ///         next.respond(request).await
     ///     }
     /// }

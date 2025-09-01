@@ -16,13 +16,13 @@
 //! ## Basic Endpoint Implementation
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, Endpoint};
+//! use http_kit::{Request, Response, Result, Endpoint, Body};
 //!
 //! struct HelloEndpoint;
 //!
 //! impl Endpoint for HelloEndpoint {
-//!     async fn respond(&self, _request: &mut Request) -> Result<Response> {
-//!         Ok(Response::new(200, "Hello, World!"))
+//!     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+//!         Ok(Response::new(Body::from_bytes("Hello, World!")))
 //!     }
 //! }
 //! ```
@@ -30,14 +30,14 @@
 //! ## Endpoint with Request Processing
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, Endpoint};
+//! use http_kit::{Request, Response, Result, Endpoint, Body};
 //!
 //! struct EchoEndpoint;
 //!
 //! impl Endpoint for EchoEndpoint {
-//!     async fn respond(&self, request: &mut Request) -> Result<Response> {
-//!         let body = request.take_body()?;
-//!         Ok(Response::new(200, body))
+//!     async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+//!         let body = std::mem::replace(request.body_mut(), Body::empty());
+//!         Ok(Response::new(body))
 //!     }
 //! }
 //! ```
@@ -45,12 +45,12 @@
 //! ## Using with Middleware
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware};
+//! use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware, Body};
 //!
 //! struct LoggingMiddleware;
 //!
 //! impl Middleware for LoggingMiddleware {
-//!     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+//!     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 //!         println!("Processing request to {}", request.uri());
 //!         next.respond(request).await
 //!     }
@@ -58,8 +58,8 @@
 //!
 //! struct MyEndpoint;
 //! impl Endpoint for MyEndpoint {
-//!     async fn respond(&self, _request: &mut Request) -> Result<Response> {
-//!         Ok(Response::new(200, "OK"))
+//!     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+//!         Ok(Response::new(Body::from_bytes("OK")))
 //!     }
 //! }
 //!
@@ -90,16 +90,16 @@ use crate::{Middleware, Request, Response, Result};
 /// ## Simple Text Response
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Endpoint};
+/// use http_kit::{Request, Response, Result, Endpoint, Body};
 ///
 /// struct GreetingEndpoint {
 ///     name: String,
 /// }
 ///
 /// impl Endpoint for GreetingEndpoint {
-///     async fn respond(&self, _request: &mut Request) -> Result<Response> {
+///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
 ///         let message = format!("Hello, {}!", self.name);
-///         Ok(Response::new(200, message))
+///         Ok(Response::new(Body::from_bytes(message)))
 ///     }
 /// }
 /// ```
@@ -109,7 +109,7 @@ use crate::{Middleware, Request, Response, Result};
 /// ```rust
 /// # #[cfg(feature = "json")]
 /// # {
-/// use http_kit::{Request, Response, Result, Endpoint};
+/// use http_kit::{Request, Response, Result, Endpoint, Body};
 /// use serde::{Serialize, Deserialize};
 ///
 /// #[derive(Serialize, Deserialize)]
@@ -118,18 +118,20 @@ use crate::{Middleware, Request, Response, Result};
 /// struct UserEndpoint;
 ///
 /// impl Endpoint for UserEndpoint {
-///     async fn respond(&self, request: &mut Request) -> Result<Response> {
+///     async fn respond(&mut self, request: &mut Request) -> Result<Response> {
 ///         match request.method().as_str() {
 ///             "GET" => {
 ///                 let user = User { name: "Alice".into(), age: 30 };
-///                 Ok(Response::empty().json(&user)?)
+///                 let body = Body::from_json(&user)?;
+///                 Ok(Response::new(body))
 ///             }
 ///             "POST" => {
-///                 let user: User = request.into_json().await?;
+///                 let user: User = request.body_mut().into_json().await?;
 ///                 // Process user...
-///                 Ok(Response::empty().json(&user)?)
+///                 let body = Body::from_json(&user)?;
+///                 Ok(Response::new(body))
 ///             }
-///             _ => Ok(Response::new(405, "Method Not Allowed"))
+///             _ => Ok(Response::new(Body::from_bytes("Method Not Allowed")))
 ///         }
 ///     }
 /// }
@@ -153,14 +155,14 @@ pub trait Endpoint: Send + Sync {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Endpoint};
+    /// use http_kit::{Request, Response, Result, Endpoint, Body};
     ///
     /// struct StatusEndpoint;
     ///
     /// impl Endpoint for StatusEndpoint {
-    ///     async fn respond(&self, request: &mut Request) -> Result<Response> {
+    ///     async fn respond(&mut self, request: &mut Request) -> Result<Response> {
     ///         let status = format!("Method: {}, URI: {}", request.method(), request.uri());
-    ///         Ok(Response::new(200, status))
+    ///         Ok(Response::new(Body::from_bytes(status)))
     ///     }
     /// }
     /// ```
@@ -197,11 +199,11 @@ impl<E: Endpoint> Endpoint for Box<E> {
 /// # Examples
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware};
+/// use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware, Body};
 ///
 /// struct TimingMiddleware;
 /// impl Middleware for TimingMiddleware {
-///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 ///         let start = std::time::Instant::now();
 ///         let response = next.respond(request).await;
 ///         let duration = start.elapsed();
@@ -212,8 +214,8 @@ impl<E: Endpoint> Endpoint for Box<E> {
 ///
 /// struct HelloEndpoint;
 /// impl Endpoint for HelloEndpoint {
-///     async fn respond(&self, _request: &mut Request) -> Result<Response> {
-///         Ok(Response::new(200, "Hello"))
+///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+///         Ok(Response::new(Body::from_bytes("Hello")))
 ///     }
 /// }
 ///
@@ -240,24 +242,24 @@ impl<E: Endpoint, M: Middleware> WithMiddleware<E, M> {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware};
+    /// use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware, Body};
     ///
     /// struct AuthMiddleware { token: String }
     /// impl Middleware for AuthMiddleware {
-    ///     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
-    ///         if let Some(auth) = request.get_header(http::header::AUTHORIZATION) {
+    ///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+    ///         if let Some(auth) = request.headers().get(http::header::AUTHORIZATION) {
     ///             if auth.as_bytes() == self.token.as_bytes() {
     ///                 return next.respond(request).await;
     ///             }
     ///         }
-    ///         Ok(Response::new(401, "Unauthorized"))
+    ///         Ok(Response::new(Body::from_bytes("Unauthorized")))
     ///     }
     /// }
     ///
     /// struct SecretEndpoint;
     /// impl Endpoint for SecretEndpoint {
-    ///     async fn respond(&self, _request: &mut Request) -> Result<Response> {
-    ///         Ok(Response::new(200, "Secret data"))
+    ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+    ///         Ok(Response::new(Body::from_bytes("Secret data")))
     ///     }
     /// }
     ///
@@ -307,19 +309,19 @@ pub(crate) trait EndpointImpl: Send + Sync {
 /// # Examples
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint};
+/// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint, Body};
 ///
 /// struct HelloEndpoint;
 /// impl Endpoint for HelloEndpoint {
-///     async fn respond(&self, _request: &mut Request) -> Result<Response> {
-///         Ok(Response::new(200, "Hello"))
+///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+///         Ok(Response::new(Body::from_bytes("Hello")))
 ///     }
 /// }
 ///
 /// struct GoodbyeEndpoint;
 /// impl Endpoint for GoodbyeEndpoint {
-///     async fn respond(&self, _request: &mut Request) -> Result<Response> {
-///         Ok(Response::new(200, "Goodbye"))
+///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+///         Ok(Response::new(Body::from_bytes("Goodbye")))
 ///     }
 /// }
 ///
@@ -350,15 +352,15 @@ impl AnyEndpoint {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint};
+    /// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint, Body};
     ///
     /// struct MyEndpoint {
     ///     message: String,
     /// }
     ///
     /// impl Endpoint for MyEndpoint {
-    ///     async fn respond(&self, _request: &mut Request) -> Result<Response> {
-    ///         Ok(Response::new(200, self.message.as_str()))
+    ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+    ///         Ok(Response::new(Body::from_bytes(self.message.clone())))
     ///     }
     /// }
     ///
@@ -376,12 +378,12 @@ impl AnyEndpoint {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint};
+    /// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint, Body};
     ///
     /// struct MyEndpoint;
     /// impl Endpoint for MyEndpoint {
-    ///     async fn respond(&self, _request: &mut Request) -> Result<Response> {
-    ///         Ok(Response::new(200, "OK"))
+    ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+    ///         Ok(Response::new(Body::from_bytes("OK")))
     ///     }
     /// }
     ///

@@ -424,29 +424,31 @@ impl<T> ResultExt<T> for Option<T> {
 /// # Example
 ///
 /// ```rust
-/// msg!("Resource not found: {}", 404, resource_id);
+/// extern crate alloc;
+/// use http_kit::msg;
+/// 
+/// fn example() -> http_kit::Result<()> {
+///     let resource_id = "user123";
+///     Err(msg!("Resource not found: {}", 404, resource_id))
+/// }
 /// ```
 ///
-/// This will create an error with the message "Resource not found: {resource_id}" and set the status code to 404.
+/// This will create an error with the message "Resource not found: user123" and set the status code to 404.
 ///
 /// # Panics
 ///
-/// Panics if `$status` cannot be converted into a valid [`StatusCode`].
+/// Panics if the status code cannot be converted into a valid StatusCode.
 ///
 /// # Notes
 ///
-/// - The macro requires that `$crate::StatusCode` and `$crate::Error` are available in scope.
-/// - The macro uses `alloc::format!` for message formatting, so it requires the `alloc` crate.
-///
-/// [`StatusCode`]: crate::StatusCode
-/// [`Error`]: crate::Error
-/// [`format!`]: https://doc.rust-lang.org/std/macro.format.html
+/// - The macro requires that StatusCode and Error types are available in scope.
+/// - The macro uses alloc::format! for message formatting, so it requires the alloc crate.
 #[macro_export]
 macro_rules! msg {
-    ($fmt:expr,$status:expr $(, $args:expr)* $(,)?) => {
+    ($fmt:expr,$status:expr $(, $args:expr)* $(,)?) => {{
         let status: $crate::StatusCode = $status.try_into().expect("Invalid status code");
         let message = alloc::format!($fmt $(, $args)*);
         let error = $crate::Error::msg(message);
         error.set_status(status)
-    };
+    }};
 }

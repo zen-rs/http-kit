@@ -12,11 +12,9 @@
 //!
 //! ```rust
 //! // Basic SSE event creation and formatting
-//! use http_kit::sse::*;
+//! use http_kit::sse::Event;
 //!
-//! let event = SseEvent::new()
-//!     .data("Hello, World!")
-//!     .event_type("message");
+//! let event = Event::new("my-id", "Hello, World!");
 //! ```
 use alloc::string::{String, ToString};
 use bytes::Bytes;

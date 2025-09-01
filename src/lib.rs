@@ -29,16 +29,15 @@
 //! ## Basic Request/Response Handling
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result};
+//! use http_kit::{Request, Response, Result, Body};
 //!
 //! async fn echo_handler(mut request: Request) -> Result<Response> {
-//!     let body = request.take_body()?;
-//!     Ok(Response::new(200, body))
+//!     let body = std::mem::replace(request.body_mut(), Body::empty());
+//!     Ok(Response::new(body))
 //! }
 //!
 //! # async fn example() -> Result<()> {
-//! let mut request = Request::get("/echo");
-//! request.replace_body("Hello, world!");
+//! let mut request = Request::new(Body::from_bytes("Hello, world!"));
 //! let response = echo_handler(request).await?;
 //! # Ok(())
 //! # }
@@ -49,7 +48,7 @@
 //! ```rust
 //! # #[cfg(feature = "json")]
 //! # {
-//! use http_kit::{Request, Response, Result};
+//! use http_kit::{Request, Response, Result, Body};
 //! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Serialize, Deserialize)]
@@ -59,9 +58,10 @@
 //! }
 //!
 //! async fn create_user(mut request: Request) -> Result<Response> {
-//!     let user: User = request.into_json().await?;
+//!     let user: User = request.body_mut().into_json().await?;
 //!     // Process user...
-//!     Ok(Response::empty().json(&user)?)
+//!     let response_body = Body::from_json(&user)?;
+//!     Ok(Response::new(response_body))
 //! }
 //! # }
 //! ```
@@ -69,12 +69,12 @@
 //! ## Middleware Usage
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, Middleware, Endpoint};
+//! use http_kit::{Request, Response, Result, Middleware, Endpoint, Body};
 //!
 //! struct LoggingMiddleware;
 //!
 //! impl Middleware for LoggingMiddleware {
-//!     async fn handle(&self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+//!     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
 //!         println!("Request: {} {}", request.method(), request.uri());
 //!         let response = next.respond(request).await?;
 //!         println!("Response: {}", response.status());

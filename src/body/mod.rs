@@ -493,8 +493,8 @@ impl Body {
     ///
     /// # async fn example() {
     /// let events = stream::iter(vec![
-    ///     Ok::<_, std::io::Error>(Event::default().data("Hello")),
-    ///     Ok(Event::default().data("World")),
+    ///     Ok::<_, std::io::Error>(Event::new("1", "Hello")),
+    ///     Ok(Event::new("2", "World")),
     /// ]);
     ///
     /// let body = Body::from_sse(events);
