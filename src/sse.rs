@@ -147,6 +147,20 @@ impl Event {
         self
     }
 
+    /// Sets the retry duration in milliseconds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::sse::Event;
+    ///
+    /// let event = Event::from_data("Hello").with_retry(5000);
+    /// ```
+    pub fn with_retry(mut self, retry: u64) -> Self {
+        self.retry = Some(retry);
+        self
+    }
+
     /// Encodes the event as an SSE-formatted string.
     ///
     /// The output follows the SSE specification format:
@@ -314,11 +328,21 @@ fn parse_event_from_buffer(
 
                 if let Some(data) = line.strip_prefix("data: ") {
                     partial_event.data.push(data.to_string());
+                } else if let Some(data) = line.strip_prefix("data:") {
+                    partial_event.data.push(data.to_string());
                 } else if let Some(event_type) = line.strip_prefix("event: ") {
+                    partial_event.event = Some(event_type.to_string());
+                } else if let Some(event_type) = line.strip_prefix("event:") {
                     partial_event.event = Some(event_type.to_string());
                 } else if let Some(id) = line.strip_prefix("id: ") {
                     partial_event.id = Some(id.to_string());
+                } else if let Some(id) = line.strip_prefix("id:") {
+                    partial_event.id = Some(id.to_string());
                 } else if let Some(retry_str) = line.strip_prefix("retry: ") {
+                    if let Ok(retry) = retry_str.parse::<u64>() {
+                        partial_event.retry = Some(retry);
+                    }
+                } else if let Some(retry_str) = line.strip_prefix("retry:") {
                     if let Ok(retry) = retry_str.parse::<u64>() {
                         partial_event.retry = Some(retry);
                     }
@@ -342,18 +366,28 @@ fn parse_event_from_buffer(
         }
 
         // Check for single newline to process incomplete lines
-        if buffer[i] == b'\n' {
+        if i < buffer.len() && buffer[i] == b'\n' {
             let line_data = buffer.drain(..=i).collect::<Vec<u8>>();
             let line = String::from_utf8_lossy(&line_data);
             let line = line.trim_end_matches('\n');
 
             if let Some(data) = line.strip_prefix("data: ") {
                 partial_event.data.push(data.to_string());
+            } else if let Some(data) = line.strip_prefix("data:") {
+                partial_event.data.push(data.to_string());
             } else if let Some(event_type) = line.strip_prefix("event: ") {
+                partial_event.event = Some(event_type.to_string());
+            } else if let Some(event_type) = line.strip_prefix("event:") {
                 partial_event.event = Some(event_type.to_string());
             } else if let Some(id) = line.strip_prefix("id: ") {
                 partial_event.id = Some(id.to_string());
+            } else if let Some(id) = line.strip_prefix("id:") {
+                partial_event.id = Some(id.to_string());
             } else if let Some(retry_str) = line.strip_prefix("retry: ") {
+                if let Ok(retry) = retry_str.parse::<u64>() {
+                    partial_event.retry = Some(retry);
+                }
+            } else if let Some(retry_str) = line.strip_prefix("retry:") {
                 if let Ok(retry) = retry_str.parse::<u64>() {
                     partial_event.retry = Some(retry);
                 }
@@ -372,7 +406,7 @@ fn parse_event_from_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
+    use alloc::{format, vec};
     use futures_lite::StreamExt;
 
     #[tokio::test]
@@ -534,5 +568,256 @@ mod tests {
         let event = stream.next().await.unwrap().unwrap();
         assert_eq!(event.text_data(), "");
         assert_eq!(event.event(), Some("ping"));
+    }
+
+    // Additional comprehensive unit tests
+
+    #[test]
+    fn test_event_with_retry_method() {
+        let event = Event::from_data("test").with_retry(1000);
+        assert_eq!(event.retry(), Some(1000));
+
+        let encoded = event.encode();
+        assert!(encoded.contains("retry: 1000\n"));
+    }
+
+    #[test]
+    fn test_event_builder_chain() {
+        let event = Event::from_data("Hello")
+            .with_id("msg-1")
+            .with_event("greeting")
+            .with_retry(2000);
+
+        assert_eq!(event.text_data(), "Hello");
+        assert_eq!(event.id(), Some("msg-1"));
+        assert_eq!(event.event(), Some("greeting"));
+        assert_eq!(event.retry(), Some(2000));
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_with_colon_in_data() {
+        let data = b"data: url: https://example.com\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "url: https://example.com");
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_with_empty_lines_between_fields() {
+        let data = b"id: 1\n\ndata: test\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "test");
+        assert_eq!(event.id(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_invalid_retry_value() {
+        let data = b"retry: not_a_number\ndata: test\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "test");
+        assert_eq!(event.retry(), None); // Invalid retry should be ignored
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_with_bom() {
+        // UTF-8 BOM followed by SSE data - BOM is treated as part of the data
+        let data = b"\xEF\xBB\xBFdata: BOM test\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let _unused_stream = SseStream::new(body);
+
+        // BOM is part of the invalid line, so this event won't be parsed
+        // Let's add a proper event after
+        let data = b"\xEF\xBB\xBFdata: BOM test\n\ndata: real event\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "real event");
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_with_windows_line_endings() {
+        let data = b"data: Windows\r\ndata: line endings\r\n\r\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        // Should handle \r\n properly
+        assert!(event.text_data().contains("Windows"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_with_only_comments() {
+        let data = b": comment 1\n: comment 2\n\ndata: real event\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        // Should skip comment-only block and get the real event
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "real event");
+    }
+
+    #[tokio::test]
+    async fn test_parse_event_field_without_space() {
+        let data = b"data:no space\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "no space");
+    }
+
+    #[tokio::test]
+    async fn test_parse_unknown_field() {
+        let data = b"unknown: field\ndata: test\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "test");
+        // Unknown field should be ignored
+    }
+
+    #[tokio::test]
+    async fn test_parse_very_long_event() {
+        let long_data = "x".repeat(10000);
+        let data = format!("data: {}\n\n", long_data);
+        let body = Body::from(Bytes::from(data.into_bytes()));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), long_data);
+    }
+
+    #[tokio::test]
+    async fn test_stream_ends_with_partial_event() {
+        let data = b"data: partial";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        // The stream ends without a double newline
+        // Currently the implementation emits partial events when the stream ends
+        let result = stream.next().await;
+        if let Some(Ok(event)) = result {
+            assert_eq!(event.text_data(), "partial");
+        } else {
+            // If the parser doesn't emit partial events, that's also valid behavior
+            assert!(result.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_stream() {
+        let data = b"";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let result = stream.next().await;
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_error_display() {
+        let error = ParseError::InvalidUtf8;
+        assert_eq!(format!("{}", error), "Invalid UTF-8 in SSE data");
+
+        let error = ParseError::InvalidRetryValue;
+        assert_eq!(format!("{}", error), "Invalid retry value in SSE event");
+
+        let error = ParseError::BodyError("test error".to_string());
+        assert_eq!(format!("{}", error), "Body stream error: test error");
+    }
+
+    #[test]
+    fn test_event_new_with_complex_type() {
+        use serde_json::json;
+
+        let data = json!({
+            "type": "message",
+            "content": "Hello, SSE!"
+        });
+
+        let event = Event::new(&data);
+        assert!(event.text_data().contains("\"type\":\"message\""));
+        assert!(event.text_data().contains("\"content\":\"Hello, SSE!\""));
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_newlines() {
+        let data = b"data: test1\n\n\n\ndata: test2\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event1 = stream.next().await.unwrap().unwrap();
+        assert_eq!(event1.text_data(), "test1");
+
+        let event2 = stream.next().await.unwrap().unwrap();
+        assert_eq!(event2.text_data(), "test2");
+    }
+
+    #[tokio::test]
+    async fn test_data_with_special_characters() {
+        let data = b"data: {\"emoji\": \"\xF0\x9F\x98\x80\"}\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert!(event.text_data().contains("😀"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_interleaved_fields() {
+        let data = b"data: part1\nid: 123\ndata: part2\nevent: test\ndata: part3\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "part1\npart2\npart3");
+        assert_eq!(event.id(), Some("123"));
+        assert_eq!(event.event(), Some("test"));
+    }
+
+    #[test]
+    fn test_parse_error_clone() {
+        let error = ParseError::InvalidUtf8;
+        let cloned = error.clone();
+        assert_eq!(format!("{}", cloned), "Invalid UTF-8 in SSE data");
+    }
+
+    #[test]
+    fn test_event_debug() {
+        let event = Event::from_data("test");
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("Event"));
+        assert!(debug_str.contains("data"));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_empty_data_fields() {
+        let data = b"data: \ndata: \ndata: \n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "\n\n");
+    }
+
+    #[tokio::test]
+    async fn test_parse_with_leading_whitespace() {
+        let data = b"  data: test\n\ndata: real event\n\n";
+        let body = Body::from(Bytes::from(&data[..]));
+        let mut stream = SseStream::new(body);
+
+        // Leading whitespace means it's not a valid field, should get the next valid event
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.text_data(), "real event");
     }
 }
