@@ -2,7 +2,7 @@
 name = "http-kit"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.87"
 authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT"
 description = "A flexible and ergonomic HTTP toolkit for Rust with async support, middleware, and zero-copy body handling"
@@ -48,9 +48,6 @@ optional = true
 [dependencies.cookie]
 version = "0.18"
 optional = true
-
-[dependencies.sse-stream]
-version = "0.2.1"
 
 [features]
 default = ["json", "form", "std", "cookie", "mime"]

@@ -79,6 +79,8 @@ mod error_type;
 mod utils;
 use crate::sse::{Event, SseStream};
 pub use error_type::Error;
+#[cfg(feature = "std")]
+extern crate std;
 use futures_lite::{ready, Stream, StreamExt};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
@@ -364,7 +366,7 @@ impl Body {
     ///
     /// # Errors
     ///
-    /// Returns an `io::Error` if the file cannot be opened or its metadata
+    /// Returns an `std::io::Error` if the file cannot be opened or its metadata
     /// cannot be read.
     ///
     /// # Examples
@@ -381,8 +383,8 @@ impl Body {
     /// # }
     /// # }
     /// ```
-    #[cfg(feature = "fs")]
-    pub async fn from_file(path: impl AsRef<core::path::Path>) -> Result<Self, core::io::Error> {
+    #[cfg(all(feature = "fs", feature = "std"))]
+    pub async fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
         let file = async_fs::File::open(path).await?;
         let len = file.metadata().await?.len() as usize;
         Ok(Self::from_reader(
@@ -493,8 +495,8 @@ impl Body {
     ///
     /// # async fn example() {
     /// let events = stream::iter(vec![
-    ///     Ok::<_, std::io::Error>(Event::new("1", "Hello")),
-    ///     Ok(Event::new("2", "World")),
+    ///     Ok::<_, std::io::Error>(Event::from_data("Hello").with_id("1")),
+    ///     Ok(Event::from_data("World").with_id("2")),
     /// ]);
     ///
     /// let body = Body::from_sse(events);
