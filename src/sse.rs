@@ -28,8 +28,10 @@ use futures_lite::{Stream, StreamExt};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use pin_project_lite::pin_project;
+#[cfg(feature = "json")]
 use serde::Serialize;
-use serde_json::to_string;
+#[cfg(feature = "json")]
+use serde_json::{self, to_string};
 
 use crate::Body;
 
@@ -45,20 +47,32 @@ pub struct Event {
 impl Event {
     /// Creates a new SSE event from JSON-serializable data.
     ///
+    /// This helper is available when the `json` feature is enabled and returns an
+    /// error instead of panicking if serialization fails.
+    ///
     /// # Examples
     ///
     /// ```rust
+    /// # #[cfg(feature = "json")]
+    /// # {
     /// use http_kit::sse::Event;
     /// use serde::Serialize;
     ///
     /// #[derive(Serialize)]
     /// struct Message { text: String }
     ///
+    /// # fn demo() -> Result<(), serde_json::Error> {
     /// let msg = Message { text: "Hello".to_string() };
-    /// let event = Event::new(&msg);
+    /// let event = Event::new(&msg)?;
+    /// # let _ = event;
+    /// # Ok(())
+    /// # }
+    /// # demo().unwrap();
+    /// # }
     /// ```
-    pub fn new<T: Serialize>(data: &T) -> Self {
-        Self::from_data(to_string(&data).expect("Failed to serialize data"))
+    #[cfg(feature = "json")]
+    pub fn new<T: Serialize>(data: &T) -> Result<Self, serde_json::Error> {
+        Ok(Self::from_data(to_string(data)?))
     }
 
     /// Creates a new SSE event from string data.
@@ -109,9 +123,12 @@ impl Event {
 
     /// Deserializes the event data as JSON.
     ///
+    /// This helper is available when the `json` feature is enabled.
+    ///
     /// # Errors
     ///
     /// Returns an error if the data cannot be deserialized as the specified type.
+    #[cfg(feature = "json")]
     pub fn data<T>(&self) -> Result<T, serde_json::Error>
     where
         T: for<'de> serde::Deserialize<'de>,
@@ -291,14 +308,7 @@ impl Stream for SseStream {
                 Poll::Ready(None) => {
                     // Stream ended, check if we have a partial event to emit
                     if !this.partial_event.data.is_empty() {
-                        let event = Event {
-                            id: this.partial_event.id.take(),
-                            event: this.partial_event.event.take(),
-                            data: this.partial_event.data.join("\n"),
-                            retry: this.partial_event.retry.take(),
-                        };
-                        this.partial_event.data.clear();
-                        return Poll::Ready(Some(Ok(event)));
+                        return Poll::Ready(Some(Ok(finalize_event(this.partial_event))));
                     }
                     return Poll::Ready(None);
                 }
@@ -312,95 +322,72 @@ fn parse_event_from_buffer(
     buffer: &mut Vec<u8>,
     partial_event: &mut PartialEvent,
 ) -> Option<Event> {
-    // Find the next double newline (event separator)
-    let mut i = 0;
-    while i < buffer.len() {
-        if i + 1 < buffer.len() && buffer[i] == b'\n' && buffer[i + 1] == b'\n' {
-            // Found event separator
-            let event_data = buffer.drain(..=i + 1).collect::<Vec<u8>>();
-
-            // Parse the event lines
-            let event_str = String::from_utf8_lossy(&event_data);
-            for line in event_str.lines() {
-                if line.is_empty() {
-                    continue;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    partial_event.data.push(data.to_string());
-                } else if let Some(data) = line.strip_prefix("data:") {
-                    partial_event.data.push(data.to_string());
-                } else if let Some(event_type) = line.strip_prefix("event: ") {
-                    partial_event.event = Some(event_type.to_string());
-                } else if let Some(event_type) = line.strip_prefix("event:") {
-                    partial_event.event = Some(event_type.to_string());
-                } else if let Some(id) = line.strip_prefix("id: ") {
-                    partial_event.id = Some(id.to_string());
-                } else if let Some(id) = line.strip_prefix("id:") {
-                    partial_event.id = Some(id.to_string());
-                } else if let Some(retry_str) = line.strip_prefix("retry: ") {
-                    if let Ok(retry) = retry_str.parse::<u64>() {
-                        partial_event.retry = Some(retry);
-                    }
-                } else if let Some(retry_str) = line.strip_prefix("retry:") {
-                    if let Ok(retry) = retry_str.parse::<u64>() {
-                        partial_event.retry = Some(retry);
-                    }
-                } else if line == ":" || line.starts_with(": ") {
-                    // Comment line, ignore
-                    continue;
-                }
-            }
-
-            // If we have data, emit an event
+    while let Some(line) = read_line(buffer) {
+        if line.is_empty() {
             if !partial_event.data.is_empty() {
-                let event = Event {
-                    id: partial_event.id.take(),
-                    event: partial_event.event.take(),
-                    data: partial_event.data.join("\n"),
-                    retry: partial_event.retry.take(),
-                };
-                partial_event.data.clear();
-                return Some(event);
+                return Some(finalize_event(partial_event));
             }
+            continue;
         }
 
-        // Check for single newline to process incomplete lines
-        if i < buffer.len() && buffer[i] == b'\n' {
-            let line_data = buffer.drain(..=i).collect::<Vec<u8>>();
-            let line = String::from_utf8_lossy(&line_data);
-            let line = line.trim_end_matches('\n');
+        let line = String::from_utf8_lossy(&line);
 
-            if let Some(data) = line.strip_prefix("data: ") {
-                partial_event.data.push(data.to_string());
-            } else if let Some(data) = line.strip_prefix("data:") {
-                partial_event.data.push(data.to_string());
-            } else if let Some(event_type) = line.strip_prefix("event: ") {
-                partial_event.event = Some(event_type.to_string());
-            } else if let Some(event_type) = line.strip_prefix("event:") {
-                partial_event.event = Some(event_type.to_string());
-            } else if let Some(id) = line.strip_prefix("id: ") {
-                partial_event.id = Some(id.to_string());
-            } else if let Some(id) = line.strip_prefix("id:") {
-                partial_event.id = Some(id.to_string());
-            } else if let Some(retry_str) = line.strip_prefix("retry: ") {
-                if let Ok(retry) = retry_str.parse::<u64>() {
-                    partial_event.retry = Some(retry);
-                }
-            } else if let Some(retry_str) = line.strip_prefix("retry:") {
-                if let Ok(retry) = retry_str.parse::<u64>() {
-                    partial_event.retry = Some(retry);
-                }
+        if line.starts_with(':') {
+            continue;
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            partial_event.data.push(data.to_string());
+        } else if let Some(data) = line.strip_prefix("data:") {
+            partial_event.data.push(data.to_string());
+        } else if let Some(event_type) = line.strip_prefix("event: ") {
+            partial_event.event = Some(event_type.to_string());
+        } else if let Some(event_type) = line.strip_prefix("event:") {
+            partial_event.event = Some(event_type.to_string());
+        } else if let Some(id) = line.strip_prefix("id: ") {
+            partial_event.id = Some(id.to_string());
+        } else if let Some(id) = line.strip_prefix("id:") {
+            partial_event.id = Some(id.to_string());
+        } else if let Some(retry_str) = line.strip_prefix("retry: ") {
+            if let Ok(retry) = retry_str.parse::<u64>() {
+                partial_event.retry = Some(retry);
             }
-
-            // Reset i since we modified the buffer
-            i = 0;
-        } else {
-            i += 1;
+        } else if let Some(retry_str) = line.strip_prefix("retry:") {
+            if let Ok(retry) = retry_str.parse::<u64>() {
+                partial_event.retry = Some(retry);
+            }
         }
     }
 
     None
+}
+
+fn read_line(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buffer.is_empty() {
+        return None;
+    }
+
+    let newline_idx = buffer.iter().position(|b| *b == b'\n' || *b == b'\r')?;
+
+    let line = buffer.drain(..newline_idx).collect::<Vec<u8>>();
+    // Remove the newline character we stopped at.
+    if !buffer.is_empty() {
+        let newline = buffer.remove(0);
+        if newline == b'\r' && !buffer.is_empty() && buffer[0] == b'\n' {
+            buffer.remove(0);
+        }
+    }
+
+    Some(line)
+}
+
+fn finalize_event(partial_event: &mut PartialEvent) -> Event {
+    let event = Event {
+        id: partial_event.id.take(),
+        event: partial_event.event.take(),
+        data: partial_event.data.join("\n"),
+        retry: partial_event.retry.take(),
+    };
+    partial_event.data.clear();
+    event
 }
 
 #[cfg(test)]
@@ -513,6 +500,7 @@ mod tests {
         assert!(encoded.ends_with("\n\n"));
     }
 
+    #[cfg(feature = "json")]
     #[tokio::test]
     async fn test_json_serialization() {
         #[derive(Serialize, serde::Deserialize, PartialEq, Debug)]
@@ -526,7 +514,7 @@ mod tests {
             count: 42,
         };
 
-        let event = Event::new(&data);
+        let event = Event::new(&data).unwrap();
         assert!(event.text_data().contains("\"message\":\"Hello\""));
         assert!(event.text_data().contains("\"count\":42"));
 
@@ -736,6 +724,7 @@ mod tests {
         assert_eq!(format!("{}", error), "Body stream error: test error");
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn test_event_new_with_complex_type() {
         use serde_json::json;
@@ -745,7 +734,7 @@ mod tests {
             "content": "Hello, SSE!"
         });
 
-        let event = Event::new(&data);
+        let event = Event::new(&data).unwrap();
         assert!(event.text_data().contains("\"type\":\"message\""));
         assert!(event.text_data().contains("\"content\":\"Hello, SSE!\""));
     }

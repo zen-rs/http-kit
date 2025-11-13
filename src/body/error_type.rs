@@ -2,6 +2,8 @@
 extern crate std;
 
 use super::{BodyFrozen, BoxError};
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
 use core::error::Error as coreError;
 use core::fmt::Display;
 use core::str::Utf8Error;
@@ -121,7 +123,7 @@ impl_body_error![
 #[cfg(not(feature = "std"))]
 impl_body_error![
     (Utf8, Utf8Error),
-    (Other, BoxcoreError),
+    (Other, BoxError),
     (JsonError, serde_json::Error, "json"),
     (SerializeForm, serde_urlencoded::ser::Error, "form"),
     (DeserializeForm, serde_urlencoded::de::Error, "form")
@@ -130,5 +132,12 @@ impl_body_error![
 impl From<BodyFrozen> for Error {
     fn from(_error: BodyFrozen) -> Self {
         Self::BodyFrozen
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl From<futures_lite::io::Error> for Error {
+    fn from(error: futures_lite::io::Error) -> Self {
+        Self::Other(Box::new(error))
     }
 }

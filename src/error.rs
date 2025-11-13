@@ -426,7 +426,7 @@ impl<T> ResultExt<T> for Option<T> {
 /// ```rust
 /// extern crate alloc;
 /// use http_kit::msg;
-/// 
+///
 /// fn example() -> http_kit::Result<()> {
 ///     let resource_id = "user123";
 ///     Err(msg!("Resource not found: {}", 404, resource_id))

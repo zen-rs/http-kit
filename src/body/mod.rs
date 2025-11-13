@@ -76,6 +76,7 @@
 // ```
 mod convert;
 mod error_type;
+#[cfg(feature = "std")]
 mod utils;
 use crate::sse::{Event, SseStream};
 pub use error_type::Error;
@@ -85,6 +86,7 @@ use futures_lite::{ready, Stream, StreamExt};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
 
+#[cfg(feature = "std")]
 use self::utils::IntoAsyncRead;
 use bytestr::ByteStr;
 
@@ -539,10 +541,10 @@ impl Body {
     /// assert_eq!(empty.len(), Some(0));
     /// ```
     pub const fn len(&self) -> Option<usize> {
-        if let BodyInner::Once(bytes) = &self.inner {
-            Some(bytes.len())
-        } else {
-            None
+        match &self.inner {
+            BodyInner::Once(bytes) => Some(bytes.len()),
+            BodyInner::Reader { length, .. } => *length,
+            _ => None,
         }
     }
 
@@ -694,6 +696,7 @@ impl Body {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "std")]
     pub fn into_reader(self) -> impl AsyncBufRead + Send + Sync {
         IntoAsyncRead::new(self)
     }
@@ -1023,8 +1026,8 @@ impl Stream for Body {
                 }
                 let data = Bytes::copy_from_slice(data);
                 reader.as_mut().consume(data.len());
-                if let Some(length) = length {
-                    *length -= data.len();
+                if let Some(known_length) = length {
+                    *known_length = known_length.saturating_sub(data.len());
                 }
                 Poll::Ready(Some(Ok(data)))
             }

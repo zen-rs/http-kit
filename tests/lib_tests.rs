@@ -215,7 +215,7 @@ async fn test_sse_basic() {
     // We'll create a simple stream for testing
     let events = futures_lite::stream::iter(vec![
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-            http_kit::sse::Event::from_data("test data").with_id("1")
+            http_kit::sse::Event::from_data("test data").with_id("1"),
         ),
         Ok(http_kit::sse::Event::from_data("more data").with_id("2")),
     ]);
