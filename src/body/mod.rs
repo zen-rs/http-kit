@@ -101,10 +101,9 @@ use core::task::{Context, Poll};
 type BoxError = Box<dyn core::error::Error + Send + Sync + 'static>;
 
 // A boxed bufreader object.
-type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>;
+type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + 'static>>;
 
-type BoxHttpBody =
-    Pin<Box<dyn http_body::Body<Data = Bytes, Error = BoxError> + Send + Sync + 'static>>;
+type BoxHttpBody = Pin<Box<dyn http_body::Body<Data = Bytes, Error = BoxError> + Send + 'static>>;
 
 pub use http_body::Body as HttpBody;
 
@@ -209,7 +208,7 @@ impl Body {
     /// ```
     pub fn new<B>(body: B) -> Self
     where
-        B: Send + Sync + http_body::Body + 'static,
+        B: Send + http_body::Body + 'static,
         B::Data: Into<Bytes>,
         B::Error: core::error::Error + Send + Sync,
     {
@@ -255,7 +254,7 @@ impl Body {
     ///
     /// # Arguments
     ///
-    /// * `reader` - Any type implementing `AsyncBufRead + Send + Sync + 'static`
+    /// * `reader` - Any type implementing `AsyncBufRead + Send + 'static`
     /// * `length` - Optional hint about the total number of bytes to read
     ///
     /// # Examples
@@ -278,7 +277,7 @@ impl Body {
     /// # }
     /// ```
     pub fn from_reader(
-        reader: impl AsyncBufRead + Send + Sync + 'static,
+        reader: impl AsyncBufRead + Send + 'static,
         length: impl Into<Option<usize>>,
     ) -> Self {
         Self {
@@ -320,7 +319,7 @@ impl Body {
     where
         T: Into<Bytes> + Send + 'static,
         E: Into<BoxError>,
-        S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
+        S: Stream<Item = Result<T, E>> + Send + 'static,
     {
         Self {
             inner: BodyInner::HttpBody(Box::pin(StreamBody::new(stream.map(|result| {
@@ -506,7 +505,7 @@ impl Body {
     /// ```
     pub fn from_sse<S, E>(s: S) -> Self
     where
-        S: Stream<Item = Result<Event, E>> + Send + Sync + 'static,
+        S: Stream<Item = Result<Event, E>> + Send + 'static,
         E: Into<BoxError> + Send + Sync + 'static,
     {
         Self {
@@ -697,7 +696,7 @@ impl Body {
     /// # }
     /// ```
     #[cfg(feature = "std")]
-    pub fn into_reader(self) -> impl AsyncBufRead + Send + Sync {
+    pub fn into_reader(self) -> impl AsyncBufRead + Send {
         IntoAsyncRead::new(self)
     }
 

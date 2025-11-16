@@ -121,7 +121,7 @@ use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
 ///     }
 /// }
 /// ```
-pub trait Middleware: Send + Sync {
+pub trait Middleware: Send {
     /// Processes a request through the middleware chain.
     ///
     /// This method receives the current request and a `next` parameter representing
@@ -169,15 +169,15 @@ pub trait Middleware: Send + Sync {
         &mut self,
         request: &mut Request,
         next: impl Endpoint,
-    ) -> impl Future<Output = Result<Response>> + Send + Sync;
+    ) -> impl Future<Output = Result<Response>> + Send;
 }
 
-pub(crate) trait MiddlewareImpl: Send + Sync {
+pub(crate) trait MiddlewareImpl: Send {
     fn handle_inner<'this, 'req, 'next, 'fut>(
         &'this mut self,
         request: &'req mut Request,
-        next: &'next dyn EndpointImpl,
-    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send + Sync>>
+        next: &'next mut dyn EndpointImpl,
+    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send>>
     where
         'this: 'fut,
         'req: 'fut,
@@ -187,7 +187,7 @@ pub(crate) trait MiddlewareImpl: Send + Sync {
     }
 }
 
-impl Endpoint for &dyn EndpointImpl {
+impl Endpoint for &mut dyn EndpointImpl {
     async fn respond(&mut self, request: &mut Request) -> Result<Response> {
         self.respond_inner(request).await
     }
@@ -197,8 +197,8 @@ impl<T: Middleware> MiddlewareImpl for T {
     fn handle_inner<'this, 'req, 'next, 'fut>(
         &'this mut self,
         request: &'req mut Request,
-        next: &'next dyn EndpointImpl,
-    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send + Sync>>
+        next: &'next mut dyn EndpointImpl,
+    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send>>
     where
         'this: 'fut,
         'req: 'fut,
@@ -409,8 +409,8 @@ impl AnyMiddleware {
 }
 
 impl Middleware for AnyMiddleware {
-    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
-        self.0.handle_inner(request, &next).await
+    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+        self.0.handle_inner(request, &mut next).await
     }
 }
 

@@ -49,14 +49,14 @@ impl From<&str> for Body {
     }
 }
 
-impl From<Box<dyn AsyncBufRead + Send + Sync + 'static>> for Body {
-    fn from(reader: Box<dyn AsyncBufRead + Send + Sync + 'static>) -> Self {
+impl From<Box<dyn AsyncBufRead + Send + 'static>> for Body {
+    fn from(reader: Box<dyn AsyncBufRead + Send + 'static>) -> Self {
         Pin::from(reader).into()
     }
 }
 
-impl From<Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>> for Body {
-    fn from(reader: Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>) -> Self {
+impl From<Pin<Box<dyn AsyncBufRead + Send + 'static>>> for Body {
+    fn from(reader: Pin<Box<dyn AsyncBufRead + Send + 'static>>) -> Self {
         Self {
             inner: BodyInner::Reader {
                 reader,

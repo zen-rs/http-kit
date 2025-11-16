@@ -113,7 +113,7 @@ impl Error {
     ///
     /// # Arguments
     ///
-    /// * `msg` - Any type that implements `Display + Debug + Send + Sync + 'static`
+    /// * `msg` - Any type that implements `Display + Debug + Send + 'static`
     ///
     /// # Examples
     ///
@@ -272,7 +272,7 @@ impl Error {
     /// let err = Error::msg("some error").set_status(StatusCode::BAD_REQUEST);
     /// let inner = err.into_inner();
     /// ```
-    pub fn into_inner(self) -> Box<dyn core::error::Error + Send + Sync + 'static> {
+    pub fn into_inner(self) -> Box<dyn core::error::Error + Send + 'static> {
         self.error.into()
     }
 }

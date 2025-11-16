@@ -80,7 +80,7 @@ use crate::{Middleware, Request, Response, Result};
 ///
 /// # Implementation Notes
 ///
-/// - Endpoints must be `Send + Sync` to work in async contexts
+/// - Endpoints must be `Send` to work in async contexts
 /// - The request parameter is mutable, allowing body consumption and header modification
 /// - Implementations should handle errors gracefully and return appropriate HTTP status codes
 /// - Endpoints can be combined with middleware for additional functionality
@@ -137,7 +137,7 @@ use crate::{Middleware, Request, Response, Result};
 /// }
 /// # }
 /// ```
-pub trait Endpoint: Send + Sync {
+pub trait Endpoint: Send {
     /// Processes an HTTP request and generates a response.
     ///
     /// This method receives a mutable reference to the request, allowing it to:
@@ -166,10 +166,7 @@ pub trait Endpoint: Send + Sync {
     ///     }
     /// }
     /// ```
-    fn respond(
-        &mut self,
-        request: &mut Request,
-    ) -> impl Future<Output = Result<Response>> + Send + Sync;
+    fn respond(&mut self, request: &mut Request) -> impl Future<Output = Result<Response>> + Send;
 }
 
 impl<E: Endpoint> Endpoint for &mut E {
@@ -280,11 +277,11 @@ impl<E: Endpoint, M: Middleware> Endpoint for WithMiddleware<E, M> {
     }
 }
 
-pub(crate) trait EndpointImpl: Send + Sync {
+pub(crate) trait EndpointImpl: Send {
     fn respond_inner<'this, 'req, 'fut>(
         &'this mut self,
         request: &'req mut Request,
-    ) -> Pin<Box<dyn 'fut + Send + Sync + Future<Output = Result<Response>>>>
+    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response>>>>
     where
         'this: 'fut,
         'req: 'fut;
@@ -399,7 +396,7 @@ impl<E: Endpoint> EndpointImpl for E {
     fn respond_inner<'this, 'req, 'fut>(
         &'this mut self,
         request: &'req mut Request,
-    ) -> Pin<Box<dyn 'fut + Send + Sync + Future<Output = Result<Response>>>>
+    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response>>>>
     where
         'this: 'fut,
         'req: 'fut,

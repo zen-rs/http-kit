@@ -213,12 +213,10 @@ impl Event {
     }
 }
 
-pub(crate) fn into_body<S, E>(
-    stream: S,
-) -> impl http_body::Body<Data = Bytes, Error = E> + Send + Sync
+pub(crate) fn into_body<S, E>(stream: S) -> impl http_body::Body<Data = Bytes, Error = E> + Send
 where
-    S: Stream<Item = Result<Event, E>> + Send + Sync,
-    E: Send + Sync,
+    S: Stream<Item = Result<Event, E>> + Send,
+    E: Send,
 {
     StreamBody::new(
         stream.map(|result| {
