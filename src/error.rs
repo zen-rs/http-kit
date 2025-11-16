@@ -272,7 +272,7 @@ impl Error {
     /// let err = Error::msg("some error").set_status(StatusCode::BAD_REQUEST);
     /// let inner = err.into_inner();
     /// ```
-    pub fn into_inner(self) -> Box<dyn core::error::Error + Send + 'static> {
+    pub fn into_inner(self) -> Box<dyn core::error::Error + Send + Sync + 'static> {
         self.error.into()
     }
 }
