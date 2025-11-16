@@ -101,9 +101,10 @@ use core::task::{Context, Poll};
 type BoxError = Box<dyn core::error::Error + Send + Sync + 'static>;
 
 // A boxed bufreader object.
-type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + 'static>>;
+type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>;
 
-type BoxHttpBody = Pin<Box<dyn http_body::Body<Data = Bytes, Error = BoxError> + Send + 'static>>;
+type BoxHttpBody =
+    Pin<Box<dyn http_body::Body<Data = Bytes, Error = BoxError> + Send + Sync + 'static>>;
 
 pub use http_body::Body as HttpBody;
 
@@ -208,7 +209,7 @@ impl Body {
     /// ```
     pub fn new<B>(body: B) -> Self
     where
-        B: Send + http_body::Body + 'static,
+        B: Send + Sync + http_body::Body + 'static,
         B::Data: Into<Bytes>,
         B::Error: core::error::Error + Send + Sync,
     {
@@ -277,7 +278,7 @@ impl Body {
     /// # }
     /// ```
     pub fn from_reader(
-        reader: impl AsyncBufRead + Send + 'static,
+        reader: impl AsyncBufRead + Send + Sync + 'static,
         length: impl Into<Option<usize>>,
     ) -> Self {
         Self {
@@ -319,7 +320,7 @@ impl Body {
     where
         T: Into<Bytes> + Send + 'static,
         E: Into<BoxError>,
-        S: Stream<Item = Result<T, E>> + Send + 'static,
+        S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
     {
         Self {
             inner: BodyInner::HttpBody(Box::pin(StreamBody::new(stream.map(|result| {
@@ -505,7 +506,7 @@ impl Body {
     /// ```
     pub fn from_sse<S, E>(s: S) -> Self
     where
-        S: Stream<Item = Result<Event, E>> + Send + 'static,
+        S: Stream<Item = Result<Event, E>> + Send + Sync + 'static,
         E: Into<BoxError> + Send + Sync + 'static,
     {
         Self {
