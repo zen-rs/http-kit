@@ -1,0 +1,18 @@
+[workspace]
+# Keep release notes in GitHub releases only for now.
+changelog_update = false
+# Update Cargo.lock dependencies while preparing the release PR.
+dependencies_update = true
+# Publish GitHub releases and tags that match the existing v* pattern.
+git_release_enable = true
+git_release_name = "http-kit v{{ version }}"
+git_tag_name = "v{{ version }}"
+# Make the release PRs easy to spot.
+pr_branch_prefix = "release/"
+pr_labels = ["release", "automation"]
+# Cargo publish options.
+publish = true
+publish_timeout = "10m"
+
+[[package]]
+name = "http-kit"
