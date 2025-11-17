@@ -397,10 +397,12 @@ impl Error {
 
 impl<E> From<E> for Error
 where
-    E: core::error::Error + Send + Sync + 'static,
+    E: HttpError,
 {
     fn from(error: E) -> Self {
-        Self::with_status(error, StatusCode::INTERNAL_SERVER_ERROR)
+        Self {
+            error: Box::new(error),
+        }
     }
 }
 

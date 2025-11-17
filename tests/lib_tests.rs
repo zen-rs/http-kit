@@ -1,4 +1,4 @@
-use http_kit::{Body, Error, Result, StatusCode};
+use http_kit::{Body, Error, Result, ResultExt, StatusCode};
 // Import stream specifically for the one function that needs it
 use futures_lite::StreamExt;
 
@@ -164,7 +164,7 @@ async fn test_error_functionality() {
 #[test]
 fn test_from_impl_sets_default_status() {
     fn fallible() -> Result<()> {
-        Err(std::io::Error::other("permission denied"))?;
+        Err(std::io::Error::other("permission denied")).status(500)?;
         Ok(())
     }
 
