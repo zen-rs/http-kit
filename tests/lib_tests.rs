@@ -161,6 +161,21 @@ async fn test_error_functionality() {
     assert_eq!(downcasted.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
+#[test]
+fn test_from_impl_sets_default_status() {
+    fn fallible() -> Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "permission denied",
+        ))?;
+        Ok(())
+    }
+
+    let err = fallible().unwrap_err();
+    assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(err.to_string(), "permission denied");
+}
+
 #[tokio::test]
 async fn test_result_ext_functionality() {
     use http_kit::ResultExt;
@@ -190,6 +205,26 @@ async fn test_result_ext_functionality() {
     let result: Result<i32> = option.status(StatusCode::BAD_REQUEST);
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), 42);
+}
+
+#[test]
+fn test_error_macro_and_bail_macro() {
+    use http_kit::{bail, error};
+
+    let err = error!(404, "missing {}", "resource");
+    assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    assert_eq!(err.to_string(), "missing resource");
+
+    fn validate(flag: bool) -> Result<()> {
+        if !flag {
+            bail!(StatusCode::BAD_REQUEST, "flag is {}", flag);
+        }
+        Ok(())
+    }
+
+    let err = validate(false).unwrap_err();
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(err.to_string(), "flag is false");
 }
 
 // Test that runs the code that was previously buggy

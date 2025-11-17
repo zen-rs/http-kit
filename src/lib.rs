@@ -83,7 +83,8 @@
 //! }
 //! ```
 //!
-extern crate alloc;
+#[doc(hidden)]
+pub extern crate alloc;
 
 #[macro_use]
 mod macros;
@@ -91,7 +92,9 @@ mod macros;
 pub mod sse;
 
 mod error;
-pub use error::{Error, Result, ResultExt};
+#[doc(hidden)]
+pub use error::__private as __error_private;
+pub use error::{Error, HttpError, Result, ResultExt};
 mod body;
 
 #[cfg(feature = "fs")]
