@@ -109,7 +109,8 @@ use crate::{Middleware, Request, Response, Result};
 /// ```rust
 /// # #[cfg(feature = "json")]
 /// # {
-/// use http_kit::{Request, Response, Result, Endpoint, Body};
+/// use http::{StatusCode};
+/// use http_kit::{Request, Response, Result, Endpoint, Body, ResultExt};
 /// use serde::{Serialize, Deserialize};
 ///
 /// #[derive(Serialize, Deserialize)]
@@ -122,13 +123,19 @@ use crate::{Middleware, Request, Response, Result};
 ///         match request.method().as_str() {
 ///             "GET" => {
 ///                 let user = User { name: "Alice".into(), age: 30 };
-///                 let body = Body::from_json(&user)?;
+///                 let body = Body::from_json(&user)
+///                     .status(StatusCode::INTERNAL_SERVER_ERROR)?;
 ///                 Ok(Response::new(body))
 ///             }
 ///             "POST" => {
-///                 let user: User = request.body_mut().into_json().await?;
+///                 let user: User = request
+///                     .body_mut()
+///                     .into_json()
+///                     .await
+///                     .status(StatusCode::BAD_REQUEST)?;
 ///                 // Process user...
-///                 let body = Body::from_json(&user)?;
+///                 let body = Body::from_json(&user)
+///                     .status(StatusCode::INTERNAL_SERVER_ERROR)?;
 ///                 Ok(Response::new(body))
 ///             }
 ///             _ => Ok(Response::new(Body::from_bytes("Method Not Allowed")))

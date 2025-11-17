@@ -48,7 +48,8 @@
 //! ```rust
 //! # #[cfg(feature = "json")]
 //! # {
-//! use http_kit::{Request, Response, Result, Body};
+//! use http::StatusCode;
+//! use http_kit::{Request, Response, Result, Body, ResultExt};
 //! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Serialize, Deserialize)]
@@ -58,9 +59,14 @@
 //! }
 //!
 //! async fn create_user(mut request: Request) -> Result<Response> {
-//!     let user: User = request.body_mut().into_json().await?;
+//!     let user: User = request
+//!         .body_mut()
+//!         .into_json()
+//!         .await
+//!         .status(StatusCode::BAD_REQUEST)?;
 //!     // Process user...
-//!     let response_body = Body::from_json(&user)?;
+//!     let response_body = Body::from_json(&user)
+//!         .status(StatusCode::INTERNAL_SERVER_ERROR)?;
 //!     Ok(Response::new(response_body))
 //! }
 //! # }

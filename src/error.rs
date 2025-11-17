@@ -55,6 +55,11 @@ pub struct Error {
 ///
 /// This trait extends the standard `Error` trait to include a method
 /// for retrieving the HTTP status code associated with the error.
+///
+/// Only types implementing this trait can be directly converted into [`Error`]
+/// via the `From` implementation. When working with generic
+/// [`core::error::Error`] values, prefer the [`ResultExt::status`] helper to
+/// attach a status code before returning an [`Error`].
 pub trait HttpError: core::error::Error + Send + Sync + 'static {
     /// Returns the associated HTTP status code.
     fn status(&self) -> StatusCode;
@@ -420,13 +425,13 @@ impl fmt::Display for Error {
 
 impl AsRef<dyn core::error::Error + Send + Sync + 'static> for Error {
     fn as_ref(&self) -> &(dyn core::error::Error + Send + Sync + 'static) {
-        self.error.as_ref()
+        self.deref()
     }
 }
 
 impl AsMut<dyn core::error::Error + Send + Sync + 'static> for Error {
     fn as_mut(&mut self) -> &mut (dyn core::error::Error + Send + Sync + 'static) {
-        self.error.as_mut()
+        self.deref_mut()
     }
 }
 
