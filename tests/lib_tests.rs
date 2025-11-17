@@ -164,10 +164,7 @@ async fn test_error_functionality() {
 #[test]
 fn test_from_impl_sets_default_status() {
     fn fallible() -> Result<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "permission denied",
-        ))?;
+        Err(std::io::Error::other("permission denied"))?;
         Ok(())
     }
 

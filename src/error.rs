@@ -48,8 +48,7 @@ use http::StatusCode;
 /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
 /// ```
 pub struct Error {
-    status: StatusCode,
-    error: Box<dyn core::error::Error + Send + Sync + 'static>,
+    error: Box<dyn HttpError>,
 }
 
 /// Trait for errors that have an associated HTTP status code.
@@ -64,6 +63,20 @@ pub trait HttpError: core::error::Error + Send + Sync + 'static {
 #[derive(Debug)]
 struct MsgError<M: fmt::Display + fmt::Debug + Send + Sync + 'static> {
     msg: M,
+}
+
+#[derive(Debug)]
+struct WithStatus<E: core::error::Error + Send + Sync + 'static> {
+    status: StatusCode,
+    error: Box<E>,
+}
+
+#[derive(Debug)]
+struct BoxedCoreError(Box<dyn core::error::Error + Send + Sync + 'static>);
+
+struct OverrideStatus {
+    status: StatusCode,
+    inner: Box<dyn HttpError>,
 }
 
 #[doc(hidden)]
@@ -96,6 +109,69 @@ impl<S: fmt::Display + fmt::Debug + Send + Sync + 'static> fmt::Display for MsgE
     }
 }
 
+impl<E> fmt::Display for WithStatus<E>
+where
+    E: fmt::Display + core::error::Error + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl<E> core::error::Error for WithStatus<E>
+where
+    E: core::error::Error + Send + Sync + 'static,
+{
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+impl<E> HttpError for WithStatus<E>
+where
+    E: core::error::Error + Send + Sync + 'static,
+{
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+}
+
+impl fmt::Display for BoxedCoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl core::error::Error for BoxedCoreError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+impl fmt::Debug for OverrideStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, f)
+    }
+}
+
+impl fmt::Display for OverrideStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl core::error::Error for OverrideStatus {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        self.inner.source()
+    }
+}
+
+impl HttpError for OverrideStatus {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+}
+
 /// A specialized Result type for HTTP operations.
 ///
 /// This is a convenience alias for `Result<T, Error>` that's used throughout
@@ -118,6 +194,25 @@ impl<S: fmt::Display + fmt::Debug + Send + Sync + 'static> fmt::Display for MsgE
 pub type Result<T> = core::result::Result<T, Error>;
 
 impl Error {
+    fn from_http_error<E>(error: E) -> Self
+    where
+        E: HttpError,
+    {
+        Self {
+            error: Box::new(error),
+        }
+    }
+
+    fn with_status<E>(error: E, status: StatusCode) -> Self
+    where
+        E: core::error::Error + Send + Sync + 'static,
+    {
+        Self::from_http_error(WithStatus {
+            status,
+            error: Box::new(error),
+        })
+    }
+
     /// Creates a new `Error` from any error type with the given HTTP status code.
     ///
     /// # Arguments
@@ -145,10 +240,8 @@ impl Error {
         S: TryInto<StatusCode>,
         S::Error: Debug,
     {
-        Self {
-            status: status.try_into().expect("Invalid status code"),
-            error: Box::new(error),
-        }
+        let status = status.try_into().expect("Invalid status code");
+        Self::with_status(error, status)
     }
 
     /// Creates an `Error` from a message string with a default status code.
@@ -171,10 +264,7 @@ impl Error {
     where
         M: fmt::Display + fmt::Debug + Send + Sync + 'static,
     {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            error: Box::new(MsgError { msg }),
-        }
+        Self::with_status(MsgError { msg }, StatusCode::SERVICE_UNAVAILABLE)
     }
 
     /// Returns the HTTP status code associated with this error.
@@ -189,20 +279,21 @@ impl Error {
     /// assert_eq!(err.status(), StatusCode::NOT_FOUND);
     /// ```
     pub fn status(&self) -> StatusCode {
-        self.status
+        self.error.status()
     }
 
     /// Sets or overrides the HTTP status code associated with this error.
     ///
     /// This consumes the error and returns a new instance so it can be chained
     /// in builder-style APIs.
-    pub fn set_status<S>(mut self, status: S) -> Self
+    pub fn set_status<S>(self, status: S) -> Self
     where
         S: TryInto<StatusCode>,
         S::Error: Debug,
     {
-        self.status = status.try_into().expect("Invalid status code");
-        self
+        let status = status.try_into().expect("Invalid status code");
+        let inner = self.into_inner();
+        Self::from_http_error(OverrideStatus { status, inner })
     }
 
     /// Attempts to downcast the inner error to a concrete type.
@@ -228,8 +319,12 @@ impl Error {
     where
         E: core::error::Error + Send + Sync + 'static,
     {
-        let Self { status, error } = self;
-        error.downcast().map_err(|error| Self { status, error })
+        let status = self.status();
+        let error = (self.error) as Box<dyn core::error::Error + Send + Sync + 'static>;
+        match error.downcast::<E>() {
+            Ok(err) => Ok(err),
+            Err(err) => Err(Self::with_status(BoxedCoreError(err), status)),
+        }
     }
 
     /// Attempts to downcast the inner error to a reference of the concrete type.
@@ -254,7 +349,8 @@ impl Error {
     where
         E: core::error::Error + Send + Sync + 'static,
     {
-        self.error.downcast_ref()
+        let error: &(dyn core::error::Error + Send + Sync + 'static) = &*self.error;
+        error.downcast_ref()
     }
 
     /// Attempts to downcast the inner error to a mutable reference of the concrete type.
@@ -279,10 +375,11 @@ impl Error {
     where
         E: core::error::Error + Send + Sync + 'static,
     {
-        self.error.downcast_mut()
+        let error: &mut (dyn core::error::Error + Send + Sync + 'static) = &mut *self.error;
+        error.downcast_mut()
     }
 
-    /// Consumes this error and returns the inner error, discarding the status code.
+    /// Consumes this error and returns the inner [`HttpError`] trait object.
     ///
     /// # Examples
     ///
@@ -293,7 +390,7 @@ impl Error {
     /// let err = Error::msg("some error").set_status(StatusCode::BAD_REQUEST);
     /// let inner = err.into_inner();
     /// ```
-    pub fn into_inner(self) -> Box<dyn core::error::Error + Send + Sync + 'static> {
+    pub fn into_inner(self) -> Box<dyn HttpError> {
         self.error
     }
 }
@@ -303,7 +400,7 @@ where
     E: core::error::Error + Send + Sync + 'static,
 {
     fn from(error: E) -> Self {
-        Self::new(error, StatusCode::INTERNAL_SERVER_ERROR)
+        Self::with_status(error, StatusCode::INTERNAL_SERVER_ERROR)
     }
 }
 
@@ -321,18 +418,18 @@ impl fmt::Display for Error {
 
 impl AsRef<dyn core::error::Error + Send + Sync + 'static> for Error {
     fn as_ref(&self) -> &(dyn core::error::Error + Send + Sync + 'static) {
-        self.deref()
+        self.error.as_ref()
     }
 }
 
 impl AsMut<dyn core::error::Error + Send + Sync + 'static> for Error {
     fn as_mut(&mut self) -> &mut (dyn core::error::Error + Send + Sync + 'static) {
-        self.deref_mut()
+        self.error.as_mut()
     }
 }
 
 impl Deref for Error {
-    type Target = dyn core::error::Error + Send + Sync + 'static;
+    type Target = dyn HttpError;
 
     fn deref(&self) -> &Self::Target {
         self.error.as_ref()
@@ -342,6 +439,18 @@ impl Deref for Error {
 impl DerefMut for Error {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.error.as_mut()
+    }
+}
+
+impl AsRef<dyn HttpError> for Error {
+    fn as_ref(&self) -> &dyn HttpError {
+        self.deref()
+    }
+}
+
+impl AsMut<dyn HttpError> for Error {
+    fn as_mut(&mut self) -> &mut dyn HttpError {
+        self.deref_mut()
     }
 }
 
