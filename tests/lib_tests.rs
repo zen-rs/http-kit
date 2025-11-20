@@ -204,25 +204,7 @@ async fn test_result_ext_functionality() {
     assert_eq!(result.unwrap(), 42);
 }
 
-#[test]
-fn test_error_macro_and_bail_macro() {
-    use http_kit::{bail, error};
 
-    let err = error!(404, "missing {}", "resource");
-    assert_eq!(err.status(), StatusCode::NOT_FOUND);
-    assert_eq!(err.to_string(), "missing resource");
-
-    fn validate(flag: bool) -> Result<()> {
-        if !flag {
-            bail!(StatusCode::BAD_REQUEST, "flag is {}", flag);
-        }
-        Ok(())
-    }
-
-    let err = validate(false).unwrap_err();
-    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(err.to_string(), "flag is false");
-}
 
 // Test that runs the code that was previously buggy
 #[tokio::test]

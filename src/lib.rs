@@ -90,7 +90,7 @@ mod macros;
 
 pub mod sse;
 
-mod error;
+pub mod error;
 pub use error::{Error, Result, ResultExt,HttpError};
 mod body;
 

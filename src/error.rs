@@ -28,6 +28,7 @@ use core::{
     ops::{Deref, DerefMut},
 };
 use http::StatusCode;
+pub use eyre::*;
 
 /// Trait for errors that have an associated HTTP status code.
 ////

@@ -98,13 +98,12 @@ use core::fmt::Debug;
 use core::mem::{replace, swap, take};
 use core::pin::Pin;
 use core::task::{Context, Poll};
-type BoxError = Box<dyn core::error::Error + Send + Sync + 'static>;
 
 // A boxed bufreader object.
 type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>;
 
 type BoxHttpBody =
-    Pin<Box<dyn http_body::Body<Data = Bytes, Error = BoxError> + Send + Sync + 'static>>;
+    Pin<Box<dyn http_body::Body<Data = Bytes, Error = Error> + Send + Sync + 'static>>;
 
 pub use http_body::Body as HttpBody;
 
@@ -211,14 +210,13 @@ impl Body {
     where
         B: Send + Sync + http_body::Body + 'static,
         B::Data: Into<Bytes>,
-        B::Error: core::error::Error + Send + Sync,
+        B::Error: Into<Error>,
     {
         Self {
             inner: BodyInner::HttpBody(Box::pin(
                 body.map_frame(|result| result.map_data(|data| data.into()))
                     .map_err(|e| {
-                        let b: BoxError = Box::new(e);
-                        b
+                        e.into()
                     }),
             )),
         }
@@ -319,7 +317,7 @@ impl Body {
     pub fn from_stream<T, E, S>(stream: S) -> Self
     where
         T: Into<Bytes> + Send + 'static,
-        E: Into<BoxError>,
+        E: Into<Error>,
         S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
     {
         Self {
@@ -507,7 +505,7 @@ impl Body {
     pub fn from_sse<S, E>(s: S) -> Self
     where
         S: Stream<Item = Result<Event, E>> + Send + Sync + 'static,
-        E: Into<BoxError> + Send + Sync + 'static,
+        E: Into<Error> + Send + Sync + 'static,
     {
         Self {
             inner: BodyInner::HttpBody(Box::pin(
@@ -1008,7 +1006,7 @@ impl Default for Body {
 }
 
 impl Stream for Body {
-    type Item = Result<Bytes, BoxError>;
+    type Item = Result<Bytes, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match &mut self.inner {
@@ -1063,6 +1061,6 @@ impl http_body::Body for Body {
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         self.poll_next(cx)
             .map(|opt| opt.map(|result| result.map(http_body::Frame::data)))
-            .map_err(Error::Other)
+            .map_err(Error::from)
     }
 }
