@@ -115,6 +115,28 @@ impl From<Box<dyn core::error::Error + Send + Sync + 'static>> for Box<dyn HttpE
     }
 }
 
+impl From<Box<dyn HttpError>> for Error {
+    fn from(error: Box<dyn HttpError>) -> Self {
+        let status = error.status();
+        #[derive(Debug)]
+        struct Wrapper{
+            error: Box<dyn HttpError>,
+        }
+
+        impl core::error::Error for Wrapper {}
+
+        impl core::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.error)
+            }
+        }
+        Self {
+            error: eyre::Error::new(Wrapper{error}),
+            status,
+        }
+    }
+}
+
 impl From<Error> for Box<dyn HttpError> {
     fn from(error: Error) -> Self {
         #[derive(Debug)]
