@@ -24,8 +24,7 @@
 //!
 use alloc::boxed::Box;
 use core::{
-    fmt,
-    ops::{Deref, DerefMut},
+    convert::Infallible, fmt, ops::{Deref, DerefMut}
 };
 use http::StatusCode;
 pub use eyre::*;
@@ -123,6 +122,12 @@ impl From<Box<dyn core::error::Error + Send + Sync + 'static>> for Box<dyn HttpE
         }
 
         Box::new(Wrapper { inner: error })
+    }
+}
+
+impl HttpError for Infallible{
+    fn status(&self) -> StatusCode {
+        unreachable!("Infallible can never be instantiated")
     }
 }
 
