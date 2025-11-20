@@ -84,6 +84,62 @@ pub struct Error {
     status: StatusCode,
 }
 
+impl<E:HttpError> From<E> for Box<dyn HttpError> {
+    fn from(error: E) -> Self {
+        Box::new(error)
+    }
+}
+
+impl From<Box<dyn core::error::Error + Send + Sync + 'static>> for Box<dyn HttpError> {
+    fn from(error: Box<dyn core::error::Error + Send + Sync + 'static>) -> Self {
+        #[derive(Debug)]
+        struct Wrapper {
+            inner: Box<dyn core::error::Error + Send + Sync + 'static>,
+        }
+
+        impl core::error::Error for Wrapper {}
+
+        impl fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.inner)
+            }
+        }
+
+        impl HttpError for Wrapper {
+            fn status(&self) -> StatusCode {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+
+        Box::new(Wrapper { inner: error })
+    }
+}
+
+impl From<Error> for Box<dyn HttpError> {
+    fn from(error: Error) -> Self {
+        #[derive(Debug)]
+        struct Wrapper {
+            inner: Error,
+        }
+
+        impl core::error::Error for Wrapper {}
+
+        impl fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.inner)
+            }
+        }
+
+        impl HttpError for Wrapper {
+            fn status(&self) -> StatusCode {
+                self.inner.status()
+            }
+        }
+
+        Box::new(Wrapper { inner: error })
+    }
+}
+
 /// A specialized Result type for HTTP operations.
 ///
 /// This is a convenience alias for `Result<T, Error>` that's used throughout
@@ -104,6 +160,7 @@ pub struct Error {
 /// }
 /// ```
 pub type Result<T> = core::result::Result<T, Error>;
+
 
 impl Error {
     /// Creates a new `Error` from any error type with the given HTTP status code.
