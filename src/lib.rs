@@ -48,8 +48,7 @@
 //! ```rust
 //! # #[cfg(feature = "json")]
 //! # {
-//! use http::StatusCode;
-//! use http_kit::{Request, Response, Result, Body, ResultExt};
+//! use http_kit::{Request, Response, Result, Body};
 //! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Serialize, Deserialize)]
@@ -59,14 +58,9 @@
 //! }
 //!
 //! async fn create_user(mut request: Request) -> Result<Response> {
-//!     let user: User = request
-//!         .body_mut()
-//!         .into_json()
-//!         .await
-//!         .status(StatusCode::BAD_REQUEST)?;
+//!     let user: User = request.body_mut().into_json().await?;
 //!     // Process user...
-//!     let response_body = Body::from_json(&user)
-//!         .status(StatusCode::INTERNAL_SERVER_ERROR)?;
+//!     let response_body = Body::from_json(&user)?;
 //!     Ok(Response::new(response_body))
 //! }
 //! # }
@@ -89,8 +83,7 @@
 //! }
 //! ```
 //!
-#[doc(hidden)]
-pub extern crate alloc;
+extern crate alloc;
 
 #[macro_use]
 mod macros;
@@ -98,9 +91,7 @@ mod macros;
 pub mod sse;
 
 mod error;
-#[doc(hidden)]
-pub use error::__private as __error_private;
-pub use error::{Error, HttpError, Result, ResultExt};
+pub use error::{Error, Result, ResultExt,HttpError};
 mod body;
 
 #[cfg(feature = "fs")]

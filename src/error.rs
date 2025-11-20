@@ -24,10 +24,41 @@
 //!
 use alloc::boxed::Box;
 use core::{
-    fmt::{self, Debug},
+    fmt,
     ops::{Deref, DerefMut},
 };
 use http::StatusCode;
+
+/// Trait for errors that have an associated HTTP status code.
+////
+/// This trait extends the standard `Error` trait to include a method for retrieving
+/// the HTTP status code associated with the error.
+pub trait HttpError: core::error::Error + Send + Sync + 'static {
+    /// Returns the HTTP status code associated with this error.
+    ////
+    /// # Examples
+    /////
+    /// ```rust
+    /// use http_kit::{HttpError,StatusCode};
+    /// #[derive(Debug)]
+    /// struct MyError;
+    ///
+    /// impl core::error::Error for MyError {}
+    /// impl std::fmt::Display for MyError {
+    ///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    ///         write!(f, "My error occurred")
+    ///     }
+    /// }
+    /// impl HttpError for MyError {
+    ///     fn status(&self) -> StatusCode {
+    ///         StatusCode::INTERNAL_SERVER_ERROR
+    ///     }
+    /// }
+    /// let err = MyError;
+    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    /// ```
+    fn status(&self) -> StatusCode;
+}
 
 /// The main error type for HTTP operations.
 ///
@@ -48,133 +79,8 @@ use http::StatusCode;
 /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
 /// ```
 pub struct Error {
-    error: Box<dyn HttpError>,
-}
-
-/// Trait for errors that have an associated HTTP status code.
-///
-/// This trait extends the standard `Error` trait to include a method
-/// for retrieving the HTTP status code associated with the error.
-///
-/// Only types implementing this trait can be directly converted into [`Error`]
-/// via the `From` implementation. When working with generic
-/// [`core::error::Error`] values, prefer the [`ResultExt::status`] helper to
-/// attach a status code before returning an [`Error`].
-pub trait HttpError: core::error::Error + Send + Sync + 'static {
-    /// Returns the associated HTTP status code.
-    fn status(&self) -> StatusCode;
-}
-
-#[derive(Debug)]
-struct MsgError<M: fmt::Display + fmt::Debug + Send + Sync + 'static> {
-    msg: M,
-}
-
-#[derive(Debug)]
-struct WithStatus<E: core::error::Error + Send + Sync + 'static> {
+    error: eyre::Error,
     status: StatusCode,
-    error: Box<E>,
-}
-
-#[derive(Debug)]
-struct BoxedCoreError(Box<dyn core::error::Error + Send + Sync + 'static>);
-
-struct OverrideStatus {
-    status: StatusCode,
-    inner: Box<dyn HttpError>,
-}
-
-#[doc(hidden)]
-pub mod __private {
-    use http::StatusCode;
-
-    /// Compile-time validator that ensures a literal status code is valid.
-    pub const fn assert_status_literal(status: u16) -> u16 {
-        if status < 100 || status > 599 {
-            panic!("Status code literal must be within 100..=599");
-        }
-        status
-    }
-
-    /// Compile-time validator for constant `StatusCode` values.
-    pub const fn assert_status_code(status: StatusCode) -> StatusCode {
-        let value = status.as_u16();
-        if value < 100 || value > 599 {
-            panic!("Status code must be within 100..=599");
-        }
-        status
-    }
-}
-
-impl<S: fmt::Display + fmt::Debug + Send + Sync + 'static> core::error::Error for MsgError<S> {}
-
-impl<S: fmt::Display + fmt::Debug + Send + Sync + 'static> fmt::Display for MsgError<S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.msg, f)
-    }
-}
-
-impl<E> fmt::Display for WithStatus<E>
-where
-    E: fmt::Display + core::error::Error + Send + Sync + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.error, f)
-    }
-}
-
-impl<E> core::error::Error for WithStatus<E>
-where
-    E: core::error::Error + Send + Sync + 'static,
-{
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        self.error.source()
-    }
-}
-
-impl<E> HttpError for WithStatus<E>
-where
-    E: core::error::Error + Send + Sync + 'static,
-{
-    fn status(&self) -> StatusCode {
-        self.status
-    }
-}
-
-impl fmt::Display for BoxedCoreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl core::error::Error for BoxedCoreError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        self.0.source()
-    }
-}
-
-impl fmt::Debug for OverrideStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.inner, f)
-    }
-}
-
-impl fmt::Display for OverrideStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.inner, f)
-    }
-}
-
-impl core::error::Error for OverrideStatus {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        self.inner.source()
-    }
-}
-
-impl HttpError for OverrideStatus {
-    fn status(&self) -> StatusCode {
-        self.status
-    }
 }
 
 /// A specialized Result type for HTTP operations.
@@ -199,30 +105,11 @@ impl HttpError for OverrideStatus {
 pub type Result<T> = core::result::Result<T, Error>;
 
 impl Error {
-    fn from_http_error<E>(error: E) -> Self
-    where
-        E: HttpError,
-    {
-        Self {
-            error: Box::new(error),
-        }
-    }
-
-    fn with_status<E>(error: E, status: StatusCode) -> Self
-    where
-        E: core::error::Error + Send + Sync + 'static,
-    {
-        Self::from_http_error(WithStatus {
-            status,
-            error: Box::new(error),
-        })
-    }
-
     /// Creates a new `Error` from any error type with the given HTTP status code.
     ///
     /// # Arguments
     ///
-    /// * `error` - Any error type that implements [`core::error::Error`]
+    /// * `error` - Any error type that can be converted to `anyhow::Error`
     /// * `status` - HTTP status code (or value convertible to one)
     ///
     /// # Panics
@@ -241,12 +128,14 @@ impl Error {
     /// ```
     pub fn new<E, S>(error: E, status: S) -> Self
     where
-        E: core::error::Error + Send + Sync + 'static,
+        E: Into<eyre::Error>,
         S: TryInto<StatusCode>,
-        S::Error: Debug,
+        S::Error: fmt::Debug,
     {
-        let status = status.try_into().expect("Invalid status code");
-        Self::with_status(error, status)
+        Self {
+            error: error.into(),
+            status: status.try_into().unwrap(), //may panic if user delivers an illegal code.
+        }
     }
 
     /// Creates an `Error` from a message string with a default status code.
@@ -265,11 +154,50 @@ impl Error {
     /// let err = Error::msg("Something went wrong");
     /// let err = Error::msg(format!("Failed to process item {}", 42));
     /// ```
-    pub fn msg<M>(msg: M) -> Self
+    pub fn msg<S>(msg: S) -> Self
     where
-        M: fmt::Display + fmt::Debug + Send + Sync + 'static,
+        S: fmt::Display + fmt::Debug + Send + Sync + 'static,
     {
-        Self::with_status(MsgError { msg }, StatusCode::SERVICE_UNAVAILABLE)
+       Self { error:  eyre::Error::msg(msg), status: StatusCode::SERVICE_UNAVAILABLE }
+    }
+
+    /// Sets the HTTP status code of this error.
+    ///
+    /// Only error status codes (400-599) can be set. In debug builds,
+    /// this method will assert that the status code is in the valid range.
+    ///
+    /// # Arguments
+    ///
+    /// * `status` - HTTP status code (or value convertible to one)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the status code is invalid or not an error status code.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Error;
+    /// use http::StatusCode;
+    ///
+    /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
+    /// ```
+    pub fn set_status<S>(mut self, status: S) -> Self
+    where
+        S: TryInto<StatusCode>,
+        S::Error: fmt::Debug,
+    {
+        let status = status.try_into().expect("Invalid status code");
+        if cfg!(debug_assertions) {
+            assert!(
+                (400..=599).contains(&status.as_u16()),
+                "Expected a status code within 400~599"
+            )
+        }
+
+        self.status = status;
+
+        self
     }
 
     /// Returns the HTTP status code associated with this error.
@@ -284,21 +212,7 @@ impl Error {
     /// assert_eq!(err.status(), StatusCode::NOT_FOUND);
     /// ```
     pub fn status(&self) -> StatusCode {
-        self.error.status()
-    }
-
-    /// Sets or overrides the HTTP status code associated with this error.
-    ///
-    /// This consumes the error and returns a new instance so it can be chained
-    /// in builder-style APIs.
-    pub fn set_status<S>(self, status: S) -> Self
-    where
-        S: TryInto<StatusCode>,
-        S::Error: Debug,
-    {
-        let status = status.try_into().expect("Invalid status code");
-        let inner = self.into_inner();
-        Self::from_http_error(OverrideStatus { status, inner })
+        self.status
     }
 
     /// Attempts to downcast the inner error to a concrete type.
@@ -324,12 +238,8 @@ impl Error {
     where
         E: core::error::Error + Send + Sync + 'static,
     {
-        let status = self.status();
-        let error = (self.error) as Box<dyn core::error::Error + Send + Sync + 'static>;
-        match error.downcast::<E>() {
-            Ok(err) => Ok(err),
-            Err(err) => Err(Self::with_status(BoxedCoreError(err), status)),
-        }
+        let Self { status, error } = self;
+        error.downcast().map_err(|error| Self { status, error })
     }
 
     /// Attempts to downcast the inner error to a reference of the concrete type.
@@ -354,8 +264,7 @@ impl Error {
     where
         E: core::error::Error + Send + Sync + 'static,
     {
-        let error: &(dyn core::error::Error + Send + Sync + 'static) = &*self.error;
-        error.downcast_ref()
+        self.error.downcast_ref()
     }
 
     /// Attempts to downcast the inner error to a mutable reference of the concrete type.
@@ -380,11 +289,10 @@ impl Error {
     where
         E: core::error::Error + Send + Sync + 'static,
     {
-        let error: &mut (dyn core::error::Error + Send + Sync + 'static) = &mut *self.error;
-        error.downcast_mut()
+        self.error.downcast_mut()
     }
 
-    /// Consumes this error and returns the inner [`HttpError`] trait object.
+    /// Consumes this error and returns the inner error, discarding the status code.
     ///
     /// # Examples
     ///
@@ -395,19 +303,20 @@ impl Error {
     /// let err = Error::msg("some error").set_status(StatusCode::BAD_REQUEST);
     /// let inner = err.into_inner();
     /// ```
-    pub fn into_inner(self) -> Box<dyn HttpError> {
-        self.error
+    pub fn into_inner(self) -> Box<dyn core::error::Error + Send + Sync + 'static> {
+        self.error.into()
     }
 }
 
-impl<E> From<E> for Error
-where
-    E: HttpError,
-{
+impl<E: core::error::Error + Send + Sync + 'static> From<E> for Error {
     fn from(error: E) -> Self {
-        Self {
-            error: Box::new(error),
-        }
+        Self::new(error, StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
+impl From<Error> for Box<dyn core::error::Error> {
+    fn from(error: Error) -> Self {
+        error.error.into()
     }
 }
 
@@ -423,41 +332,29 @@ impl fmt::Display for Error {
     }
 }
 
-impl AsRef<dyn core::error::Error + Send + Sync + 'static> for Error {
-    fn as_ref(&self) -> &(dyn core::error::Error + Send + Sync + 'static) {
+impl AsRef<dyn core::error::Error + Send + 'static> for Error {
+    fn as_ref(&self) -> &(dyn core::error::Error + Send + 'static) {
         self.deref()
     }
 }
 
-impl AsMut<dyn core::error::Error + Send + Sync + 'static> for Error {
-    fn as_mut(&mut self) -> &mut (dyn core::error::Error + Send + Sync + 'static) {
+impl AsMut<dyn core::error::Error + Send + 'static> for Error {
+    fn as_mut(&mut self) -> &mut (dyn core::error::Error + Send + 'static) {
         self.deref_mut()
     }
 }
 
 impl Deref for Error {
-    type Target = dyn HttpError;
+    type Target = dyn core::error::Error + Send + 'static;
 
     fn deref(&self) -> &Self::Target {
-        self.error.as_ref()
+        self.error.deref()
     }
 }
 
 impl DerefMut for Error {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.error.as_mut()
-    }
-}
-
-impl AsRef<dyn HttpError> for Error {
-    fn as_ref(&self) -> &dyn HttpError {
-        self.deref()
-    }
-}
-
-impl AsMut<dyn HttpError> for Error {
-    fn as_mut(&mut self) -> &mut dyn HttpError {
-        self.deref_mut()
+        self.error.deref_mut()
     }
 }
 
@@ -537,8 +434,7 @@ impl<T> ResultExt<T> for Option<T> {
         S: TryInto<StatusCode>,
         S::Error: fmt::Debug,
     {
-        let status = status.try_into().expect("Invalid status code");
-        self.ok_or_else(|| Error::msg("None Error").set_status(status))
+        self.ok_or(Error::msg("None Error").set_status(status))
     }
 }
 
@@ -582,73 +478,8 @@ impl<T> ResultExt<T> for Option<T> {
 macro_rules! msg {
     ($fmt:expr,$status:expr $(, $args:expr)* $(,)?) => {{
         let status: $crate::StatusCode = $status.try_into().expect("Invalid status code");
-        let message = $crate::alloc::format!($fmt $(, $args)*);
+        let message = alloc::format!($fmt $(, $args)*);
         let error = $crate::Error::msg(message);
         error.set_status(status)
-    }};
-}
-
-/// Constructs an [`Error`] with a formatted message and compile-time verified status code.
-///
-/// The first argument must be an HTTP status code literal (e.g. `404`) or a constant/status-code
-/// path (e.g. [`StatusCode::NOT_FOUND`]). When a literal is provided, the macro uses a `const fn`
-/// to ensure at compile time that the value lies within the valid HTTP range (`100..=599`).
-///
-/// # Examples
-///
-/// ```rust
-/// use http_kit::{error, StatusCode};
-///
-/// let not_found = error!(404, "Resource {} missing", "item-42");
-/// assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
-///
-/// let unavailable = error!(StatusCode::SERVICE_UNAVAILABLE, "try again later");
-/// assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
-/// ```
-#[macro_export]
-macro_rules! error {
-    ($status:literal, $fmt:expr $(, $args:expr)* $(,)?) => {{
-        const __HTTP_KIT_STATUS: u16 =
-            $crate::__error_private::assert_status_literal($status);
-        let status = $crate::StatusCode::from_u16(__HTTP_KIT_STATUS)
-            .expect("status code literal already validated");
-        $crate::Error::msg($crate::alloc::format!($fmt $(, $args)*))
-            .set_status(status)
-    }};
-    ($status:path, $fmt:expr $(, $args:expr)* $(,)?) => {{
-        const __HTTP_KIT_STATUS: $crate::StatusCode =
-            $crate::__error_private::assert_status_code($status);
-        $crate::Error::msg($crate::alloc::format!($fmt $(, $args)*))
-            .set_status(__HTTP_KIT_STATUS)
-    }};
-}
-
-/// Returns early with an [`Error`] constructed by [`error!`].
-///
-/// This macro mirrors the ergonomics of `anyhow::bail!` while enforcing that
-/// callers always provide an explicit HTTP status code. The status argument
-/// must be either a numeric literal (`404`) or a status constant/path
-/// (`StatusCode::BAD_REQUEST`). Literal status codes are validated at
-/// compile-time using a `const fn`.
-///
-/// # Examples
-///
-/// ```rust
-/// use http_kit::{bail, Result, StatusCode};
-///
-/// fn must_be_even(n: u32) -> Result<()> {
-///     if n % 2 != 0 {
-///         bail!(StatusCode::BAD_REQUEST, "expected even number, got {}", n);
-///     }
-///     Ok(())
-/// }
-/// ```
-#[macro_export]
-macro_rules! bail {
-    ($status:literal, $fmt:expr $(, $args:expr)* $(,)?) => {{
-        return Err($crate::error!($status, $fmt $(, $args)*));
-    }};
-    ($status:path, $fmt:expr $(, $args:expr)* $(,)?) => {{
-        return Err($crate::error!($status, $fmt $(, $args)*));
     }};
 }

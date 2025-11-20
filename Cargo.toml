@@ -20,6 +20,7 @@ bytestr = "0.1.0"
 futures-lite = "2.6"
 pin-project-lite = "0.2.16"
 http-body-util = "0.1.3"
+eyre = "0.6.12"
 
 [dependencies.serde_json]
 version = "1.0"
