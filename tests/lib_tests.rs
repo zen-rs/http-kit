@@ -1,6 +1,21 @@
-use http_kit::{Body, Error, Result, ResultExt, StatusCode};
+use http_kit::{http_error, http_error_fmt, Body, Error, HttpError, Result, ResultExt, StatusCode};
 // Import stream specifically for the one function that needs it
 use futures_lite::StreamExt;
+
+http_error!(
+    /// Error returned when testing macros for missing resources.
+    pub MacroNotFound,
+    StatusCode::NOT_FOUND,
+    "macro missing"
+);
+
+
+http_error_fmt!(
+    /// Custom formatted macro error used in tests.
+    pub MacroDisplayError,
+    StatusCode::BAD_REQUEST,
+    |_, f| write!(f, "bad request (400)"),
+);
 
 #[tokio::test]
 async fn test_basic_body_operations() {
@@ -202,6 +217,17 @@ async fn test_result_ext_functionality() {
     let result: Result<i32> = option.status(StatusCode::BAD_REQUEST);
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), 42);
+}
+
+#[test]
+fn test_http_error_macros() {
+    let not_found = MacroNotFound::new();
+    assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+    assert_eq!(not_found.to_string(), "macro missing");
+
+    let display = MacroDisplayError::new();
+    assert_eq!(display.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(display.to_string(), "bad request (400)");
 }
 
 

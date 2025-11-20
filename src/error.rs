@@ -50,14 +50,25 @@ pub trait HttpError: core::error::Error + Send + Sync + 'static {
     ///         write!(f, "My error occurred")
     ///     }
     /// }
-    /// impl HttpError for MyError {
-    ///     fn status(&self) -> StatusCode {
-    ///         StatusCode::INTERNAL_SERVER_ERROR
-    ///     }
-    /// }
-    /// let err = MyError;
-    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    /// ```
+/// impl HttpError for MyError {
+///     fn status(&self) -> StatusCode {
+///         StatusCode::INTERNAL_SERVER_ERROR
+///     }
+/// }
+/// let err = MyError;
+/// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+/// ```
+///
+/// Alternatively, you can use the [`http_error!`](crate::http_error!) macro to build
+/// zero-sized types that already implement `HttpError` with a fixed status code:
+///
+/// ```rust
+/// use http_kit::{http_error, StatusCode, HttpError};
+///
+/// http_error!(pub BadGateway, StatusCode::BAD_GATEWAY, "upstream failed");
+/// let err = BadGateway::new();
+/// assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+/// ```
     fn status(&self) -> StatusCode;
 }
 
