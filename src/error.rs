@@ -29,6 +29,37 @@ use core::{
 };
 use http::StatusCode;
 
+/// Trait for errors that have an associated HTTP status code.
+////
+/// This trait extends the standard `Error` trait to include a method for retrieving
+/// the HTTP status code associated with the error.
+pub trait HttpError: core::error::Error + Send + Sync + 'static {
+    /// Returns the HTTP status code associated with this error.
+    ////
+    /// # Examples
+    /////
+    /// ```rust
+    /// use http_kit::{HttpError,StatusCode};
+    /// #[derive(Debug)]
+    /// struct MyError;
+    ///
+    /// impl core::error::Error for MyError {}
+    /// impl std::fmt::Display for MyError {
+    ///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    ///         write!(f, "My error occurred")
+    ///     }
+    /// }
+    /// impl HttpError for MyError {
+    ///     fn status(&self) -> StatusCode {
+    ///         StatusCode::INTERNAL_SERVER_ERROR
+    ///     }
+    /// }
+    /// let err = MyError;
+    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    /// ```
+    fn status(&self) -> StatusCode;
+}
+
 /// The main error type for HTTP operations.
 ///
 /// This error type wraps any error with an associated HTTP status code,
@@ -48,7 +79,7 @@ use http::StatusCode;
 /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
 /// ```
 pub struct Error {
-    error: anyhow::Error,
+    error: eyre::Error,
     status: StatusCode,
 }
 
@@ -97,7 +128,7 @@ impl Error {
     /// ```
     pub fn new<E, S>(error: E, status: S) -> Self
     where
-        E: Into<anyhow::Error>,
+        E: Into<eyre::Error>,
         S: TryInto<StatusCode>,
         S::Error: fmt::Debug,
     {
@@ -127,7 +158,7 @@ impl Error {
     where
         S: fmt::Display + fmt::Debug + Send + Sync + 'static,
     {
-        anyhow::Error::msg(msg).into()
+       Self { error:  eyre::Error::msg(msg), status: StatusCode::SERVICE_UNAVAILABLE }
     }
 
     /// Sets the HTTP status code of this error.
@@ -277,7 +308,7 @@ impl Error {
     }
 }
 
-impl<E: Into<anyhow::Error>> From<E> for Error {
+impl<E: core::error::Error + Send + Sync + 'static> From<E> for Error {
     fn from(error: E) -> Self {
         Self::new(error, StatusCode::SERVICE_UNAVAILABLE)
     }

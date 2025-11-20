@@ -91,7 +91,7 @@ mod macros;
 pub mod sse;
 
 mod error;
-pub use error::{Error, Result, ResultExt};
+pub use error::{Error, Result, ResultExt,HttpError};
 mod body;
 
 #[cfg(feature = "fs")]
