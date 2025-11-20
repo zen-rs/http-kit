@@ -94,62 +94,21 @@ pub struct Error {
     status: StatusCode,
 }
 
-impl<E:HttpError> From<E> for Box<dyn HttpError> {
-    fn from(error: E) -> Self {
-        Box::new(error)
-    }
-}
+/// A boxed HTTP error trait object.
+/// 
+/// > Unlike `Box<dyn std::error::Error>`, this type carries HTTP status code information, and implements the `HttpError` trait.
+pub type BoxHttpError = Box<dyn HttpError>;
 
-impl From<Box<dyn core::error::Error + Send + Sync + 'static>> for Box<dyn HttpError> {
-    fn from(error: Box<dyn core::error::Error + Send + Sync + 'static>) -> Self {
-        #[derive(Debug)]
-        struct Wrapper {
-            inner: Box<dyn core::error::Error + Send + Sync + 'static>,
-        }
-
-        impl core::error::Error for Wrapper {}
-
-        impl fmt::Display for Wrapper {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", self.inner)
-            }
-        }
-
-        impl HttpError for Wrapper {
-            fn status(&self) -> StatusCode {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        }
-
-        Box::new(Wrapper { inner: error })
+impl core::error::Error for BoxHttpError{}
+impl HttpError for BoxHttpError{
+    fn status(&self) -> StatusCode {
+        (**self).status()
     }
 }
 
 impl HttpError for Infallible{
     fn status(&self) -> StatusCode {
         unreachable!("Infallible can never be instantiated")
-    }
-}
-
-impl From<Box<dyn HttpError>> for Error {
-    fn from(error: Box<dyn HttpError>) -> Self {
-        let status = error.status();
-        #[derive(Debug)]
-        struct Wrapper{
-            error: Box<dyn HttpError>,
-        }
-
-        impl core::error::Error for Wrapper {}
-
-        impl core::fmt::Display for Wrapper {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", self.error)
-            }
-        }
-        Self {
-            error: eyre::Error::new(Wrapper{error}),
-            status,
-        }
     }
 }
 
@@ -388,19 +347,49 @@ impl Error {
         self.error.downcast_mut()
     }
 
-    /// Consumes this error and returns the inner error, discarding the status code.
+    /// Converts this error into a boxed standard error trait object.
     ///
     /// # Examples
+    ///// ```rust
+    /// use http_kit::Error;
+    /// let err = Error::msg("Not found");
+    /// let boxed_err: Box<dyn std::error::Error + Send> = err.into_boxed_error();
+    /// ```
+    pub fn into_boxed_error(self) -> Box<dyn core::error::Error + Send + 'static> {
+        self.into_boxed_http_error() as Box<dyn core::error::Error + Send + 'static>
+    }
+
+    /// Converts this error into a boxed `HttpError` trait object.
     ///
-    /// ```rust
+    /// # Examples
+    //// ```rust
     /// use http_kit::Error;
     /// use http::StatusCode;
-    ///
-    /// let err = Error::msg("some error").set_status(StatusCode::BAD_REQUEST);
-    /// let inner = err.into_inner();
+    /// let err = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
+    /// let boxed_err: Box<dyn http_kit::HttpError> = err.into_boxed_http_error();
     /// ```
-    pub fn into_inner(self) -> Box<dyn core::error::Error + Send + Sync + 'static> {
-        self.error.into()
+    pub fn into_boxed_http_error(self) -> Box<dyn HttpError> {
+        struct Wrapper {
+            inner: Error,
+        }
+
+        impl core::error::Error for Wrapper {}
+        impl fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.inner)
+            }
+        }
+        impl fmt::Debug for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Debug::fmt(&self.inner, f)
+            }
+        }
+        impl HttpError for Wrapper {
+            fn status(&self) -> StatusCode {
+                self.inner.status()
+            }
+        }
+        Box::new(Wrapper { inner: self })
     }
 }
 
