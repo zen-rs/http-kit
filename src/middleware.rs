@@ -33,11 +33,10 @@
 //! The middleware can then be composed with endpoints using [`WithMiddleware`].
 //! Multiple middleware can be chained together using tuples like `(Middleware1, Middleware2)`.
 use crate::{
-    endpoint::{EndpointImpl, WithMiddleware},
-    Endpoint, Request, Response, Result,
+    Endpoint, HttpError, Request, Response, endpoint::{EndpointImpl}, error::BoxHttpError
 };
 use alloc::boxed::Box;
-use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
+use core::{any::type_name,  fmt::{Debug, Display}, future::Future, ops::DerefMut, pin::Pin};
 /// Trait for implementing middleware that can process HTTP requests and responses.
 ///
 /// Middleware sits between the initial request and the final endpoint, allowing you to
@@ -169,7 +168,7 @@ pub trait Middleware: Send {
         &mut self,
         request: &mut Request,
         next: impl Endpoint,
-    ) -> impl Future<Output = Result<Response>> + Send;
+    ) -> impl Future<Output = Result<Response,BoxHttpError>> + Send;
 }
 
 pub(crate) trait MiddlewareImpl: Send {
@@ -177,7 +176,7 @@ pub(crate) trait MiddlewareImpl: Send {
         &'this mut self,
         request: &'req mut Request,
         next: &'next mut dyn EndpointImpl,
-    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send>>
+    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response,BoxHttpError>> + Send>>
     where
         'this: 'fut,
         'req: 'fut,
@@ -188,7 +187,8 @@ pub(crate) trait MiddlewareImpl: Send {
 }
 
 impl Endpoint for &mut dyn EndpointImpl {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    type Error = BoxHttpError;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.respond_inner(request).await
     }
 }
@@ -198,7 +198,7 @@ impl<T: Middleware> MiddlewareImpl for T {
         &'this mut self,
         request: &'req mut Request,
         next: &'next mut dyn EndpointImpl,
-    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response>> + Send>>
+    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response,BoxHttpError>> + Send>>
     where
         'this: 'fut,
         'req: 'fut,
@@ -209,57 +209,63 @@ impl<T: Middleware> MiddlewareImpl for T {
 }
 
 impl<M: Middleware> Middleware for &mut M {
-    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response,BoxHttpError> {
         Middleware::handle(*self, request, next).await
     }
 }
 
 impl<M: Middleware> Middleware for Box<M> {
-    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
+    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response,BoxHttpError> {
         Middleware::handle(self.deref_mut(), request, next).await
     }
 }
 
-/// Middleware implementation for tuples of two middleware types.
-///
-/// This allows you to combine two middleware into a single unit where the first
-/// middleware wraps the second middleware, which in turn wraps the endpoint.
-/// The execution order is: `self.0` → `self.1` → endpoint.
-///
-/// # Examples
-///
-/// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body};
-///
-/// struct LoggingMiddleware;
-/// impl Middleware for LoggingMiddleware {
-///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
-///         println!("Before request");
-///         let response = next.respond(request).await;
-///         println!("After request");
-///         response
-///     }
-/// }
-///
-/// struct TimingMiddleware;
-/// impl Middleware for TimingMiddleware {
-///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
-///         let start = std::time::Instant::now();
-///         let response = next.respond(request).await;
-///         println!("Elapsed: {:?}", start.elapsed());
-///         response
-///     }
-/// }
-///
-/// // Combine middleware using tuple syntax
-/// let combined = (LoggingMiddleware, TimingMiddleware);
-/// // Execution order: LoggingMiddleware → TimingMiddleware → endpoint
-/// ```
-impl<T1: Middleware, T2: Middleware> Middleware for (T1, T2) {
-    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response> {
-        self.0
-            .handle(request, WithMiddleware::new(next, &mut self.1))
-            .await
+
+/// Error type for middleware tuples, representing errors from either middleware.
+#[derive(Debug)]
+pub enum MiddlewareTupleError<E1: HttpError, E2: HttpError> {
+    /// Error from the first middleware in the tuple.
+    First(E1),
+    /// Error from the second middleware in the tuple.
+    Second(E2),
+}
+
+impl<A,B> Display for MiddlewareTupleError<A,B>
+where
+    A: HttpError,
+    B: HttpError,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MiddlewareTupleError::First(e) => write!(f, "First middleware error: {}", e),
+            MiddlewareTupleError::Second(e) => write!(f, "Second middleware error: {}", e),
+        }
+    }
+}
+
+impl<A,B> core::error::Error for MiddlewareTupleError<A,B>
+where
+    A: HttpError,
+    B: HttpError,
+{
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            MiddlewareTupleError::First(e) => e.source(),
+            MiddlewareTupleError::Second(e) => e.source(),
+        }
+    }
+}
+
+impl<A,B> HttpError for MiddlewareTupleError<A,B>
+where
+    A: HttpError,
+    B: HttpError,
+{
+    fn status(&self) -> crate::StatusCode {
+        match self {
+            MiddlewareTupleError::First(e) => e.status(),
+            MiddlewareTupleError::Second(e) => e.status(),
+        }
     }
 }
 
@@ -409,7 +415,7 @@ impl AnyMiddleware {
 }
 
 impl Middleware for AnyMiddleware {
-    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response, BoxHttpError> {
         self.0.handle_inner(request, &mut next).await
     }
 }
@@ -422,7 +428,7 @@ impl Middleware for AnyMiddleware {
 /// - Conditional middleware application
 /// - Testing scenarios where middleware is optional
 impl Middleware for () {
-    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
-        next.respond(request).await
+    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response, BoxHttpError> {
+        next.respond(request).await.map_err(|e| Box::new(e) as BoxHttpError)
     }
 }

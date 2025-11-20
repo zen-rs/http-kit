@@ -1,4 +1,4 @@
-use http_kit::{http_error, http_error_fmt, Body, Error, HttpError, Result, ResultExt, StatusCode};
+use http_kit::{http_error, http_error_fmt, Body, HttpError, StatusCode};
 // Import stream specifically for the one function that needs it
 use futures_lite::StreamExt;
 
@@ -152,72 +152,7 @@ async fn test_form_functionality() {
     assert_eq!(parsed, data);
 }
 
-#[tokio::test]
-async fn test_error_functionality() {
-    // Test basic error creation
-    let error = Error::msg("Test error");
-    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(format!("{}", error), "Test error");
 
-    // Test error with custom status
-    let error_404 = Error::msg("Not found").set_status(StatusCode::NOT_FOUND);
-    assert_eq!(error_404.status(), StatusCode::NOT_FOUND);
-    assert_eq!(format!("{}", error_404), "Not found");
-
-    // Test error from standard error
-    let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-    let http_error = Error::new(io_error, StatusCode::NOT_FOUND);
-    assert_eq!(http_error.status(), StatusCode::NOT_FOUND);
-
-    // Test downcast
-    let io_error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
-    let error = Error::new(io_error, StatusCode::FORBIDDEN);
-    let downcasted = error.downcast_ref::<std::io::Error>().unwrap();
-    assert_eq!(downcasted.kind(), std::io::ErrorKind::PermissionDenied);
-}
-
-#[test]
-fn test_from_impl_sets_default_status() {
-    fn fallible() -> Result<()> {
-        Err(std::io::Error::other("permission denied")).status(500)?;
-        Ok(())
-    }
-
-    let err = fallible().unwrap_err();
-    assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(err.to_string(), "permission denied");
-}
-
-#[tokio::test]
-async fn test_result_ext_functionality() {
-    use http_kit::ResultExt;
-
-    // Test with Result
-    let io_result: std::result::Result<String, std::io::Error> = Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "file not found",
-    ));
-
-    let http_result: Result<String> = io_result.status(StatusCode::NOT_FOUND);
-    assert!(http_result.is_err());
-
-    let error = http_result.unwrap_err();
-    assert_eq!(error.status(), StatusCode::NOT_FOUND);
-
-    // Test with Option (None)
-    let option: Option<i32> = None;
-    let result: Result<i32> = option.status(StatusCode::BAD_REQUEST);
-    assert!(result.is_err());
-
-    let error = result.unwrap_err();
-    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-
-    // Test with Option (Some)
-    let option: Option<i32> = Some(42);
-    let result: Result<i32> = option.status(StatusCode::BAD_REQUEST);
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 42);
-}
 
 #[test]
 fn test_http_error_macros() {

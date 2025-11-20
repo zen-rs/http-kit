@@ -70,7 +70,7 @@ use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
 
 use alloc::boxed::Box;
 
-use crate::{Middleware, Request, Response, Result};
+use crate::{HttpError, Middleware, Request, Response, error::BoxHttpError};
 
 /// A trait for types that can handle HTTP requests and generate responses.
 ///
@@ -145,6 +145,8 @@ use crate::{Middleware, Request, Response, Result};
 /// # }
 /// ```
 pub trait Endpoint: Send {
+    /// The error type returned by this endpoint.
+    type Error: HttpError;
     /// Processes an HTTP request and generates a response.
     ///
     /// This method receives a mutable reference to the request, allowing it to:
@@ -173,17 +175,19 @@ pub trait Endpoint: Send {
     ///     }
     /// }
     /// ```
-    fn respond(&mut self, request: &mut Request) -> impl Future<Output = Result<Response>> + Send;
+    fn respond(&mut self, request: &mut Request) -> impl Future<Output = Result<Response,Self::Error>> + Send;
 }
 
 impl<E: Endpoint> Endpoint for &mut E {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    type Error = E::Error;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response,Self::Error> {
         Endpoint::respond(*self, request).await
     }
 }
 
 impl<E: Endpoint> Endpoint for Box<E> {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    type Error = E::Error;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response,Self::Error> {
         Endpoint::respond(self.deref_mut(), request).await
     }
 }
@@ -279,7 +283,8 @@ impl<E: Endpoint, M: Middleware> WithMiddleware<E, M> {
 }
 
 impl<E: Endpoint, M: Middleware> Endpoint for WithMiddleware<E, M> {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    type Error = BoxHttpError;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response,Self::Error> {
         self.middleware.handle(request, &mut self.endpoint).await
     }
 }
@@ -288,7 +293,7 @@ pub(crate) trait EndpointImpl: Send {
     fn respond_inner<'this, 'req, 'fut>(
         &'this mut self,
         request: &'req mut Request,
-    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response>>>>
+    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response,BoxHttpError>>>>
     where
         'this: 'fut,
         'req: 'fut;
@@ -403,17 +408,23 @@ impl<E: Endpoint> EndpointImpl for E {
     fn respond_inner<'this, 'req, 'fut>(
         &'this mut self,
         request: &'req mut Request,
-    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response>>>>
+    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response,BoxHttpError>>>>
     where
         'this: 'fut,
         'req: 'fut,
     {
-        Box::pin(self.respond(request))
+        Box::pin(async move {
+            Endpoint::respond(self, request)
+                .await
+                .map_err(|e| Box::new(e) as BoxHttpError)
+        })
     }
 }
 
 impl Endpoint for AnyEndpoint {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    type Error = BoxHttpError;
+    /// Processes an HTTP request using the underlying endpoint implementation.
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.0.respond_inner(request).await
     }
 }
