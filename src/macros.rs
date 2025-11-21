@@ -59,8 +59,8 @@ macro_rules! http_error_fmt {
         impl ::core::error::Error for $name {}
 
         impl $crate::HttpError for $name {
-            fn status(&self) -> $crate::StatusCode {
-                $status
+            fn status(&self) -> ::core::option::Option<$crate::StatusCode> {
+                ::core::option::Option::Some($status)
             }
         }
     };

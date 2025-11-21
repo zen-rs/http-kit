@@ -23,9 +23,7 @@
 //! ```
 //!
 use alloc::boxed::Box;
-use core::{
-    convert::Infallible
-};
+use core::convert::Infallible;
 use http::StatusCode;
 
 /// Trait for errors that have an associated HTTP status code.
@@ -48,44 +46,42 @@ pub trait HttpError: core::error::Error + Send + Sync + 'static {
     ///         write!(f, "My error occurred")
     ///     }
     /// }
-/// impl HttpError for MyError {
-///     fn status(&self) -> StatusCode {
-///         StatusCode::INTERNAL_SERVER_ERROR
-///     }
-/// }
-/// let err = MyError;
-/// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-/// ```
-///
-/// Alternatively, you can use the [`http_error!`](crate::http_error!) macro to build
-/// zero-sized types that already implement `HttpError` with a fixed status code:
-///
-/// ```rust
-/// use http_kit::{http_error, StatusCode, HttpError};
-///
-/// http_error!(pub BadGateway, StatusCode::BAD_GATEWAY, "upstream failed");
-/// let err = BadGateway::new();
-/// assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
-/// ```
-    fn status(&self) -> StatusCode;
+    /// impl HttpError for MyError {
+    ///     fn status(&self) -> StatusCode {
+    ///         StatusCode::INTERNAL_SERVER_ERROR
+    ///     }
+    /// }
+    /// let err = MyError;
+    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    /// ```
+    ///
+    /// Alternatively, you can use the [`http_error!`](crate::http_error!) macro to build
+    /// zero-sized types that already implement `HttpError` with a fixed status code:
+    ///
+    /// ```rust
+    /// use http_kit::{http_error, StatusCode, HttpError};
+    ///
+    /// http_error!(pub BadGateway, StatusCode::BAD_GATEWAY, "upstream failed");
+    /// let err = BadGateway::new();
+    /// assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+    /// ```
+    fn status(&self) -> Option<StatusCode>;
 }
 
-
-
 /// A boxed HTTP error trait object.
-/// 
+///
 /// > Unlike `Box<dyn std::error::Error>`, this type carries HTTP status code information, and implements the `HttpError` trait.
 pub type BoxHttpError = Box<dyn HttpError>;
 
-impl core::error::Error for BoxHttpError{}
-impl HttpError for BoxHttpError{
-    fn status(&self) -> StatusCode {
+impl core::error::Error for BoxHttpError {}
+impl HttpError for BoxHttpError {
+    fn status(&self) -> Option<StatusCode> {
         (**self).status()
     }
 }
 
-impl HttpError for Infallible{
-    fn status(&self) -> StatusCode {
+impl HttpError for Infallible {
+    fn status(&self) -> Option<StatusCode> {
         unreachable!("Infallible can never be instantiated")
     }
 }

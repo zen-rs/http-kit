@@ -70,7 +70,9 @@ use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
 
 use alloc::boxed::Box;
 
-use crate::{HttpError, Middleware, Request, Response, error::BoxHttpError, middleware::MiddlewareError};
+use crate::{
+    error::BoxHttpError, middleware::MiddlewareError, HttpError, Middleware, Request, Response,
+};
 
 /// A trait for types that can handle HTTP requests and generate responses.
 ///
@@ -175,19 +177,22 @@ pub trait Endpoint: Send {
     ///     }
     /// }
     /// ```
-    fn respond(&mut self, request: &mut Request) -> impl Future<Output = Result<Response,Self::Error>> + Send;
+    fn respond(
+        &mut self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send;
 }
 
 impl<E: Endpoint> Endpoint for &mut E {
     type Error = E::Error;
-    async fn respond(&mut self, request: &mut Request) -> Result<Response,Self::Error> {
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         Endpoint::respond(*self, request).await
     }
 }
 
 impl<E: Endpoint> Endpoint for Box<E> {
     type Error = E::Error;
-    async fn respond(&mut self, request: &mut Request) -> Result<Response,Self::Error> {
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         Endpoint::respond(self.deref_mut(), request).await
     }
 }
@@ -283,8 +288,8 @@ impl<E: Endpoint, M: Middleware> WithMiddleware<E, M> {
 }
 
 impl<E: Endpoint, M: Middleware> Endpoint for WithMiddleware<E, M> {
-    type Error = MiddlewareError<E::Error,M::Error>;
-    async fn respond(&mut self, request: &mut Request) -> Result<Response,Self::Error> {
+    type Error = MiddlewareError<E::Error, M::Error>;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.middleware.handle(request, &mut self.endpoint).await
     }
 }
@@ -293,7 +298,7 @@ pub(crate) trait EndpointImpl: Send {
     fn respond_inner<'this, 'req, 'fut>(
         &'this mut self,
         request: &'req mut Request,
-    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response,BoxHttpError>>>>
+    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response, BoxHttpError>>>>
     where
         'this: 'fut,
         'req: 'fut;
@@ -408,7 +413,7 @@ impl<E: Endpoint> EndpointImpl for E {
     fn respond_inner<'this, 'req, 'fut>(
         &'this mut self,
         request: &'req mut Request,
-    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response,BoxHttpError>>>>
+    ) -> Pin<Box<dyn 'fut + Send + Future<Output = Result<Response, BoxHttpError>>>>
     where
         'this: 'fut,
         'req: 'fut,

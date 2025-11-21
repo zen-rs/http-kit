@@ -9,7 +9,6 @@ http_error!(
     "macro missing"
 );
 
-
 http_error_fmt!(
     /// Custom formatted macro error used in tests.
     pub MacroDisplayError,
@@ -152,20 +151,16 @@ async fn test_form_functionality() {
     assert_eq!(parsed, data);
 }
 
-
-
 #[test]
 fn test_http_error_macros() {
     let not_found = MacroNotFound::new();
-    assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+    assert_eq!(not_found.status(), Some(StatusCode::NOT_FOUND));
     assert_eq!(not_found.to_string(), "macro missing");
 
     let display = MacroDisplayError::new();
-    assert_eq!(display.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(display.status(), Some(StatusCode::BAD_REQUEST));
     assert_eq!(display.to_string(), "bad request (400)");
 }
-
-
 
 // Test that runs the code that was previously buggy
 #[tokio::test]
