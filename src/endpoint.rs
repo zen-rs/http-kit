@@ -70,7 +70,7 @@ use core::{any::type_name, fmt::Debug, future::Future, ops::DerefMut, pin::Pin};
 
 use alloc::boxed::Box;
 
-use crate::{HttpError, Middleware, Request, Response, error::BoxHttpError};
+use crate::{HttpError, Middleware, Request, Response, error::BoxHttpError, middleware::MiddlewareError};
 
 /// A trait for types that can handle HTTP requests and generate responses.
 ///
@@ -283,7 +283,7 @@ impl<E: Endpoint, M: Middleware> WithMiddleware<E, M> {
 }
 
 impl<E: Endpoint, M: Middleware> Endpoint for WithMiddleware<E, M> {
-    type Error = BoxHttpError;
+    type Error = MiddlewareError<E::Error,M::Error>;
     async fn respond(&mut self, request: &mut Request) -> Result<Response,Self::Error> {
         self.middleware.handle(request, &mut self.endpoint).await
     }

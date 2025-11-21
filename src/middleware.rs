@@ -36,7 +36,7 @@ use crate::{
     Endpoint, HttpError, Request, Response, endpoint::{EndpointImpl}, error::BoxHttpError
 };
 use alloc::boxed::Box;
-use core::{any::type_name,  fmt::{Debug, Display}, future::Future, ops::DerefMut, pin::Pin};
+use core::{any::type_name, convert::Infallible, fmt::{Debug, Display}, future::Future, ops::DerefMut, pin::Pin};
 /// Trait for implementing middleware that can process HTTP requests and responses.
 ///
 /// Middleware sits between the initial request and the final endpoint, allowing you to
@@ -121,6 +121,8 @@ use core::{any::type_name,  fmt::{Debug, Display}, future::Future, ops::DerefMut
 /// }
 /// ```
 pub trait Middleware: Send {
+    /// The error type that this middleware can produce.
+    type Error: HttpError;
     /// Processes a request through the middleware chain.
     ///
     /// This method receives the current request and a `next` parameter representing
@@ -164,11 +166,47 @@ pub trait Middleware: Send {
     ///     }
     /// }
     /// ```
-    fn handle(
+    fn handle<E:Endpoint>(
         &mut self,
         request: &mut Request,
-        next: impl Endpoint,
-    ) -> impl Future<Output = Result<Response,BoxHttpError>> + Send;
+        next: E,
+    ) -> impl Future<Output = Result<Response,MiddlewareError<E::Error,Self::Error>>> + Send;
+}
+
+/// Error type for middleware that can represent errors from either the middleware itself or the endpoint it wraps.
+#[derive(Debug)]
+pub enum MiddlewareError<N,E>{
+    /// Error originating from the endpoint being called.
+    Endpoint(N),
+    /// Error originating from the middleware itself.
+    Middleware(E),
+}
+
+impl<N: HttpError,E: HttpError> Display for MiddlewareError<N,E>{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MiddlewareError::Endpoint(e) => write!(f, "Endpoint error: {}", e),
+            MiddlewareError::Middleware(e) => write!(f, "Middleware error: {}", e),
+        }
+    }
+}
+
+impl<N: HttpError,E: HttpError> core::error::Error for MiddlewareError<N,E>{
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            MiddlewareError::Endpoint(e) => e.source(),
+            MiddlewareError::Middleware(e) => e.source(),
+        }
+    }
+}
+
+impl<N: HttpError,E: HttpError> HttpError for MiddlewareError<N,E>{
+    fn status(&self) -> crate::StatusCode {
+        match self {
+            MiddlewareError::Endpoint(e) => e.status(),
+            MiddlewareError::Middleware(e) => e.status(),
+        }
+    }
 }
 
 pub(crate) trait MiddlewareImpl: Send {
@@ -186,7 +224,7 @@ pub(crate) trait MiddlewareImpl: Send {
     }
 }
 
-impl Endpoint for &mut dyn EndpointImpl {
+impl <'a>Endpoint for &mut (dyn EndpointImpl+'a) {
     type Error = BoxHttpError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.respond_inner(request).await
@@ -204,19 +242,31 @@ impl<T: Middleware> MiddlewareImpl for T {
         'req: 'fut,
         'next: 'fut,
     {
-        Box::pin(self.handle(request, next))
+        Box::pin(async move{
+            self.handle(request, next).await.map_err(|e| Box::new(e) as BoxHttpError)
+        })
     }
 }
 
 impl<M: Middleware> Middleware for &mut M {
-    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response,BoxHttpError> {
-        Middleware::handle(*self, request, next).await
+    type Error = M::Error;
+    async fn handle<E:Endpoint>(
+            &mut self,
+            request: &mut Request,
+            next: E,
+        ) -> Result<Response,MiddlewareError<E::Error,Self::Error>> {
+                Middleware::handle(*self, request, next).await
     }
 }
 
 impl<M: Middleware> Middleware for Box<M> {
-    async fn handle(&mut self, request: &mut Request, next: impl Endpoint) -> Result<Response,BoxHttpError> {
-        Middleware::handle(self.deref_mut(), request, next).await
+    type Error = M::Error;
+    async fn handle<E:Endpoint>(
+            &mut self,
+            request: &mut Request,
+            next: E,
+        ) -> Result<Response,MiddlewareError<E::Error,Self::Error>> {
+                Middleware::handle(self.deref_mut(), request, next).await
     }
 }
 
@@ -415,8 +465,13 @@ impl AnyMiddleware {
 }
 
 impl Middleware for AnyMiddleware {
-    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response, BoxHttpError> {
-        self.0.handle_inner(request, &mut next).await
+        type Error = BoxHttpError;
+    async fn handle<E:Endpoint>(
+            &mut self,
+            request: &mut Request,
+            mut next: E,
+        ) -> Result<Response,MiddlewareError<E::Error,Self::Error>> {
+                self.0.handle_inner(request, &mut next).await.map_err(MiddlewareError::Middleware)
     }
 }
 
@@ -428,7 +483,12 @@ impl Middleware for AnyMiddleware {
 /// - Conditional middleware application
 /// - Testing scenarios where middleware is optional
 impl Middleware for () {
-    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response, BoxHttpError> {
-        next.respond(request).await.map_err(|e| Box::new(e) as BoxHttpError)
-    }
+    type Error = Infallible;
+    async fn handle<E:Endpoint>(
+           &mut self,
+           request: &mut Request,
+           mut next: E,
+       ) -> Result<Response,MiddlewareError<E::Error,Self::Error>> {
+        next.respond(request).await.map_err(MiddlewareError::Endpoint)
+   }
 }
