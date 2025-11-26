@@ -66,6 +66,11 @@ pub trait HttpError: core::error::Error + Send + Sync + 'static {
     /// assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
     /// ```
     fn status(&self) -> Option<StatusCode>;
+
+    /// If the remote serve responded with an http status code instead of a connection error, it would be true.
+    fn is_remote(&self) -> bool {
+        self.status().is_some()
+    }
 }
 
 /// A boxed HTTP error trait object.

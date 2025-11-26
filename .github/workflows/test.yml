@@ -1,45 +1,23 @@
-name: Tests
+name: Test
 
 on:
-  push:
-    branches:
-      - "**"
-    tags:
-      - "v*"
-  pull_request:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  tests:
-    name: Tests (${{ matrix.os }})
+  test:
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
+      - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test
-        run: cargo test --locked --all-features
-
-  wasm:
-    name: wasm32 build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo build (wasm)
-        run: cargo build --locked --all-features --target wasm32-unknown-unknown
+          shared-key: test-${{ matrix.os }}
+      - run: cargo test --verbose --all-features
