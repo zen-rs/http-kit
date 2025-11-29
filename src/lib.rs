@@ -69,14 +69,16 @@
 //! ## Middleware Usage
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, Middleware, Endpoint, Body};
+//! use http_kit::{Request, Response, Result, Middleware, Endpoint, Body, Error};
+//! use http_kit::middleware::MiddlewareError;
 //!
 //! struct LoggingMiddleware;
 //!
 //! impl Middleware for LoggingMiddleware {
-//!     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+//!     type Error = Error;
+//!     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
 //!         println!("Request: {} {}", request.method(), request.uri());
-//!         let response = next.respond(request).await?;
+//!         let response = next.respond(request).await.map_err(MiddlewareError::Endpoint)?;
 //!         println!("Response: {}", response.status());
 //!         Ok(response)
 //!     }
@@ -91,11 +93,11 @@ mod macros;
 pub mod sse;
 
 pub mod error;
-pub use error::{HttpError};
+pub use error::{HttpError, Error, Result, ResultExt};
 mod body;
 
 #[cfg(feature = "fs")]
-pub(crate) mod mime_guess;
+pub mod mime_guess;
 pub use body::Body;
 pub use body::Error as BodyError;
 

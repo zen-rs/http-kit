@@ -16,12 +16,14 @@
 //! ## Basic Endpoint Implementation
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, Endpoint, Body};
+//! use http_kit::{Request, Response, Endpoint, Body};
+//! use core::convert::Infallible;
 //!
 //! struct HelloEndpoint;
 //!
 //! impl Endpoint for HelloEndpoint {
-//!     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+//!     type Error = Infallible;
+//!     async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
 //!         Ok(Response::new(Body::from_bytes("Hello, World!")))
 //!     }
 //! }
@@ -30,11 +32,12 @@
 //! ## Endpoint with Request Processing
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, Endpoint, Body};
+//! use http_kit::{Request, Response, Result, Endpoint, Body, Error};
 //!
 //! struct EchoEndpoint;
 //!
 //! impl Endpoint for EchoEndpoint {
+//!     type Error = Error;
 //!     async fn respond(&mut self, request: &mut Request) -> Result<Response> {
 //!         let body = std::mem::replace(request.body_mut(), Body::empty());
 //!         Ok(Response::new(body))
@@ -45,19 +48,22 @@
 //! ## Using with Middleware
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware, Body};
+//! use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware, Body, Error};
+//! use http_kit::middleware::MiddlewareError;
 //!
 //! struct LoggingMiddleware;
 //!
 //! impl Middleware for LoggingMiddleware {
-//!     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+//!     type Error = Error;
+//!     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
 //!         println!("Processing request to {}", request.uri());
-//!         next.respond(request).await
+//!         next.respond(request).await.map_err(MiddlewareError::Endpoint)
 //!     }
 //! }
 //!
 //! struct MyEndpoint;
 //! impl Endpoint for MyEndpoint {
+//!     type Error = Error;
 //!     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
 //!         Ok(Response::new(Body::from_bytes("OK")))
 //!     }
@@ -92,13 +98,14 @@ use crate::{
 /// ## Simple Text Response
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Endpoint, Body};
+/// use http_kit::{Request, Response, Result, Endpoint, Body, Error};
 ///
 /// struct GreetingEndpoint {
 ///     name: String,
 /// }
 ///
 /// impl Endpoint for GreetingEndpoint {
+///     type Error = Error;
 ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
 ///         let message = format!("Hello, {}!", self.name);
 ///         Ok(Response::new(Body::from_bytes(message)))
@@ -111,9 +118,27 @@ use crate::{
 /// ```rust
 /// # #[cfg(feature = "json")]
 /// # {
-/// use http::{StatusCode};
-/// use http_kit::{Request, Response, Result, Endpoint, Body, ResultExt};
+/// use http::StatusCode;
+/// use http_kit::{Request, Response, Result, Endpoint, Body, HttpError, BodyError};
 /// use serde::{Serialize, Deserialize};
+/// use thiserror::Error;
+///
+/// #[derive(Debug, Error)]
+/// enum ApiError {
+///     #[error("json error: {0}")]
+///     Json(#[from] serde_json::Error),
+///     #[error("body error: {0}")]
+///     Body(#[from] BodyError),
+/// }
+///
+/// impl HttpError for ApiError {
+///     fn status(&self) -> Option<StatusCode> {
+///         match self {
+///             Self::Json(_) => Some(StatusCode::BAD_REQUEST),
+///             Self::Body(_) => Some(StatusCode::INTERNAL_SERVER_ERROR),
+///         }
+///     }
+/// }
 ///
 /// #[derive(Serialize, Deserialize)]
 /// struct User { name: String, age: u32 }
@@ -121,23 +146,21 @@ use crate::{
 /// struct UserEndpoint;
 ///
 /// impl Endpoint for UserEndpoint {
-///     async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+///     type Error = ApiError;
+///     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
 ///         match request.method().as_str() {
 ///             "GET" => {
 ///                 let user = User { name: "Alice".into(), age: 30 };
-///                 let body = Body::from_json(&user)
-///                     .status(StatusCode::INTERNAL_SERVER_ERROR)?;
+///                 let body = Body::from_json(&user)?;
 ///                 Ok(Response::new(body))
 ///             }
 ///             "POST" => {
 ///                 let user: User = request
 ///                     .body_mut()
 ///                     .into_json()
-///                     .await
-///                     .status(StatusCode::BAD_REQUEST)?;
+///                     .await?;
 ///                 // Process user...
-///                 let body = Body::from_json(&user)
-///                     .status(StatusCode::INTERNAL_SERVER_ERROR)?;
+///                 let body = Body::from_json(&user)?;
 ///                 Ok(Response::new(body))
 ///             }
 ///             _ => Ok(Response::new(Body::from_bytes("Method Not Allowed")))
@@ -166,11 +189,12 @@ pub trait Endpoint: Send {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Endpoint, Body};
+    /// use http_kit::{Request, Response, Result, Endpoint, Body, Error};
     ///
     /// struct StatusEndpoint;
     ///
     /// impl Endpoint for StatusEndpoint {
+    ///     type Error = Error;
     ///     async fn respond(&mut self, request: &mut Request) -> Result<Response> {
     ///         let status = format!("Method: {}, URI: {}", request.method(), request.uri());
     ///         Ok(Response::new(Body::from_bytes(status)))
@@ -212,21 +236,24 @@ impl<E: Endpoint> Endpoint for Box<E> {
 /// # Examples
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware, Body};
+/// use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware, Body, Error};
+/// use http_kit::middleware::MiddlewareError;
 ///
 /// struct TimingMiddleware;
 /// impl Middleware for TimingMiddleware {
-///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+///     type Error = Error;
+///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
 ///         let start = std::time::Instant::now();
 ///         let response = next.respond(request).await;
 ///         let duration = start.elapsed();
 ///         println!("Request took {:?}", duration);
-///         response
+///         response.map_err(MiddlewareError::Endpoint)
 ///     }
 /// }
 ///
 /// struct HelloEndpoint;
 /// impl Endpoint for HelloEndpoint {
+///     type Error = Error;
 ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
 ///         Ok(Response::new(Body::from_bytes("Hello")))
 ///     }
@@ -255,14 +282,16 @@ impl<E: Endpoint, M: Middleware> WithMiddleware<E, M> {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware, Body};
+    /// use http_kit::{Request, Response, Result, Endpoint, Middleware, endpoint::WithMiddleware, Body, Error};
+    /// use http_kit::middleware::MiddlewareError;
     ///
     /// struct AuthMiddleware { token: String }
     /// impl Middleware for AuthMiddleware {
-    ///     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+    ///     type Error = Error;
+    ///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
     ///         if let Some(auth) = request.headers().get(http::header::AUTHORIZATION) {
     ///             if auth.as_bytes() == self.token.as_bytes() {
-    ///                 return next.respond(request).await;
+    ///                 return next.respond(request).await.map_err(MiddlewareError::Endpoint);
     ///             }
     ///         }
     ///         Ok(Response::new(Body::from_bytes("Unauthorized")))
@@ -271,6 +300,7 @@ impl<E: Endpoint, M: Middleware> WithMiddleware<E, M> {
     ///
     /// struct SecretEndpoint;
     /// impl Endpoint for SecretEndpoint {
+    ///     type Error = Error;
     ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
     ///         Ok(Response::new(Body::from_bytes("Secret data")))
     ///     }
@@ -323,10 +353,11 @@ pub(crate) trait EndpointImpl: Send {
 /// # Examples
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint, Body};
+/// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint, Body, Error};
 ///
 /// struct HelloEndpoint;
 /// impl Endpoint for HelloEndpoint {
+///     type Error = Error;
 ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
 ///         Ok(Response::new(Body::from_bytes("Hello")))
 ///     }
@@ -334,6 +365,7 @@ pub(crate) trait EndpointImpl: Send {
 ///
 /// struct GoodbyeEndpoint;
 /// impl Endpoint for GoodbyeEndpoint {
+///     type Error = Error;
 ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
 ///         Ok(Response::new(Body::from_bytes("Goodbye")))
 ///     }
@@ -366,13 +398,14 @@ impl AnyEndpoint {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint, Body};
+    /// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint, Body, Error};
     ///
     /// struct MyEndpoint {
     ///     message: String,
     /// }
     ///
     /// impl Endpoint for MyEndpoint {
+    ///     type Error = Error;
     ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
     ///         Ok(Response::new(Body::from_bytes(self.message.clone())))
     ///     }
@@ -392,10 +425,11 @@ impl AnyEndpoint {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint, Body};
+    /// use http_kit::{Request, Response, Result, Endpoint, endpoint::AnyEndpoint, Body, Error};
     ///
     /// struct MyEndpoint;
     /// impl Endpoint for MyEndpoint {
+    ///     type Error = Error;
     ///     async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
     ///         Ok(Response::new(Body::from_bytes("OK")))
     ///     }

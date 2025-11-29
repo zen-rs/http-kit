@@ -81,7 +81,7 @@ macro_rules! http_error_fmt {
 /// );
 ///
 /// let err = NotFoundError::new();
-/// assert_eq!(err.status(), StatusCode::NOT_FOUND);
+/// assert_eq!(err.status(), Some(StatusCode::NOT_FOUND));
 /// assert_eq!(err.to_string(), "resource not found");
 /// ```
 #[macro_export]

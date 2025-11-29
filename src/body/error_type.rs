@@ -142,3 +142,9 @@ impl From<futures_lite::io::Error> for Error {
         Self::Other(Box::new(error))
     }
 }
+
+impl From<core::convert::Infallible> for Error {
+    fn from(_: core::convert::Infallible) -> Self {
+        unreachable!()
+    }
+}

@@ -215,9 +215,7 @@ impl Body {
         Self {
             inner: BodyInner::HttpBody(Box::pin(
                 body.map_frame(|result| result.map_data(|data| data.into()))
-                    .map_err(|e| {
-                        e.into()
-                    }),
+                    .map_err(|e| e.into()),
             )),
         }
     }
@@ -1033,7 +1031,7 @@ impl Stream for Body {
                 .as_mut()
                 .poll_frame(cx)
                 .map_ok(|frame| frame.into_data().unwrap_or_default()),
-            BodyInner::Freeze => Poll::Ready(Some(Err(Error::BodyFrozen.into()))),
+            BodyInner::Freeze => Poll::Ready(Some(Err(Error::BodyFrozen))),
         }
     }
 
