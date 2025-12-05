@@ -1146,11 +1146,8 @@ impl http_body::Body for Body {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{
-        string::{String, ToString},
-        vec,
-        vec::Vec,
-    };
+    use alloc::string::ToString;
+    use alloc::vec;
     use futures_lite::{stream, StreamExt};
 
     #[tokio::test]
@@ -1225,6 +1222,7 @@ mod tests {
     #[cfg(feature = "json")]
     #[tokio::test]
     async fn json_roundtrip() {
+        use alloc::string::{String, ToString};
         use serde::{Deserialize, Serialize};
 
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -1251,6 +1249,7 @@ mod tests {
     #[cfg(feature = "form")]
     #[tokio::test]
     async fn form_roundtrip() {
+        use alloc::string::String;
         use serde::{Deserialize, Serialize};
 
         #[derive(Serialize, Deserialize, PartialEq, Debug)]

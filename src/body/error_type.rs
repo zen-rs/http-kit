@@ -3,8 +3,6 @@ extern crate std;
 
 use super::BodyFrozen;
 use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
 use core::error::Error as coreError;
 use core::fmt::Display;
 use core::str::Utf8Error;
