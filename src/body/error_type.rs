@@ -122,7 +122,7 @@ impl_body_error![
 #[cfg(not(feature = "std"))]
 impl_body_error![
     (Utf8, Utf8Error),
-    (Other, BoxError),
+    (Other, Box<dyn core::error::Error + Send + Sync + 'static>),
     (JsonError, serde_json::Error, "json"),
     (SerializeForm, serde_urlencoded::ser::Error, "form"),
     (DeserializeForm, serde_urlencoded::de::Error, "form")
