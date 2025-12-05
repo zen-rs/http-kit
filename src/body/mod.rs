@@ -254,6 +254,8 @@ impl Body {
     /// The optional length hint can improve performance for operations that
     /// benefit from knowing the total size.
     ///
+    /// You are responsible for setting the MIME type of the body.
+    ///
     /// # Arguments
     ///
     /// * `reader` - Any type implementing `AsyncBufRead + Send + 'static`
@@ -297,6 +299,8 @@ impl Body {
     /// `Result<T, E>` where `T` can be converted to `Bytes`. This is useful
     /// for handling data from network sources, databases, or custom generators.
     ///
+    /// You are responsible for setting the MIME type of the body.
+    ///
     /// # Type Parameters
     ///
     /// * `T` - Data type that can be converted to `Bytes`
@@ -339,6 +343,8 @@ impl Body {
     /// including `String`, `Vec<u8>`, `&str`, `&[u8]`, and `Bytes` itself.
     /// The conversion is zero-copy when possible.
     ///
+    /// By default, the MIME type is set to `application/octet-stream`.
+    ///
     /// # Examples
     ///
     /// ```rust
@@ -355,8 +361,36 @@ impl Body {
     /// ```
     pub fn from_bytes(data: impl Into<Bytes>) -> Self {
         Self {
-            mime: None,
+            mime: Some(mime::APPLICATION_OCTET_STREAM),
             inner: BodyInner::Once(data.into()),
+        }
+    }
+
+    /// Creates a body from a string slice.
+    ///
+    ///
+    /// This method accepts any type that can be converted to `ByteStr`,
+    /// including `String`, `&str`, and `ByteStr` itself.
+    /// The conversion is zero-copy when possible.
+    ///
+    /// By default, the MIME type is set to `text/plain; charset=utf-8`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    /// use bytestr::ByteStr;
+    ///
+    /// // From string slice
+    /// let body1 = Body::from_str("Hello, world!");
+    ///
+    /// // From String
+    /// let body2 = Body::from_str("Hello, world!".to_string());
+    /// ```
+    pub fn from_str(str: impl Into<ByteStr>) -> Self {
+        Self {
+            mime: Some(mime::TEXT_PLAIN_UTF_8),
+            inner: BodyInner::Once(str.into().into()),
         }
     }
 
@@ -415,6 +449,8 @@ impl Body {
     /// a body containing the JSON string. The resulting body will have
     /// UTF-8 encoded JSON content.
     ///
+    /// By default, the MIME type is set to `application/json`.
+    ///
     /// # Arguments
     ///
     /// * `value` - Any type implementing `serde::Serialize`
@@ -458,6 +494,8 @@ impl Body {
     ///
     /// This method serializes any `Serialize` type to `application/x-www-form-urlencoded`
     /// format, commonly used for HTML form submissions.
+    ///
+    /// By default, the MIME type is set to `application/x-www-form-urlencoded`.
     ///
     /// # Arguments
     ///

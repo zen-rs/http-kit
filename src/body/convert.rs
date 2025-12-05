@@ -17,7 +17,22 @@ macro_rules! from_bytes {
         )*
     };
 }
-from_bytes!(Bytes, Vec<u8>, Box<[u8]>, ByteStr, String);
+
+macro_rules! from_str {
+    ($($ty:ty),*) => {
+        $(
+            impl From<$ty> for Body {
+                fn from(data: $ty) -> Self {
+                    Body::from_str(data)
+                }
+            }
+        )*
+    };
+}
+
+from_str!(ByteStr, String, Box<str>, &str, Cow<'_, str>);
+
+from_bytes!(Bytes, Vec<u8>, Box<[u8]>);
 
 impl<'a> From<Cow<'a, [u8]>> for Body {
     fn from(data: Cow<[u8]>) -> Self {
@@ -28,24 +43,6 @@ impl<'a> From<Cow<'a, [u8]>> for Body {
 impl From<&[u8]> for Body {
     fn from(data: &[u8]) -> Self {
         Body::from_bytes(data.to_vec())
-    }
-}
-
-impl From<Box<str>> for Body {
-    fn from(data: Box<str>) -> Self {
-        Body::from_bytes(ByteStr::from(data))
-    }
-}
-
-impl<'a> From<Cow<'a, str>> for Body {
-    fn from(data: Cow<str>) -> Self {
-        data.as_bytes().into()
-    }
-}
-
-impl From<&str> for Body {
-    fn from(data: &str) -> Self {
-        data.as_bytes().into()
     }
 }
 
