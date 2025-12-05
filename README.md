@@ -36,15 +36,6 @@ async fn handler(mut req: Request) -> Result<Response> {
 }
 ```
 
-## Installation
-
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-http-kit = "0.1"
-```
-
 ## License
 
 This project is licensed under the MIT license.
