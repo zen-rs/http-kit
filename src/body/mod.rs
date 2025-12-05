@@ -430,7 +430,7 @@ impl Body {
         let len = file.metadata().await?.len() as usize;
         let mime = if let Some(ext) = path.extension() {
             if let Some(ext_str) = ext.to_str() {
-                crate::mime_guess::guess(ext_str.as_bytes()).and_then(|m| m.parse().ok())
+                Self::guess(ext_str.as_bytes()).and_then(|m| m.parse().ok())
             } else {
                 None
             }
@@ -488,6 +488,12 @@ impl Body {
             mime: Some(mime::APPLICATION_JSON),
             ..Self::from_bytes(serde_json::to_string(&value)?)
         })
+    }
+
+    #[cfg(feature = "fs")]
+    fn guess(extension: &[u8]) -> Option<&'static str> {
+        let s = core::str::from_utf8(extension).ok()?;
+        mime_guess::from_ext(s).first_raw()
     }
 
     /// Creates a body by serializing an object to URL-encoded form data.

@@ -96,8 +96,6 @@ pub mod error;
 pub use error::{Error, HttpError, Result, ResultExt};
 mod body;
 
-#[cfg(feature = "fs")]
-pub mod mime_guess;
 pub use body::Body;
 pub use body::Error as BodyError;
 

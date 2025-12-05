@@ -290,3 +290,22 @@ async fn test_mime_types() {
         );
     }
 }
+
+#[cfg(feature = "fs")]
+#[tokio::test]
+async fn test_file_body_with_mime() {
+    use std::io::Write;
+
+    // Create a temporary file with .html extension to test mime_guess
+    let dir = std::env::temp_dir();
+    let file_path = dir.join("test_mime.html");
+    let mut file = std::fs::File::create(&file_path).unwrap();
+    file.write_all(b"<html></html>").unwrap();
+
+    let body = Body::from_file(&file_path).await.unwrap();
+
+    assert_eq!(body.mime().unwrap().as_ref(), "text/html");
+
+    // Clean up
+    let _ = std::fs::remove_file(file_path);
+}
