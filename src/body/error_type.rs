@@ -1,7 +1,7 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-use super::{BodyFrozen};
+use super::BodyFrozen;
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;

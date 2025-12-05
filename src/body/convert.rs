@@ -58,6 +58,7 @@ impl From<Box<dyn AsyncBufRead + Send + Sync + 'static>> for Body {
 impl From<Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>> for Body {
     fn from(reader: Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>) -> Self {
         Self {
+            mime: None,
             inner: BodyInner::Reader {
                 reader,
                 length: None,

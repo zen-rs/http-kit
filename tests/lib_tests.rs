@@ -259,3 +259,34 @@ async fn test_body_freeze() {
     let result = body.into_bytes().await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn test_mime_types() {
+    let empty = Body::empty();
+    assert!(empty.mime().is_none());
+
+    #[cfg(feature = "json")]
+    {
+        use serde::Serialize;
+        #[derive(Serialize)]
+        struct Data {
+            val: i32,
+        }
+        let body = Body::from_json(&Data { val: 1 }).unwrap();
+        assert_eq!(body.mime().unwrap().as_ref(), "application/json");
+    }
+
+    #[cfg(feature = "form")]
+    {
+        use serde::Serialize;
+        #[derive(Serialize)]
+        struct Data {
+            val: i32,
+        }
+        let body = Body::from_form(&Data { val: 1 }).unwrap();
+        assert_eq!(
+            body.mime().unwrap().as_ref(),
+            "application/x-www-form-urlencoded"
+        );
+    }
+}

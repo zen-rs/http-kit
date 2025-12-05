@@ -51,7 +51,7 @@ impl Error {
             status: None,
         }
     }
-    
+
     /// Set the HTTP status code for this error.
     pub fn set_status(mut self, status: StatusCode) -> Self {
         self.status = Some(status);

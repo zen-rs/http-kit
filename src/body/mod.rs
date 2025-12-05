@@ -85,6 +85,7 @@ extern crate std;
 use futures_lite::{ready, Stream, StreamExt};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
+use mime::Mime;
 
 #[cfg(feature = "std")]
 use self::utils::IntoAsyncRead;
@@ -136,6 +137,7 @@ pub use http_body::Body as HttpBody;
 /// }
 /// ```
 pub struct Body {
+    mime: Option<Mime>,
     inner: BodyInner,
 }
 
@@ -182,6 +184,7 @@ impl Body {
     /// ```
     pub const fn empty() -> Self {
         Self {
+            mime: None,
             inner: BodyInner::Once(Bytes::new()),
         }
     }
@@ -213,6 +216,7 @@ impl Body {
         B::Error: Into<Error>,
     {
         Self {
+            mime: None,
             inner: BodyInner::HttpBody(Box::pin(
                 body.map_frame(|result| result.map_data(|data| data.into()))
                     .map_err(|e| e.into()),
@@ -238,6 +242,7 @@ impl Body {
     /// ```
     pub const fn frozen() -> Self {
         Self {
+            mime: None,
             inner: BodyInner::Freeze,
         }
     }
@@ -278,6 +283,7 @@ impl Body {
         length: impl Into<Option<usize>>,
     ) -> Self {
         Self {
+            mime: None,
             inner: BodyInner::Reader {
                 reader: Box::pin(reader),
                 length: length.into(),
@@ -319,6 +325,7 @@ impl Body {
         S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
     {
         Self {
+            mime: None,
             inner: BodyInner::HttpBody(Box::pin(StreamBody::new(stream.map(|result| {
                 result
                     .map(|data| Frame::data(data.into()))
@@ -348,6 +355,7 @@ impl Body {
     /// ```
     pub fn from_bytes(data: impl Into<Bytes>) -> Self {
         Self {
+            mime: None,
             inner: BodyInner::Once(data.into()),
         }
     }
@@ -383,12 +391,22 @@ impl Body {
     /// ```
     #[cfg(all(feature = "fs", feature = "std"))]
     pub async fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
+        let path = path.as_ref();
         let file = async_fs::File::open(path).await?;
         let len = file.metadata().await?.len() as usize;
-        Ok(Self::from_reader(
-            futures_lite::io::BufReader::new(file),
-            len,
-        ))
+        let mime = if let Some(ext) = path.extension() {
+            if let Some(ext_str) = ext.to_str() {
+                crate::mime_guess::guess(ext_str.as_bytes()).and_then(|m| m.parse().ok())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            mime,
+            ..Self::from_reader(futures_lite::io::BufReader::new(file), len)
+        })
     }
 
     /// Creates a body by serializing an object to JSON.
@@ -430,7 +448,10 @@ impl Body {
     /// ```
     #[cfg(feature = "json")]
     pub fn from_json<T: serde::Serialize>(value: T) -> Result<Self, serde_json::Error> {
-        Ok(Self::from_bytes(serde_json::to_string(&value)?))
+        Ok(Self {
+            mime: Some(mime::APPLICATION_JSON),
+            ..Self::from_bytes(serde_json::to_string(&value)?)
+        })
     }
 
     /// Creates a body by serializing an object to URL-encoded form data.
@@ -471,7 +492,10 @@ impl Body {
     /// ```
     #[cfg(feature = "form")]
     pub fn from_form<T: serde::Serialize>(value: T) -> Result<Self, serde_urlencoded::ser::Error> {
-        Ok(Self::from_bytes(serde_urlencoded::to_string(value)?))
+        Ok(Self {
+            mime: Some(mime::APPLICATION_WWW_FORM_URLENCODED),
+            ..Self::from_bytes(serde_urlencoded::to_string(value)?)
+        })
     }
 
     /// Creates a body from a stream of Server-Sent Events (SSE).
@@ -506,12 +530,24 @@ impl Body {
         E: Into<Error> + Send + Sync + 'static,
     {
         Self {
+            mime: Some(mime::TEXT_EVENT_STREAM),
             inner: BodyInner::HttpBody(Box::pin(
                 crate::sse::into_body(s)
                     .map_frame(|result| result.map_data(|data| data))
                     .map_err(|e| e.into()),
             )),
         }
+    }
+
+    /// Returns the MIME type of the body, if known.
+    pub fn mime(&self) -> Option<&Mime> {
+        self.mime.as_ref()
+    }
+
+    /// Sets the MIME type of the body.
+    pub fn with_mime(mut self, mime: Mime) -> Self {
+        self.mime = Some(mime);
+        self
     }
 
     /// Returns the length of the body in bytes, if known.
