@@ -95,3 +95,34 @@ macro_rules! http_error {
         );
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+    use crate::{HttpError, StatusCode};
+
+    http_error!(
+        /// Error returned when testing macros for missing resources.
+        pub MacroNotFound,
+        StatusCode::NOT_FOUND,
+        "macro missing"
+    );
+
+    http_error_fmt!(
+        /// Custom formatted macro error used in tests.
+        pub MacroDisplayError,
+        StatusCode::BAD_REQUEST,
+        |_, f| write!(f, "bad request (400)"),
+    );
+
+    #[test]
+    fn http_error_macros_create_expected_types() {
+        let not_found = MacroNotFound::new();
+        assert_eq!(not_found.status(), Some(StatusCode::NOT_FOUND));
+        assert_eq!(not_found.to_string(), "macro missing");
+
+        let display = MacroDisplayError::new();
+        assert_eq!(display.status(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(display.to_string(), "bad request (400)");
+    }
+}

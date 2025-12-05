@@ -1142,3 +1142,272 @@ impl http_body::Body for Body {
             .map_err(Error::from)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+    use futures_lite::{stream, StreamExt};
+
+    #[tokio::test]
+    async fn basic_body_operations() {
+        let empty = Body::empty();
+        assert_eq!(empty.len(), Some(0));
+        assert_eq!(empty.is_empty(), Some(true));
+        assert!(!empty.is_frozen());
+
+        let text_body = Body::from_bytes("Hello, World!");
+        assert_eq!(text_body.len(), Some(13));
+        assert_eq!(text_body.is_empty(), Some(false));
+
+        let result = text_body.into_bytes().await.unwrap();
+        assert_eq!(result.as_ref(), b"Hello, World!");
+    }
+
+    #[tokio::test]
+    async fn body_freeze_and_take() {
+        let mut body = Body::from_bytes("test data");
+        assert!(!body.is_frozen());
+
+        let taken = Body::take(&mut body).unwrap();
+        assert!(body.is_frozen());
+
+        let data = taken.into_bytes().await.unwrap();
+        assert_eq!(data.as_ref(), b"test data");
+
+        let result = body.into_bytes().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn body_conversions() {
+        let vec_data = vec![1, 2, 3, 4, 5];
+        let body = Body::from(vec_data.clone());
+        let result = body.into_bytes().await.unwrap();
+        assert_eq!(result.as_ref(), vec_data.as_slice());
+
+        let str_data = "string conversion test";
+        let body = Body::from(str_data);
+        let result = body.into_string().await.unwrap();
+        assert_eq!(result.as_str(), str_data);
+
+        let string_data = "owned string test".to_string();
+        let expected = string_data.clone();
+        let body = Body::from(string_data);
+        let result = body.into_string().await.unwrap();
+        assert_eq!(result.as_str(), expected);
+
+        let slice_data: &[u8] = &[6, 7, 8, 9, 10];
+        let body = Body::from(slice_data);
+        let result = body.into_bytes().await.unwrap();
+        assert_eq!(result.as_ref(), slice_data);
+    }
+
+    #[tokio::test]
+    async fn body_stream_yields_bytes() {
+        let body = Body::from_bytes("streaming test data");
+        let mut chunks = Vec::new();
+
+        let mut stream = body;
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            chunks.push(chunk);
+        }
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].as_ref(), b"streaming test data");
+    }
+
+    #[cfg(feature = "json")]
+    #[tokio::test]
+    async fn json_roundtrip() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct TestData {
+            message: String,
+            count: u32,
+        }
+
+        let data = TestData {
+            message: "JSON test".to_string(),
+            count: 42,
+        };
+
+        let body = Body::from_json(&data).unwrap();
+        let json_str = body.into_string().await.unwrap();
+        assert!(json_str.contains("JSON test"));
+        assert!(json_str.contains("42"));
+
+        let mut body = Body::from_json(&data).unwrap();
+        let parsed: TestData = body.into_json().await.unwrap();
+        assert_eq!(parsed, data);
+    }
+
+    #[cfg(feature = "form")]
+    #[tokio::test]
+    async fn form_roundtrip() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct FormData {
+            name: String,
+            age: u32,
+        }
+
+        let data = FormData {
+            name: "Alice".to_string(),
+            age: 30,
+        };
+
+        let body = Body::from_form(&data).unwrap();
+        let form_str = body.into_string().await.unwrap();
+        assert!(form_str.contains("name=Alice"));
+        assert!(form_str.contains("age=30"));
+
+        let mut body = Body::from_form(&data).unwrap();
+        let parsed: FormData = body.into_form().await.unwrap();
+        assert_eq!(parsed, data);
+    }
+
+    #[tokio::test]
+    async fn reader_does_not_hang() {
+        use futures_lite::io::{BufReader, Cursor};
+
+        let data = "This test ensures the reader doesn't create infinite loops";
+        let cursor = Cursor::new(data.as_bytes().to_vec());
+        let reader = BufReader::new(cursor);
+
+        let body = Body::from_reader(reader, data.len());
+
+        let result = body.into_bytes().await.unwrap();
+        assert_eq!(result.as_ref(), data.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn sse_body_creation_sets_mime() {
+        let events = stream::iter(vec![
+            Ok::<_, Box<dyn core::error::Error + Send + Sync>>(
+                crate::sse::Event::from_data("test data").with_id("1"),
+            ),
+            Ok(crate::sse::Event::from_data("more data").with_id("2")),
+        ]);
+
+        let body = Body::from_sse(events);
+        assert_eq!(
+            body.mime().as_ref().map(|m| m.as_ref()),
+            Some("text/event-stream")
+        );
+    }
+
+    #[tokio::test]
+    async fn body_as_str_and_bytes() {
+        let mut body = Body::from_bytes("test string");
+
+        let bytes_ref = body.as_bytes().await.unwrap();
+        assert_eq!(bytes_ref, b"test string");
+
+        let bytes_ref2 = body.as_bytes().await.unwrap();
+        assert_eq!(bytes_ref2, b"test string");
+
+        let mut body2 = Body::from_bytes("test string");
+        let str_ref = body2.as_str().await.unwrap();
+        assert_eq!(str_ref, "test string");
+
+        let mut invalid_body = Body::from_bytes(vec![0xFF, 0xFE, 0xFD]);
+        let result = invalid_body.as_str().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn body_replace_and_swap() {
+        let mut body = Body::from_bytes("original");
+        let old_body = body.replace(Body::from_bytes("replacement"));
+
+        let new_data = body.into_bytes().await.unwrap();
+        let old_data = old_body.into_bytes().await.unwrap();
+
+        assert_eq!(new_data.as_ref(), b"replacement");
+        assert_eq!(old_data.as_ref(), b"original");
+
+        let mut body1 = Body::from_bytes("first");
+        let mut body2 = Body::from_bytes("second");
+
+        Body::swap(&mut body1, &mut body2).unwrap();
+
+        let data1 = body1.into_bytes().await.unwrap();
+        let data2 = body2.into_bytes().await.unwrap();
+
+        assert_eq!(data1.as_ref(), b"second");
+        assert_eq!(data2.as_ref(), b"first");
+
+        let mut frozen_body = Body::frozen();
+        let mut normal_body = Body::from_bytes("test");
+        let result = Body::swap(&mut frozen_body, &mut normal_body);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn body_freeze() {
+        let mut body = Body::from_bytes("test");
+        assert!(!body.is_frozen());
+
+        body.freeze();
+        assert!(body.is_frozen());
+
+        let result = body.into_bytes().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mime_types() {
+        let empty = Body::empty();
+        assert!(empty.mime().is_none());
+
+        #[cfg(feature = "json")]
+        {
+            use serde::Serialize;
+            #[derive(Serialize)]
+            struct Data {
+                val: i32,
+            }
+            let body = Body::from_json(&Data { val: 1 }).unwrap();
+            assert_eq!(body.mime().unwrap().as_ref(), "application/json");
+        }
+
+        #[cfg(feature = "form")]
+        {
+            use serde::Serialize;
+            #[derive(Serialize)]
+            struct Data {
+                val: i32,
+            }
+            let body = Body::from_form(&Data { val: 1 }).unwrap();
+            assert_eq!(
+                body.mime().unwrap().as_ref(),
+                "application/x-www-form-urlencoded"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "fs", feature = "std"))]
+    #[tokio::test]
+    async fn file_body_with_mime() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir();
+        let file_path = dir.join("test_mime.html");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        file.write_all(b"<html></html>").unwrap();
+
+        let body = Body::from_file(&file_path).await.unwrap();
+
+        assert_eq!(body.mime().unwrap().as_ref(), "text/html");
+
+        let _ = std::fs::remove_file(file_path);
+    }
+}
