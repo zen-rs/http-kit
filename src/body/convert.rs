@@ -23,7 +23,7 @@ macro_rules! from_str {
         $(
             impl From<$ty> for Body {
                 fn from(data: $ty) -> Self {
-                    Body::from_str(data)
+                    Body::from_text(data)
                 }
             }
         )*

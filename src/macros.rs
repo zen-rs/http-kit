@@ -98,8 +98,8 @@ macro_rules! http_error {
 
 #[cfg(test)]
 mod tests {
-    use alloc::string::ToString;
     use crate::{HttpError, StatusCode};
+    use alloc::string::ToString;
 
     http_error!(
         /// Error returned when testing macros for missing resources.

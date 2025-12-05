@@ -319,7 +319,7 @@ impl Body {
     ///     Ok("world!".as_bytes()),
     /// ]);
     ///
-    /// let body = Body::from_stream(data_stream);
+    /// let body = Body::from_texteam(data_stream);
     /// # }
     /// ```
     pub fn from_stream<T, E, S>(stream: S) -> Self
@@ -382,12 +382,12 @@ impl Body {
     /// use bytestr::ByteStr;
     ///
     /// // From string slice
-    /// let body1 = Body::from_str("Hello, world!");
+    /// let body1 = Body::from_text("Hello, world!");
     ///
     /// // From String
-    /// let body2 = Body::from_str("Hello, world!".to_string());
+    /// let body2 = Body::from_text("Hello, world!".to_string());
     /// ```
-    pub fn from_str(str: impl Into<ByteStr>) -> Self {
+    pub fn from_text(str: impl Into<ByteStr>) -> Self {
         Self {
             mime: Some(mime::TEXT_PLAIN_UTF_8),
             inner: BodyInner::Once(str.into().into()),
