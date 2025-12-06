@@ -18,7 +18,7 @@ pub enum WebSocketMessage {
     Pong(Bytes),
 
     /// Close control frame.
-    Close(Bytes),
+    Close,
 }
 
 /// Configuration applied when establishing a websocket connection.
@@ -90,8 +90,8 @@ impl WebSocketMessage {
     }
 
     /// Construct a close message.
-    pub fn close<T: AsRef<[u8]>>(value: T) -> Self {
-        Self::Close(Bytes::from(value.as_ref().to_owned()))
+    pub fn close() -> Self {
+        Self::Close
     }
 
     /// Construct a binary message.
