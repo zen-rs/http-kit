@@ -48,12 +48,13 @@ version = "0.18"
 optional = true
 
 [features]
-default = ["json", "form", "std", "cookie"]
+default = ["json", "form", "std", "cookie", "ws"]
 std = []
 full = ["json", "form", "std", "cookie", "fs"]
 json = ["dep:serde", "dep:serde_json"]
 form = ["dep:serde", "dep:serde_urlencoded"]
 fs = ["dep:async-fs", "dep:mime_guess"]
+ws = []
 cookie = ["dep:cookie"]
 
 [dev-dependencies]

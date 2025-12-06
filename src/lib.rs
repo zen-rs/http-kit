@@ -116,4 +116,7 @@ pub type Response = http::Response<Body>;
 #[cfg(feature = "cookie")]
 pub use cookie;
 
+#[cfg(feature = "ws")]
+pub mod ws;
+
 pub use http::{header, method, uri, version, Extensions, Method, StatusCode, Uri, Version};
