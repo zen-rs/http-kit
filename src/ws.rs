@@ -73,6 +73,12 @@ impl WebSocketMessage {
         Self::Binary(value.into())
     }
 
+    /// Construct a JSON message.
+    pub fn json<T: serde::Serialize>(value: &T) -> serde_json::Result<Self> {
+        let json_string = serde_json::to_string(value)?;
+        Ok(Self::Text(json_string.into()))
+    }
+
     /// Returns the payload as text when possible.
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
@@ -96,6 +102,15 @@ impl WebSocketMessage {
     pub fn into_text(self) -> Option<ByteStr> {
         match self {
             Self::Text(text) => Some(text),
+            Self::Binary(_) => None,
+        }
+    }
+
+    /// Converts the payload into a JSON value when possible.
+    #[must_use]
+    pub fn into_json(self) -> Option<serde_json::Value> {
+        match self {
+            Self::Text(text) => serde_json::from_str(&text).ok(),
             Self::Binary(_) => None,
         }
     }
