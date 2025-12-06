@@ -101,6 +101,7 @@ impl WebSocketMessage {
     }
 
     /// Construct a JSON message.
+    #[cfg(feature = "json")]
     pub fn json<T: serde::Serialize>(value: &T) -> serde_json::Result<Self> {
         let json_string = serde_json::to_string(value)?;
         Ok(Self::Text(json_string.into()))
@@ -137,7 +138,7 @@ impl WebSocketMessage {
     }
 
     /// Converts the payload into a JSON value when possible.
-    #[must_use]
+    #[cfg(feature = "json")]
     pub fn into_json<T>(self) -> Option<Result<T, serde_json::Error>>
     where
         T: serde::de::DeserializeOwned,
