@@ -1,3 +1,5 @@
+//! WebSocket message and configuration types.
+
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use bytes::Bytes;
 use bytestr::ByteStr;
@@ -9,6 +11,11 @@ pub enum WebSocketMessage {
     Text(ByteStr),
     /// Binary payload.
     Binary(Bytes),
+
+    /// Ping control frame.
+    Ping(Bytes),
+    /// Pong control frame.
+    Pong(Bytes),
 }
 
 /// Configuration applied when establishing a websocket connection.
@@ -67,6 +74,18 @@ impl WebSocketMessage {
         Self::Text(value.into())
     }
 
+    /// Construct a ping message.
+    #[must_use]
+    pub fn ping(value: impl Into<Bytes>) -> Self {
+        Self::Ping(value.into())
+    }
+
+    /// Construct a pong message.
+    #[must_use]
+    pub fn pong(value: impl Into<Bytes>) -> Self {
+        Self::Pong(value.into())
+    }
+
     /// Construct a binary message.
     #[must_use]
     pub fn binary(value: impl Into<Bytes>) -> Self {
@@ -82,45 +101,50 @@ impl WebSocketMessage {
     /// Returns the payload as text when possible.
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Self::Text(text) => Some(text),
-            Self::Binary(_) => None,
+        if let Self::Text(text) = self {
+            Some(text)
+        } else {
+            None
         }
     }
 
     /// Returns the payload as raw bytes when possible.
     #[must_use]
     pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Text(_) => None,
-            Self::Binary(bytes) => Some(bytes),
+        if let Self::Binary(bytes) = self {
+            Some(bytes)
+        } else {
+            None
         }
     }
 
     /// Converts the payload into owned text when possible.
     #[must_use]
     pub fn into_text(self) -> Option<ByteStr> {
-        match self {
-            Self::Text(text) => Some(text),
-            Self::Binary(_) => None,
+        if let Self::Text(text) = self {
+            Some(text)
+        } else {
+            None
         }
     }
 
     /// Converts the payload into a JSON value when possible.
     #[must_use]
     pub fn into_json(self) -> Option<serde_json::Value> {
-        match self {
-            Self::Text(text) => serde_json::from_str(&text).ok(),
-            Self::Binary(_) => None,
+        if let Self::Text(text) = self {
+            serde_json::from_str(&text).ok()
+        } else {
+            None
         }
     }
 
     /// Converts the payload into owned bytes when possible.
     #[must_use]
     pub fn into_bytes(self) -> Option<Bytes> {
-        match self {
-            Self::Text(_) => None,
-            Self::Binary(bytes) => Some(bytes),
+        if let Self::Binary(bytes) = self {
+            Some(bytes)
+        } else {
+            None
         }
     }
 }
