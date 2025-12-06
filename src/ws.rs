@@ -18,7 +18,7 @@ pub enum WebSocketMessage {
     Pong(Bytes),
 
     /// Close control frame.
-    Close,
+    Close(Bytes),
 }
 
 /// Configuration applied when establishing a websocket connection.
@@ -88,16 +88,11 @@ impl WebSocketMessage {
     pub fn pong(value: impl Into<Bytes>) -> Self {
         Self::Pong(value.into())
     }
-    /// Construct a raw frame message.
-    #[must_use]
-    pub fn frame(value: impl Into<Bytes>) -> Self {
-        Self::Frame(value.into())
-    }
 
     /// Construct a close message.
     #[must_use]
-    pub fn close() -> Self {
-        Self::Close
+    pub fn close(value: impl Into<Bytes>) -> Self {
+        Self::Close(value.into())
     }
 
     /// Construct a binary message.
