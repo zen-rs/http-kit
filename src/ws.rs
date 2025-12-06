@@ -130,9 +130,12 @@ impl WebSocketMessage {
 
     /// Converts the payload into a JSON value when possible.
     #[must_use]
-    pub fn into_json(self) -> Option<serde_json::Value> {
+    pub fn into_json<T>(self) -> Option<Result<T, serde_json::Error>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
         if let Self::Text(text) = self {
-            serde_json::from_str(&text).ok()
+            Some(serde_json::from_str(&text))
         } else {
             None
         }
