@@ -17,9 +17,6 @@ pub enum WebSocketMessage {
     /// Pong control frame.
     Pong(Bytes),
 
-    /// Raw websocket frame.
-    Frame(Bytes),
-
     /// Close control frame.
     Close,
 }
