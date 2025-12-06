@@ -1,158 +1,147 @@
-//! Shared websocket types exposed by the public API without leaking backend dependencies.
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use bytes::Bytes;
+use bytestr::ByteStr;
 
-extern crate std;
-
-use std::{fmt, io};
-
-use alloc::{string::String, vec::Vec};
-
-/// Result type used by websocket operations.
-pub type WebSocketResult<T> = Result<T, WebSocketError>;
-
-/// Lightweight websocket configuration used across targets.
-#[derive(Clone, Debug, Default)]
-pub struct WebSocketConfig {
-    /// Maximum incoming message size in bytes. `None` removes the limit.
-    pub max_message_size: Option<usize>,
-}
-
-/// Close frame representation that avoids depending on tungstenite types.
+/// Message transmitted over a websocket connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WebSocketCloseFrame {
-    /// Close code sent to peer.
-    pub code: u16,
-    /// Human readable close reason.
-    pub reason: String,
+pub enum WebSocketMessage {
+    /// UTF-8 text payload.
+    Text(ByteStr),
+    /// Binary payload.
+    Binary(Bytes),
 }
 
-impl WebSocketCloseFrame {
-    /// Build a close frame from code and reason.
-    pub fn new(code: u16, reason: impl Into<String>) -> Self {
+/// Configuration applied when establishing a websocket connection.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct WebSocketConfig {
+    /// Maximum incoming websocket message size in bytes.
+    /// `None` means no limit.
+    pub max_message_size: Option<usize>,
+
+    /// Maximum incoming websocket frame size in bytes.
+    /// `None` means no limit.
+    pub max_frame_size: Option<usize>,
+}
+
+const DEFAULT_MAX_MESSAGE_SIZE: Option<usize> = Some(64 << 20);
+const DEFAULT_MAX_FRAME_SIZE: Option<usize> = Some(16 << 20);
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
         Self {
-            code,
-            reason: reason.into(),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
     }
 }
 
-/// Message wrapper that mirrors the common websocket frames we need.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WebSocketMessage {
-    /// Text payload.
-    Text(String),
-    /// Binary payload.
-    Binary(Vec<u8>),
-    /// Ping control frame.
-    Ping(Vec<u8>),
-    /// Pong control frame.
-    Pong(Vec<u8>),
-    /// Close control frame.
-    Close(Option<WebSocketCloseFrame>),
+impl WebSocketConfig {
+    /// Override the maximum incoming websocket message size in bytes.
+    ///
+    /// `None` means no limit.
+    ///
+    /// Defaults to 64 MiB.
+    #[must_use]
+    pub const fn with_max_message_size(mut self, max_message_size: Option<usize>) -> Self {
+        self.max_message_size = max_message_size;
+        self
+    }
+
+    /// Override the maximum incoming websocket frame size in bytes.
+    ///
+    /// `None` means no limit.
+    ///
+    /// Defaults to 16 MiB.
+    #[must_use]
+    pub const fn with_max_frame_size(mut self, max_frame_size: Option<usize>) -> Self {
+        self.max_frame_size = max_frame_size;
+        self
+    }
 }
 
 impl WebSocketMessage {
-    /// Create a text message.
-    pub fn text(value: impl Into<String>) -> Self {
+    /// Construct a text message.
+    #[must_use]
+    pub fn text(value: impl Into<ByteStr>) -> Self {
         Self::Text(value.into())
     }
 
-    /// Create a binary message.
-    pub fn binary(bytes: impl Into<Vec<u8>>) -> Self {
-        Self::Binary(bytes.into())
-    }
-
-    /// Returns true when the message is textual.
+    /// Construct a binary message.
     #[must_use]
-    pub const fn is_text(&self) -> bool {
-        matches!(self, Self::Text(_))
+    pub fn binary(value: impl Into<Bytes>) -> Self {
+        Self::Binary(value.into())
     }
 
-    /// Consume and return the text payload if present.
-    pub fn into_text(self) -> Result<String, Self> {
-        match self {
-            Self::Text(text) => Ok(text),
-            other => Err(other),
-        }
-    }
-
-    /// Deserialize JSON text message into a typed value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WebSocketError::Protocol`] if the message is not text or JSON deserialization fails.
-    #[cfg(feature = "json")]
-    pub fn into_json<T: serde::de::DeserializeOwned>(self) -> WebSocketResult<T> {
-        match self {
-            Self::Text(text) => serde_json::from_str(&text).map_err(WebSocketError::from),
-            _ => Err(WebSocketError::Protocol(
-                "Expected text message for JSON deserialization".into(),
-            )),
-        }
-    }
-
-    /// Try to deserialize JSON text message, returning None if not text.
-    ///
-    /// Returns `None` for non-text messages, or `Some(Result)` for text messages.
-    #[cfg(feature = "json")]
-    pub fn try_into_json<T: serde::de::DeserializeOwned>(self) -> Option<WebSocketResult<T>> {
-        match self {
-            Self::Text(text) => Some(serde_json::from_str(&text).map_err(WebSocketError::from)),
-            _ => None,
-        }
-    }
-
-    /// Returns true when the message is binary.
+    /// Returns the payload as text when possible.
     #[must_use]
-    pub const fn is_binary(&self) -> bool {
-        matches!(self, Self::Binary(_))
-    }
-
-    /// Consume and return the binary payload if present.
-    pub fn into_binary(self) -> Result<Vec<u8>, Self> {
+    pub fn as_text(&self) -> Option<&str> {
         match self {
-            Self::Binary(data) => Ok(data),
-            other => Err(other),
+            Self::Text(text) => Some(text),
+            Self::Binary(_) => None,
         }
     }
 
-    /// Returns true when the message is a close frame.
+    /// Returns the payload as raw bytes when possible.
     #[must_use]
-    pub const fn is_close(&self) -> bool {
-        matches!(self, Self::Close(_))
-    }
-}
-
-/// Errors produced by websocket operations.
-#[derive(Debug)]
-pub enum WebSocketError {
-    /// Underlying IO/transport failure.
-    Transport(io::Error),
-    /// Protocol-level failure.
-    Protocol(String),
-}
-
-impl From<io::Error> for WebSocketError {
-    fn from(error: io::Error) -> Self {
-        Self::Transport(error)
-    }
-}
-
-impl fmt::Display for WebSocketError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
-            Self::Transport(err) => write!(f, "transport error: {err}"),
-            Self::Protocol(err) => write!(f, "protocol error: {err}"),
+            Self::Text(_) => None,
+            Self::Binary(bytes) => Some(bytes),
+        }
+    }
+
+    /// Converts the payload into owned text when possible.
+    #[must_use]
+    pub fn into_text(self) -> Option<ByteStr> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Binary(_) => None,
+        }
+    }
+
+    /// Converts the payload into owned bytes when possible.
+    #[must_use]
+    pub fn into_bytes(self) -> Option<Bytes> {
+        match self {
+            Self::Text(_) => None,
+            Self::Binary(bytes) => Some(bytes),
         }
     }
 }
 
-impl std::error::Error for WebSocketError {}
+impl From<String> for WebSocketMessage {
+    fn from(value: String) -> Self {
+        Self::Text(value.into())
+    }
+}
 
-#[cfg(feature = "json")]
-impl From<serde_json::Error> for WebSocketError {
-    fn from(error: serde_json::Error) -> Self {
-        use alloc::string::ToString;
+impl From<ByteStr> for WebSocketMessage {
+    fn from(value: ByteStr) -> Self {
+        Self::Text(value)
+    }
+}
 
-        Self::Protocol(error.to_string())
+impl From<&str> for WebSocketMessage {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_owned().into())
+    }
+}
+
+impl From<Bytes> for WebSocketMessage {
+    fn from(value: Bytes) -> Self {
+        Self::Binary(value)
+    }
+}
+
+impl From<Vec<u8>> for WebSocketMessage {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Binary(value.into())
+    }
+}
+
+impl From<&[u8]> for WebSocketMessage {
+    fn from(value: &[u8]) -> Self {
+        Self::Binary(value.to_vec().into())
     }
 }
