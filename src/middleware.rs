@@ -217,7 +217,7 @@ impl<N: HttpError, E: HttpError> core::error::Error for MiddlewareError<N, E> {
 }
 
 impl<N: HttpError, E: HttpError> HttpError for MiddlewareError<N, E> {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         match self {
             MiddlewareError::Endpoint(e) => e.status(),
             MiddlewareError::Middleware(e) => e.status(),
@@ -328,7 +328,7 @@ where
     A: HttpError,
     B: HttpError,
 {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         match self {
             MiddlewareTupleError::First(e) => e.status(),
             MiddlewareTupleError::Second(e) => e.status(),

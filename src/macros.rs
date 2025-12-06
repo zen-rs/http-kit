@@ -59,8 +59,8 @@ macro_rules! http_error_fmt {
         impl ::core::error::Error for $name {}
 
         impl $crate::HttpError for $name {
-            fn status(&self) -> ::core::option::Option<$crate::StatusCode> {
-                ::core::option::Option::Some($status)
+            fn status(&self) -> $crate::StatusCode {
+                $status
             }
         }
     };
@@ -81,7 +81,7 @@ macro_rules! http_error_fmt {
 /// );
 ///
 /// let err = NotFoundError::new();
-/// assert_eq!(err.status(), Some(StatusCode::NOT_FOUND));
+/// assert_eq!(err.status(), StatusCode::NOT_FOUND);
 /// assert_eq!(err.to_string(), "resource not found");
 /// ```
 #[macro_export]
@@ -118,11 +118,11 @@ mod tests {
     #[test]
     fn http_error_macros_create_expected_types() {
         let not_found = MacroNotFound::new();
-        assert_eq!(not_found.status(), Some(StatusCode::NOT_FOUND));
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
         assert_eq!(not_found.to_string(), "macro missing");
 
         let display = MacroDisplayError::new();
-        assert_eq!(display.status(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(display.status(), StatusCode::BAD_REQUEST);
         assert_eq!(display.to_string(), "bad request (400)");
     }
 }

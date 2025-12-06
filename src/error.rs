@@ -32,7 +32,7 @@ use http::StatusCode;
 #[derive(Debug)]
 pub struct Error {
     inner: Box<dyn core::error::Error + Send + Sync>,
-    status: Option<StatusCode>,
+    status: StatusCode,
 }
 
 impl Error {
@@ -40,7 +40,7 @@ impl Error {
     pub fn msg(msg: impl Into<String>) -> Self {
         Self {
             inner: msg.into().into(),
-            status: None,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -48,13 +48,13 @@ impl Error {
     pub fn new(e: impl Into<Box<dyn core::error::Error + Send + Sync>>) -> Self {
         Self {
             inner: e.into(),
-            status: None,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
     /// Set the HTTP status code for this error.
     pub fn set_status(mut self, status: StatusCode) -> Self {
-        self.status = Some(status);
+        self.status = status;
         self
     }
 }
@@ -108,16 +108,13 @@ pub trait HttpError: core::error::Error + Send + Sync + 'static {
     /// let err = BadGateway::new();
     /// assert_eq!(err.status(), Some(StatusCode::BAD_GATEWAY));
     /// ```
-    fn status(&self) -> Option<StatusCode>;
-
-    /// If the remote serve responded with an http status code instead of a connection error, it would be true.
-    fn is_remote(&self) -> bool {
-        self.status().is_some()
+    fn status(&self) -> StatusCode {
+        StatusCode::INTERNAL_SERVER_ERROR
     }
 }
 
 impl HttpError for Error {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         self.status
     }
 }
@@ -160,13 +157,13 @@ impl From<serde_json::Error> for Error {
 
 impl core::error::Error for BoxHttpError {}
 impl HttpError for BoxHttpError {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         (**self).status()
     }
 }
 
 impl HttpError for Infallible {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         unreachable!("Infallible can never be instantiated")
     }
 }
