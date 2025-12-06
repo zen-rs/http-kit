@@ -90,9 +90,8 @@ impl WebSocketMessage {
     }
 
     /// Construct a close message.
-    #[must_use]
-    pub fn close(value: impl Into<Bytes>) -> Self {
-        Self::Close(value.into())
+    pub fn close<T: AsRef<[u8]>>(value: T) -> Self {
+        Self::Close(Bytes::from(value.as_ref().to_owned()))
     }
 
     /// Construct a binary message.
