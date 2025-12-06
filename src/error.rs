@@ -89,8 +89,8 @@ pub trait HttpError: core::error::Error + Send + Sync + 'static {
     /// struct MyError;
     ///
     /// impl HttpError for MyError {
-    ///     fn status(&self) -> Option<StatusCode> {
-    ///         Some(StatusCode::INTERNAL_SERVER_ERROR)
+    ///     fn status(&self) -> StatusCode {
+    ///         StatusCode::INTERNAL_SERVER_ERROR
     ///     }
     /// }
     /// let err = MyError;
