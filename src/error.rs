@@ -94,7 +94,7 @@ pub trait HttpError: core::error::Error + Send + Sync + 'static {
     ///     }
     /// }
     /// let err = MyError;
-    /// assert_eq!(err.status(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     /// assert_eq!(err.to_string(), "My error occurred");
     /// ```
     ///
@@ -106,7 +106,7 @@ pub trait HttpError: core::error::Error + Send + Sync + 'static {
     ///
     /// http_error!(pub BadGateway, StatusCode::BAD_GATEWAY, "upstream failed");
     /// let err = BadGateway::new();
-    /// assert_eq!(err.status(), Some(StatusCode::BAD_GATEWAY));
+    /// assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
     /// ```
     fn status(&self) -> StatusCode {
         StatusCode::INTERNAL_SERVER_ERROR
