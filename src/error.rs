@@ -59,6 +59,32 @@ impl Error {
         self.inner
     }
 
+    /// Convert this error into a boxed HTTP error trait object.
+    pub fn into_boxed_http_error(self) -> BoxHttpError {
+        struct Wrapper(Error);
+        impl Debug for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                Debug::fmt(&self.0, f)
+            }
+        }
+        impl Display for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                Display::fmt(&self.0, f)
+            }
+        }
+        impl core::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+                self.0.inner.source()
+            }
+        }
+        impl HttpError for Wrapper {
+            fn status(&self) -> StatusCode {
+                self.0.status
+            }
+        }
+        Box::new(Wrapper(self))
+    }
+
     /// Set the HTTP status code for this error.
     pub fn set_status(mut self, status: StatusCode) -> Self {
         self.status = status;
