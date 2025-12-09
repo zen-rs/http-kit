@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/zen-rs/http-kit/compare/v0.4.0...v0.4.1) - 2025-12-09
+
+### Added
+
+- replace Error with BoxHttpError in Endpoint and Middleware implementations
+- integrate eyre for enhanced error handling in HTTP operations
+- add status handling to Option type in ResultExt
+
 ## [0.4.0](https://github.com/zen-rs/http-kit/compare/v0.3.0...v0.4.0) - 2025-12-08
 
 ### Other
