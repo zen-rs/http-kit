@@ -137,6 +137,12 @@ where
     }
 }
 
+impl<T> ResultExt<T> for core::option::Option<T> {
+    fn status(self, status: StatusCode) -> Result<T, Error> {
+        self.ok_or_else(|| Error::msg("None value").set_status(status))
+    }
+}
+
 /// A boxed HTTP error trait object.
 ///
 /// > Unlike `Box<dyn std::error::Error>`, this type carries HTTP status code information, and implements the `HttpError` trait.
