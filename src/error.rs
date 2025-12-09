@@ -28,6 +28,9 @@ use core::fmt::{self, Debug, Display};
 use http::StatusCode;
 
 /// A concrete error type for HTTP operations.
+///
+/// Note that this type doesn't implement `HttpError` directly, but also provide `status` method
+/// to get the associated status code.
 #[derive(Debug)]
 pub struct Error {
     inner: eyre::Report,
