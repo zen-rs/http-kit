@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/zen-rs/http-kit/compare/v0.4.1...v0.4.2) - 2025-12-09
+
+### Added
+
+- add method to convert Error into a boxed HTTP error trait object
+
 ## [0.4.1](https://github.com/zen-rs/http-kit/compare/v0.4.0...v0.4.1) - 2025-12-09
 
 ### Added
