@@ -132,10 +132,10 @@ use crate::{
 /// }
 ///
 /// impl HttpError for ApiError {
-///     fn status(&self) -> Option<StatusCode> {
+///     fn status(&self) -> StatusCode {
 ///         match self {
-///             Self::Json(_) => Some(StatusCode::BAD_REQUEST),
-///             Self::Body(_) => Some(StatusCode::INTERNAL_SERVER_ERROR),
+///             Self::Json(_) => StatusCode::BAD_REQUEST,
+///             Self::Body(_) => StatusCode::INTERNAL_SERVER_ERROR,
 ///         }
 ///     }
 /// }
