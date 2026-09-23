@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/zen-rs/http-kit/compare/v0.4.2...v0.4.3) - 2026-09-23
+
+### Added
+
+- *(body)* try_clone copies a body whose bytes are in memory ([#11](https://github.com/zen-rs/http-kit/pull/11))
+
+### Fixed
+
+- gate websocket JSON helpers on the json feature and repair stale doc examples
+
+### Other
+
+- publish on push to main; crates.io refuses workflow_run tokens ([#14](https://github.com/zen-rs/http-kit/pull/14))
+- Merge remote-tracking branch 'origin/main' into chore/sync-main-into-dev
+- run tests with cargo nextest ([#10](https://github.com/zen-rs/http-kit/pull/10))
+- publish to crates.io via OIDC trusted publishing ([#8](https://github.com/zen-rs/http-kit/pull/8))
+- gate pull requests into main so only dev may merge ([#9](https://github.com/zen-rs/http-kit/pull/9))
+- use stable toolchain
+- use stable toolchain
+- add rust-cache to dep-check workflow
+- add weekly dependency check workflow
+
 ## [0.4.2](https://github.com/zen-rs/http-kit/compare/v0.4.1...v0.4.2) - 2025-12-09
 
 ### Added
