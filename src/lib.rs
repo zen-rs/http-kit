@@ -23,68 +23,6 @@
 //! - `mime` - MIME type parsing and manipulation
 //! - `http_body` - Implementation of http_body traits
 //! - `std` - Enable standard library support (enabled by default)
-//!
-//! # Examples
-//!
-//! ## Basic Request/Response Handling
-//!
-//! ```rust
-//! use http_kit::{Request, Response, Result, Body};
-//!
-//! async fn echo_handler(mut request: Request) -> Result<Response> {
-//!     let body = std::mem::replace(request.body_mut(), Body::empty());
-//!     Ok(Response::new(body))
-//! }
-//!
-//! # async fn example() -> Result<()> {
-//! let mut request = Request::new(Body::from_bytes("Hello, world!"));
-//! let response = echo_handler(request).await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## JSON Handling
-//!
-//! ```rust
-//! # #[cfg(feature = "json")]
-//! # {
-//! use http_kit::{Request, Response, Result, Body};
-//! use serde::{Deserialize, Serialize};
-//!
-//! #[derive(Serialize, Deserialize)]
-//! struct User {
-//!     name: String,
-//!     email: String,
-//! }
-//!
-//! async fn create_user(mut request: Request) -> Result<Response> {
-//!     let user: User = request.body_mut().into_json().await?;
-//!     // Process user...
-//!     let response_body = Body::from_json(&user)?;
-//!     Ok(Response::new(response_body))
-//! }
-//! # }
-//! ```
-//!
-//! ## Middleware Usage
-//!
-//! ```rust
-//! use http_kit::{Request, Response, Result, Middleware, Endpoint, Body, Error};
-//! use http_kit::middleware::MiddlewareError;
-//!
-//! struct LoggingMiddleware;
-//!
-//! impl Middleware for LoggingMiddleware {
-//!     type Error = Error;
-//!     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
-//!         println!("Request: {} {}", request.method(), request.uri());
-//!         let response = next.respond(request).await.map_err(MiddlewareError::Endpoint)?;
-//!         println!("Response: {}", response.status());
-//!         Ok(response)
-//!     }
-//! }
-//! ```
-//!
 extern crate alloc;
 
 #[macro_use]
@@ -93,7 +31,7 @@ mod macros;
 pub mod sse;
 
 pub mod error;
-pub use error::{Error, HttpError, Result, ResultExt};
+pub use error::{BoxHttpError, Error, HttpError, Result, ResultExt};
 mod body;
 
 pub use body::Body;

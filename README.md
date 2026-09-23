@@ -1,6 +1,9 @@
 # http-kit
 
-[![crates.io](https://img.shields.io/crates/v/http_kit.svg)](https://crates.io/crates/http_kit) [![doc.rs](https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square)](https://docs.rs/http_kit)
+[![crates.io](https://img.shields.io/crates/v/http_kit.svg)](https://crates.io/crates/http_kit) 
+[![doc.rs](https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square)](https://docs.rs/http_kit)
+[![License](https://img.shields.io/crates/l/http_kit.svg)](LICENSE)
+[![Coverage](https://img.shields.io/codecov/c/github/zen-rs/http-kit?logo=codecov)](https://app.codecov.io/gh/zen-rs/http-kit)
 
 A flexible and ergonomic HTTP toolkit for Rust that provides high-level abstractions for HTTP operations while maintaining performance and type safety.
 

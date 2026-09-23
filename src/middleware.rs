@@ -16,13 +16,13 @@
 //! Implement the [`Middleware`] trait to create custom middleware:
 //!
 //! ```rust
-//! use http_kit::{Request, Response, Result, Endpoint, middleware::Middleware, Error};
+//! use http_kit::{Request, Response, Result, Endpoint, middleware::Middleware, BoxHttpError};
 //! use http_kit::middleware::MiddlewareError;
 //!
 //! struct MyMiddleware;
 //!
 //! impl Middleware for MyMiddleware {
-//!     type Error = Error;
+//!     type Error = BoxHttpError;
 //!     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
 //!         // Pre-processing
 //!         let response = next.respond(request).await.map_err(MiddlewareError::Endpoint)?;
@@ -70,13 +70,13 @@ use http::StatusCode;
 /// ## Request Logging Middleware
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body, Error};
+/// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body, BoxHttpError};
 /// use http_kit::middleware::MiddlewareError;
 ///
 /// struct LoggingMiddleware;
 ///
 /// impl Middleware for LoggingMiddleware {
-///     type Error = Error;
+///     type Error = BoxHttpError;
 ///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
 ///         println!("Incoming: {} {}", request.method(), request.uri());
 ///
@@ -91,7 +91,7 @@ use http::StatusCode;
 /// ## Authentication Middleware
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint, StatusCode, Body, Error};
+/// use http_kit::{Request, Response, Result, Middleware, Endpoint, StatusCode, Body, BoxHttpError};
 /// use http_kit::middleware::MiddlewareError;
 ///
 /// struct AuthMiddleware {
@@ -99,7 +99,7 @@ use http::StatusCode;
 /// }
 ///
 /// impl Middleware for AuthMiddleware {
-///     type Error = Error;
+///     type Error = BoxHttpError;
 ///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
 ///         if let Some(auth_header) = request.headers().get(http::header::AUTHORIZATION) {
 ///             if auth_header.as_bytes() == self.required_token.as_bytes() {
@@ -115,13 +115,13 @@ use http::StatusCode;
 /// ## Response Header Middleware
 ///
 /// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body, Error};
+/// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body, BoxHttpError};
 /// use http_kit::middleware::MiddlewareError;
 ///
 /// struct HeaderMiddleware;
 ///
 /// impl Middleware for HeaderMiddleware {
-///     type Error = Error;
+///     type Error = BoxHttpError;
 ///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
 ///         let mut response = next.respond(request).await.map_err(MiddlewareError::Endpoint)?;
 ///
@@ -162,13 +162,13 @@ pub trait Middleware: Send {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body, Error};
+    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, Body, BoxHttpError};
     /// use http_kit::middleware::MiddlewareError;
     ///
     /// struct TimingMiddleware;
     ///
     /// impl Middleware for TimingMiddleware {
-    ///     type Error = Error;
+    ///     type Error = BoxHttpError;
     ///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
     ///         let start = std::time::Instant::now();
     ///
@@ -346,78 +346,6 @@ where
 /// - Plugin systems where middleware is loaded dynamically
 /// - Configuration-driven middleware stacks
 /// - Storing middleware in collections or registries
-///
-/// # Performance Considerations
-///
-/// Using `AnyMiddleware` involves dynamic dispatch and heap allocation, which has
-/// a small performance overhead compared to using concrete types directly. However,
-/// this overhead is typically negligible in HTTP server contexts where network I/O
-/// dominates performance characteristics.
-///
-/// # Examples
-///
-/// ## Storing Mixed Middleware Types
-///
-/// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body, Error};
-/// use http_kit::middleware::MiddlewareError;
-///
-/// struct LoggingMiddleware;
-/// impl Middleware for LoggingMiddleware {
-///     type Error = Error;
-///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
-///         println!("Request: {}", request.uri());
-///         next.respond(request).await.map_err(MiddlewareError::Endpoint)
-///     }
-/// }
-///
-/// struct TimingMiddleware;
-/// impl Middleware for TimingMiddleware {
-///     type Error = Error;
-///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
-///         let start = std::time::Instant::now();
-///         let response = next.respond(request).await.map_err(MiddlewareError::Endpoint);
-///         println!("Duration: {:?}", start.elapsed());
-///         response
-///     }
-/// }
-///
-/// // Store different middleware types in a collection
-/// let middleware_stack: Vec<AnyMiddleware> = vec![
-///     AnyMiddleware::new(LoggingMiddleware),
-///     AnyMiddleware::new(TimingMiddleware),
-/// ];
-/// ```
-///
-/// ## Dynamic Middleware Configuration
-///
-/// ```rust
-/// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body, Error};
-/// use http_kit::middleware::MiddlewareError;
-///
-/// fn create_middleware(name: &str) -> Option<AnyMiddleware> {
-///     match name {
-///         "logging" => Some(AnyMiddleware::new(LoggingMiddleware)),
-///         "timing" => Some(AnyMiddleware::new(TimingMiddleware)),
-///         _ => None,
-///     }
-/// }
-///
-/// # struct LoggingMiddleware;
-/// # impl Middleware for LoggingMiddleware {
-/// #     type Error = Error;
-/// #     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
-/// #         next.respond(request).await.map_err(MiddlewareError::Endpoint)
-/// #     }
-/// # }
-/// # struct TimingMiddleware;
-/// # impl Middleware for TimingMiddleware {
-/// #     type Error = Error;
-/// #     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
-/// #         next.respond(request).await.map_err(MiddlewareError::Endpoint)
-/// #     }
-/// # }
-/// ```
 pub struct AnyMiddleware(Box<dyn MiddlewareImpl>);
 
 impl Debug for AnyMiddleware {
@@ -440,7 +368,7 @@ impl AnyMiddleware {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body, Error};
+    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body, BoxHttpError};
     /// use http_kit::middleware::MiddlewareError;
     ///
     /// struct CustomMiddleware {
@@ -448,7 +376,7 @@ impl AnyMiddleware {
     /// }
     ///
     /// impl Middleware for CustomMiddleware {
-    ///     type Error = Error;
+    ///     type Error = BoxHttpError;
     ///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
     ///         println!("{}: Processing {}", self.prefix, request.uri());
     ///         next.respond(request).await.map_err(MiddlewareError::Endpoint)
@@ -471,12 +399,12 @@ impl AnyMiddleware {
     /// # Examples
     ///
     /// ```rust
-    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body, Error};
+    /// use http_kit::{Request, Response, Result, Middleware, Endpoint, middleware::AnyMiddleware, Body, BoxHttpError};
     /// use http_kit::middleware::MiddlewareError;
     ///
     /// struct MyMiddleware;
     /// impl Middleware for MyMiddleware {
-    ///     type Error = Error;
+    ///     type Error = BoxHttpError;
     ///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
     ///         next.respond(request).await.map_err(MiddlewareError::Endpoint)
     ///     }
