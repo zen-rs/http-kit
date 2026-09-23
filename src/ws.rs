@@ -139,6 +139,7 @@ impl WebSocketMessage {
 
     /// Converts the payload into a JSON value when possible.
     #[cfg(feature = "json")]
+    #[must_use]
     pub fn into_json<T>(self) -> Option<Result<T, serde_json::Error>>
     where
         T: serde::de::DeserializeOwned,
