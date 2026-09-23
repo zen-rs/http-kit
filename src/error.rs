@@ -23,33 +23,66 @@
 //! ```
 //!
 use alloc::boxed::Box;
-use alloc::string::String;
 use core::convert::Infallible;
-use core::fmt;
+use core::fmt::{self, Debug, Display};
 use http::StatusCode;
 
 /// A concrete error type for HTTP operations.
+///
+/// Note that this type doesn't implement `HttpError` directly, but also provide `status` method
+/// to get the associated status code.
 #[derive(Debug)]
 pub struct Error {
-    inner: Box<dyn core::error::Error + Send + Sync>,
+    inner: eyre::Report,
     status: StatusCode,
 }
 
 impl Error {
-    /// Create a new error from a message.
-    pub fn msg(msg: impl Into<String>) -> Self {
+    /// Create a new error with a custom message.
+    pub fn msg(msg: impl Display + Send + Sync + Debug + 'static) -> Self {
         Self {
-            inner: msg.into().into(),
+            inner: eyre::Report::msg(msg),
             status: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
     /// Create a new error from any standard error type.
-    pub fn new(e: impl Into<Box<dyn core::error::Error + Send + Sync>>) -> Self {
+    pub fn new(e: impl Into<eyre::Report>) -> Self {
         Self {
             inner: e.into(),
             status: StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+
+    /// Consume the error and return the inner `eyre::Report`.
+    pub fn into_inner(self) -> eyre::Report {
+        self.inner
+    }
+
+    /// Convert this error into a boxed HTTP error trait object.
+    pub fn into_boxed_http_error(self) -> BoxHttpError {
+        struct Wrapper(Error);
+        impl Debug for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                Debug::fmt(&self.0, f)
+            }
+        }
+        impl Display for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                Display::fmt(&self.0, f)
+            }
+        }
+        impl core::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+                self.0.inner.source()
+            }
+        }
+        impl HttpError for Wrapper {
+            fn status(&self) -> StatusCode {
+                self.0.status
+            }
+        }
+        Box::new(Wrapper(self))
     }
 
     /// Set the HTTP status code for this error.
@@ -62,12 +95,6 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.inner)
-    }
-}
-
-impl core::error::Error for Error {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        Some(self.inner.as_ref())
     }
 }
 
@@ -113,12 +140,6 @@ pub trait HttpError: core::error::Error + Send + Sync + 'static {
     }
 }
 
-impl HttpError for Error {
-    fn status(&self) -> StatusCode {
-        self.status
-    }
-}
-
 /// A specialized Result type for HTTP operations.
 pub type Result<T, E = Error> = core::result::Result<T, E>;
 
@@ -130,10 +151,16 @@ pub trait ResultExt<T> {
 
 impl<T, E> ResultExt<T> for core::result::Result<T, E>
 where
-    E: Into<Box<dyn core::error::Error + Send + Sync>>,
+    E: Into<eyre::Report>,
 {
     fn status(self, status: StatusCode) -> Result<T, Error> {
         self.map_err(|e| Error::new(e).set_status(status))
+    }
+}
+
+impl<T> ResultExt<T> for core::option::Option<T> {
+    fn status(self, status: StatusCode) -> Result<T, Error> {
+        self.ok_or_else(|| Error::msg("None value").set_status(status))
     }
 }
 
@@ -142,15 +169,11 @@ where
 /// > Unlike `Box<dyn std::error::Error>`, this type carries HTTP status code information, and implements the `HttpError` trait.
 pub type BoxHttpError = Box<dyn HttpError>;
 
-impl From<crate::BodyError> for Error {
-    fn from(e: crate::BodyError) -> Self {
-        Error::new(e)
-    }
-}
-
-#[cfg(feature = "json")]
-impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self {
+impl<E> From<E> for Error
+where
+    E: Into<eyre::Report>,
+{
+    fn from(e: E) -> Self {
         Error::new(e)
     }
 }
