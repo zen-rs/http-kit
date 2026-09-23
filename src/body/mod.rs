@@ -1075,6 +1075,35 @@ impl Body {
     pub fn freeze(&mut self) {
         self.replace(Self::frozen());
     }
+
+    /// Returns a copy of the body when its bytes are held in memory.
+    ///
+    /// A body built from bytes or text can be sent any number of times, so
+    /// it is cloned (sharing the underlying `Bytes`). A reader, stream or
+    /// frozen body can be read only once and returns `None`: a middleware that
+    /// replays a request, such as a retry, must not send it a second time.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use http_kit::Body;
+    ///
+    /// let body = Body::from_bytes("payload");
+    /// assert_eq!(body.try_clone().and_then(|copy| copy.len()), Some(7));
+    ///
+    /// let frozen = Body::frozen();
+    /// assert!(frozen.try_clone().is_none());
+    /// ```
+    #[must_use]
+    pub fn try_clone(&self) -> Option<Self> {
+        match &self.inner {
+            BodyInner::Once(bytes) => Some(Self {
+                mime: self.mime.clone(),
+                inner: BodyInner::Once(bytes.clone()),
+            }),
+            BodyInner::Reader { .. } | BodyInner::HttpBody(_) | BodyInner::Freeze => None,
+        }
+    }
 }
 
 impl Default for Body {
@@ -1163,6 +1192,25 @@ mod tests {
 
         let result = text_body.into_bytes().await.unwrap();
         assert_eq!(result.as_ref(), b"Hello, World!");
+    }
+
+    #[tokio::test]
+    async fn try_clone_copies_only_in_memory_bodies() {
+        let body = Body::from_bytes("replayable").with_mime(mime::TEXT_PLAIN);
+        let copy = body.try_clone().expect("an in-memory body clones");
+        assert_eq!(copy.mime(), Some(&mime::TEXT_PLAIN));
+        assert_eq!(copy.into_bytes().await.unwrap().as_ref(), b"replayable");
+        assert_eq!(body.into_bytes().await.unwrap().as_ref(), b"replayable");
+
+        let reader = Body::from_reader(futures_lite::io::Cursor::new(b"once".to_vec()), 4);
+        assert!(reader.try_clone().is_none());
+
+        let stream = Body::from_stream(stream::iter(vec![Ok::<_, std::io::Error>(
+            Bytes::from_static(b"once"),
+        )]));
+        assert!(stream.try_clone().is_none());
+
+        assert!(Body::frozen().try_clone().is_none());
     }
 
     #[tokio::test]
