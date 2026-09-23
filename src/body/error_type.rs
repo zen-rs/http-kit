@@ -3,7 +3,6 @@ extern crate std;
 
 use super::BodyFrozen;
 use alloc::boxed::Box;
-use core::error::Error as coreError;
 use core::fmt::Display;
 use core::str::Utf8Error;
 
@@ -94,8 +93,8 @@ macro_rules! impl_body_error {
             }
         }
 
-        impl coreError for Error {
-            fn source(&self) -> Option<&(dyn coreError + 'static)> {
+        impl core::error::Error for Error {
+            fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
                 match self {
                     $(
                         $(#[cfg(feature = $feature)])*
