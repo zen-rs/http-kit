@@ -59,9 +59,9 @@ fn poll_data(
         .transpose()
         .map_err(io::Error::other)?
     {
-        let data = match frame.into_data() {
-            Ok(data) => data,
-            Err(_) => return Poll::Ready(Ok(())),
+        // Trailers carry no bytes to read; skip them like an empty chunk.
+        let Ok(data) = frame.into_data() else {
+            return poll_data(optional_stream, buf, cx);
         };
         if data.is_empty() {
             return poll_data(optional_stream, buf, cx);
