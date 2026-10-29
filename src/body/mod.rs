@@ -76,6 +76,7 @@
 // ```
 mod convert;
 mod error_type;
+mod into_bytes;
 #[cfg(feature = "std")]
 mod utils;
 use crate::sse::{Event, SseStream};
@@ -217,10 +218,7 @@ impl Body {
     {
         Self {
             mime: None,
-            inner: BodyInner::HttpBody(Box::pin(
-                body.map_frame(|result| result.map_data(|data| data.into()))
-                    .map_err(|e| e.into()),
-            )),
+            inner: BodyInner::HttpBody(Box::pin(into_bytes::IntoBytes::new(body))),
         }
     }
 
@@ -1170,6 +1168,30 @@ impl http_body::Body for Body {
             .map(|opt| opt.map(|result| result.map(http_body::Frame::data)))
             .map_err(Error::from)
     }
+
+    fn is_end_stream(&self) -> bool {
+        match &self.inner {
+            BodyInner::Once(bytes) => bytes.is_empty(),
+            BodyInner::Reader { length, .. } => *length == Some(0),
+            BodyInner::HttpBody(body) => body.is_end_stream(),
+            // Polling a frozen body yields `BodyFrozen`; it must not look finished.
+            BodyInner::Freeze => false,
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match &self.inner {
+            BodyInner::Once(bytes) => http_body::SizeHint::with_exact(bytes.len() as u64),
+            BodyInner::Reader {
+                length: Some(length),
+                ..
+            } => http_body::SizeHint::with_exact(*length as u64),
+            BodyInner::Reader { length: None, .. } | BodyInner::Freeze => {
+                http_body::SizeHint::default()
+            }
+            BodyInner::HttpBody(body) => body.size_hint(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1192,6 +1214,44 @@ mod tests {
 
         let result = text_body.into_bytes().await.unwrap();
         assert_eq!(result.as_ref(), b"Hello, World!");
+    }
+
+    #[tokio::test]
+    async fn http_body_reports_end_and_exact_size() {
+        use http_body::Body as _;
+
+        let empty = Body::empty();
+        assert!(empty.is_end_stream());
+        assert_eq!(http_body::Body::size_hint(&empty).exact(), Some(0));
+
+        let mut bytes = Body::from_bytes("Hello");
+        assert!(!bytes.is_end_stream());
+        assert_eq!(http_body::Body::size_hint(&bytes).exact(), Some(5));
+        bytes.frame().await.unwrap().unwrap();
+        assert!(bytes.is_end_stream());
+        assert_eq!(http_body::Body::size_hint(&bytes).exact(), Some(0));
+
+        let mut sized = Body::from_reader(futures_lite::io::Cursor::new(b"abc".to_vec()), 3);
+        assert!(!sized.is_end_stream());
+        assert_eq!(http_body::Body::size_hint(&sized).exact(), Some(3));
+        while sized.frame().await.transpose().unwrap().is_some() {}
+        assert!(sized.is_end_stream());
+
+        let unsized_reader =
+            Body::from_reader(futures_lite::io::Cursor::new(b"abc".to_vec()), None);
+        assert!(!unsized_reader.is_end_stream());
+        assert_eq!(http_body::Body::size_hint(&unsized_reader).exact(), None);
+
+        let wrapped = Body::new(http_body_util::Full::new(Bytes::from_static(b"wrapped")));
+        assert!(!wrapped.is_end_stream());
+        assert_eq!(http_body::Body::size_hint(&wrapped).exact(), Some(7));
+        let wrapped_empty = Body::new(http_body_util::Empty::<Bytes>::new());
+        assert!(wrapped_empty.is_end_stream());
+
+        let mut frozen = Body::from_bytes("gone");
+        frozen.freeze();
+        assert!(!frozen.is_end_stream());
+        assert_eq!(http_body::Body::size_hint(&frozen).exact(), None);
     }
 
     #[tokio::test]
