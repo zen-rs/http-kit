@@ -1265,8 +1265,6 @@ mod tests {
 
     #[tokio::test]
     async fn wrapped_body_keeps_trailers_as_frames_only() {
-        use http_body::Body as _;
-
         fn with_trailers() -> Body {
             let mut trailers = http::HeaderMap::new();
             trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
