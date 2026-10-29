@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/zen-rs/http-kit/compare/v0.4.3...v0.4.4) - 2026-10-29
+
+### Fixed
+
+- *(body)* pass trailers through poll_frame
+- *(body)* report end of stream and exact size hint
+
+### Other
+
+- *(body)* drop an unused import
+
 ## [0.4.3](https://github.com/zen-rs/http-kit/compare/v0.4.2...v0.4.3) - 2026-09-23
 
 ### Added
