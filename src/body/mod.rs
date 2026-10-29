@@ -1134,10 +1134,15 @@ impl Stream for Body {
                 }
                 Poll::Ready(Some(Ok(data)))
             }
-            BodyInner::HttpBody(stream) => stream
-                .as_mut()
-                .poll_frame(cx)
-                .map_ok(|frame| frame.into_data().unwrap_or_default()),
+            // A stream of data chunks has no place for trailers; skip them.
+            BodyInner::HttpBody(stream) => loop {
+                let Some(frame) = ready!(stream.as_mut().poll_frame(cx)) else {
+                    return Poll::Ready(None);
+                };
+                if let Ok(data) = frame?.into_data() {
+                    return Poll::Ready(Some(Ok(data)));
+                }
+            },
             BodyInner::Freeze => Poll::Ready(Some(Err(Error::BodyFrozen))),
         }
     }
@@ -1161,9 +1166,13 @@ impl http_body::Body for Body {
     type Error = Error;
 
     fn poll_frame(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        // A wrapped body's frames pass through unchanged, trailers included.
+        if let BodyInner::HttpBody(body) = &mut self.inner {
+            return body.as_mut().poll_frame(cx);
+        }
         self.poll_next(cx)
             .map(|opt| opt.map(|result| result.map(http_body::Frame::data)))
             .map_err(Error::from)
@@ -1252,6 +1261,48 @@ mod tests {
         frozen.freeze();
         assert!(!frozen.is_end_stream());
         assert_eq!(http_body::Body::size_hint(&frozen).exact(), None);
+    }
+
+    #[tokio::test]
+    async fn wrapped_body_keeps_trailers_as_frames_only() {
+        use http_body::Body as _;
+
+        fn with_trailers() -> Body {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+            Body::new(StreamBody::new(stream::iter([
+                Ok::<_, core::convert::Infallible>(Frame::data(Bytes::from_static(b"data"))),
+                Ok(Frame::trailers(trailers)),
+            ])))
+        }
+
+        let mut body = with_trailers();
+        let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(data.as_ref(), b"data");
+        let trailers = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(trailers["grpc-status"], "0");
+        assert!(body.frame().await.is_none());
+
+        let chunks: Vec<Bytes> = with_trailers().try_collect().await.unwrap();
+        assert_eq!(chunks, [Bytes::from_static(b"data")]);
+
+        #[cfg(feature = "std")]
+        {
+            use futures_lite::AsyncReadExt;
+            let mut read = Vec::new();
+            with_trailers()
+                .into_reader()
+                .read_to_end(&mut read)
+                .await
+                .unwrap();
+            assert_eq!(read, b"data");
+        }
     }
 
     #[tokio::test]
