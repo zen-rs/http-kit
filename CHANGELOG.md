@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/zen-rs/http-kit/compare/v0.4.4...v0.4.5) - 2026-11-04
+
+### Other
+
+- drop the typos check
+- run on pull requests only, tiered by target branch
+
 ## [0.4.4](https://github.com/zen-rs/http-kit/compare/v0.4.3...v0.4.4) - 2026-10-29
 
 ### Fixed
