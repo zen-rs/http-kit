@@ -1,15 +1,15 @@
 //! Endpoints, bodies and middleware need `Send` only where their parts are.
 
-use std::{cell::Cell, convert::Infallible, future::Future, rc::Rc};
+use std::{cell::Cell, convert::Infallible, rc::Rc};
 
 use bytes::Bytes;
 use futures_lite::{stream, StreamExt};
 use http_kit::{
-    endpoint::{AnyEndpoint, AnySendEndpoint, SendNext, WithMiddleware},
+    endpoint::{AnyEndpoint, AnySendEndpoint, WithMiddleware},
     flavor::{Flavor, Local},
     middleware::{AnySendMiddleware, MiddlewareError},
     Body, Endpoint, GenericBody, LocalBody, LocalRequest, LocalResponse, Middleware, Request,
-    Response, SendEndpoint, SendMiddleware,
+    Response, SendEndpoint,
 };
 
 /// Counts requests in per-thread state and echoes the request body.
@@ -47,15 +47,7 @@ impl<F: Flavor> Middleware<F> for Tag {
     }
 }
 
-impl SendMiddleware for Tag {
-    fn handle_send<E: SendEndpoint>(
-        &mut self,
-        request: &mut Request,
-        next: E,
-    ) -> impl Future<Output = Result<Response, MiddlewareError<E::Error, Infallible>>> + Send {
-        self.handle(request, SendNext::new(next))
-    }
-}
+http_kit::impl_send_middleware!(Tag);
 
 /// A body whose stream holds an `Rc`, so it can only be a `LocalBody`.
 fn local_body(owner: Rc<str>) -> LocalBody {
@@ -107,14 +99,7 @@ impl Endpoint for Echo {
     }
 }
 
-impl SendEndpoint for Echo {
-    fn respond_send(
-        &mut self,
-        request: &mut Request,
-    ) -> impl Future<Output = Result<Response, Infallible>> + Send {
-        self.respond(request)
-    }
-}
+http_kit::impl_send_endpoint!(Echo);
 
 fn send_body() -> Body {
     Body::from_stream(

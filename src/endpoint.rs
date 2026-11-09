@@ -249,7 +249,8 @@ pub trait Endpoint<F: Flavor = Shared> {
 /// code that knows the type sees that without this trait. Code generic over
 /// the endpoint cannot, so it bounds on `SendEndpoint` and calls
 /// [`respond_send`](Self::respond_send). For a concrete type the
-/// implementation forwards to [`Endpoint::respond`]:
+/// implementation forwards to [`Endpoint::respond`], which
+/// [`impl_send_endpoint!`](crate::impl_send_endpoint) writes for you:
 ///
 /// ```rust
 /// use core::future::Future;

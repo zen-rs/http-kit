@@ -208,7 +208,8 @@ pub trait Middleware<F: Flavor = Shared> {
 ///
 /// A concrete middleware implements it by handing `next` to its own
 /// [`Middleware::handle`] through [`SendNext`](crate::endpoint::SendNext),
-/// which makes `next`'s future the `Send` one:
+/// which makes `next`'s future the `Send` one;
+/// [`impl_send_middleware!`](crate::impl_send_middleware) writes this impl:
 ///
 /// ```rust
 /// use core::future::Future;
