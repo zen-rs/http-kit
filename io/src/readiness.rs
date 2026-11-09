@@ -353,7 +353,6 @@ impl<T: Ready> DatagramSocket for Datagram<T> {
                         .with_control(control.as_uninit());
                     let n = sock.recvmsg(&mut msg, 0)?;
                     let (truncated, control_len) = (msg.flags().is_truncated(), msg.control_len());
-                    drop(msg);
                     if truncated {
                         return Err(crate::datagram::truncated_coalesced());
                     }
