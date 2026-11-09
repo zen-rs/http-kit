@@ -2,6 +2,7 @@
 name = "http-kit-io"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT"
 description = "Runtime-neutral owned-buffer I/O for completion-based and readiness-based drivers"
