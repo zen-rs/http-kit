@@ -1,3 +1,6 @@
+[workspace]
+members = ["io"]
+
 [package]
 name = "http-kit"
 version = "0.4.4"
