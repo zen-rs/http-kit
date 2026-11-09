@@ -40,8 +40,9 @@ optional = true
 version = "1.0"
 
 
-[dependencies.async-fs]
-version = "2.1"
+[dependencies.blocking]
+version = "1.7"
+default-features = false
 optional = true
 
 [dependencies.cookie]
@@ -54,7 +55,7 @@ std = []
 full = ["json", "form", "std", "cookie", "fs"]
 json = ["dep:serde", "dep:serde_json"]
 form = ["dep:serde", "dep:serde_urlencoded"]
-fs = ["dep:async-fs", "dep:mime_guess"]
+fs = ["std", "dep:blocking", "dep:mime_guess"]
 ws = []
 cookie = ["dep:cookie"]
 
