@@ -42,7 +42,9 @@ pub struct ServerConfig {
     /// request). `None` waits without bound.
     pub header_read_timeout: Option<Duration>,
     /// How long a keep-alive connection may sit idle, with no byte of the
-    /// next request received. `None` waits without bound.
+    /// next request received. At the deadline the connection closes
+    /// normally ([`ServerOutcome::Closed`](crate::ServerOutcome::Closed)).
+    /// `None` waits without bound.
     pub keep_alive_timeout: Option<Duration>,
     /// How long a single read of a request body may take to deliver bytes.
     /// It bounds the socket, not the consumer: time spent waiting for the

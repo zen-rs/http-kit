@@ -189,13 +189,12 @@ where
         served: bool,
     ) -> Result<Option<RequestHead>, Error> {
         let header_timeout = self.config.header_read_timeout;
-        let (mut deadline, mut expiry) = if self.recv.buf.is_empty() && served {
-            (
-                deadline_after(self.config.keep_alive_timeout),
-                Timeout::KeepAliveIdle,
-            )
+        // Waiting idle between keep-alive requests ends the connection
+        // normally at its deadline; any other wait is for a head.
+        let (mut deadline, mut idle_wait) = if self.recv.buf.is_empty() && served {
+            (deadline_after(self.config.keep_alive_timeout), true)
         } else {
-            (deadline_after(header_timeout), Timeout::HeadRead)
+            (deadline_after(header_timeout), false)
         };
         loop {
             if let Some(head) = parse_request_head(&mut self.recv.buf, &self.config.limits)? {
@@ -221,17 +220,21 @@ where
                 fill.await
             };
             let Some(read) = read else {
-                tracing::debug!(%expiry, "closing the connection");
+                if idle_wait {
+                    tracing::debug!("keep-alive connection idle; closing");
+                    return Ok(None);
+                }
+                tracing::debug!("request head not received in time; closing");
                 if !idle {
                     self.send_status(StatusCode::REQUEST_TIMEOUT).await;
                 }
-                return Err(Error::Timeout(expiry));
+                return Err(Error::Timeout(Timeout::HeadRead));
             };
             let read = read?;
             if idle && read > 0 {
                 // The head's own clock starts at its first byte.
                 deadline = deadline_after(header_timeout);
-                expiry = Timeout::HeadRead;
+                idle_wait = false;
             }
             if read == 0 {
                 return if self.recv.buf.is_empty() {

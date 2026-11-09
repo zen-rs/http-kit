@@ -9,7 +9,8 @@ use futures_lite::future::zip;
 use http::{HeaderValue, Method, StatusCode, header};
 use http_kit::{Body, Request, Response};
 use http_kit_h1::{
-    ClientConfig, ClientOutcome, Error, ServerConfig, ServerConnection, Timeout, handshake,
+    ClientConfig, ClientOutcome, Error, ServerConfig, ServerConnection, ServerOutcome, Timeout,
+    handshake,
 };
 use http_kit_io::Timer;
 use support::{CJK, connection};
@@ -115,10 +116,7 @@ async fn idle_keep_alive<T: Timer>(timer: T) {
         client_in.read_to_end(),
     )
     .await;
-    assert!(matches!(
-        outcome.unwrap_err(),
-        Error::Timeout(Timeout::KeepAliveIdle)
-    ));
+    assert!(matches!(outcome.unwrap(), ServerOutcome::Closed));
     assert_at_deadline(started);
     let wire = String::from_utf8(wire).unwrap();
     assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");

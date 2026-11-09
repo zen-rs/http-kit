@@ -188,11 +188,6 @@ pub enum Timeout {
     /// Timeout` before closing (RFC 9110 §15.5.9).
     #[error("request head not received in time")]
     HeadRead,
-    /// A keep-alive connection sat idle for
-    /// [`keep_alive_timeout`](crate::ServerConfig::keep_alive_timeout). This
-    /// is how an idle connection normally ends; callers usually just log it.
-    #[error("keep-alive connection idle for too long")]
-    KeepAliveIdle,
     /// A read of the request body delivered nothing within
     /// [`body_read_timeout`](crate::ServerConfig::body_read_timeout).
     #[error("request body stalled")]
