@@ -2,19 +2,23 @@
 //! pumping a received body to its consumer.
 
 use std::{
-    future::{Future, poll_fn},
+    future::{Future, pending, poll_fn},
     io, mem,
     pin::pin,
     task::Poll,
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
-use futures_lite::{StreamExt as _, future::poll_once};
+use futures_lite::{
+    StreamExt as _,
+    future::{or, poll_once},
+};
 use http_kit::{Body, BodyFrame};
-use http_kit_io::{BufResult, IntoInner as _, IoBuf as _, Read, SendFile, Write};
+use http_kit_io::{BufResult, IntoInner as _, IoBuf as _, Read, SendFile, Timer, Write};
 
 use crate::{
-    Error, Limits,
+    Error, Limits, Timeout,
     body::{BodySender, Message},
     proto::{BodyDecoder, BodyEncoder, Decoded},
 };
@@ -68,6 +72,30 @@ impl<R: Read> Recv<R> {
             }
         }
     }
+}
+
+/// The instant `timeout` from now, or `None` when there is no timeout or it
+/// is too long to represent (which is no deadline at all).
+pub(crate) fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
+    Instant::now().checked_add(timeout?)
+}
+
+/// Runs `future` until `deadline`; `None` if the deadline came first. A
+/// future that is ready at the same time as its deadline wins.
+pub(crate) async fn until<T: Timer, F: Future>(
+    timer: &T,
+    deadline: Option<Instant>,
+    future: F,
+) -> Option<F::Output> {
+    let done = async { Some(future.await) };
+    let expired = async {
+        match deadline {
+            Some(deadline) => timer.sleep_until(deadline).await,
+            None => pending().await,
+        }
+        None
+    };
+    or(done, expired).await
 }
 
 /// Buffers queued for one vectored write.
@@ -230,12 +258,15 @@ pub(crate) enum Pumped {
 /// Reads a received body and hands it to its consumer one frame per demand.
 ///
 /// `before_first_read` runs once, when the consumer first asks for data and
-/// before anything is read (a server sends `100 Continue` there).
-pub(crate) async fn pump_body<R: Read, F: Future<Output = ()>>(
+/// before anything is read (a server sends `100 Continue` there). Each read
+/// of the socket is bounded by `read_timeout`, if any.
+pub(crate) async fn pump_body<R: Read, T: Timer, F: Future<Output = ()>>(
     recv: &mut Recv<R>,
     mut decoder: BodyDecoder,
     limits: &Limits,
     sender: BodySender,
+    timer: &T,
+    read_timeout: Option<Duration>,
     before_first_read: F,
 ) -> Result<Pumped, Error> {
     let mut before_first_read = Some(before_first_read);
@@ -246,7 +277,7 @@ pub(crate) async fn pump_body<R: Read, F: Future<Output = ()>>(
         if let Some(first) = before_first_read.take() {
             first.await;
         }
-        let decoded = match next_decoded(recv, &mut decoder, limits).await {
+        let decoded = match next_decoded(recv, &mut decoder, limits, timer, read_timeout).await {
             Ok(decoded) => decoded,
             Err(error) => {
                 sender.send(Message::Error(error.clone())).await;
@@ -275,16 +306,21 @@ pub(crate) async fn pump_body<R: Read, F: Future<Output = ()>>(
     }
 }
 
-async fn next_decoded<R: Read>(
+async fn next_decoded<R: Read, T: Timer>(
     recv: &mut Recv<R>,
     decoder: &mut BodyDecoder,
     limits: &Limits,
+    timer: &T,
+    read_timeout: Option<Duration>,
 ) -> Result<Decoded, Error> {
     loop {
         if let Some(decoded) = decoder.decode(&mut recv.buf, limits)? {
             return Ok(decoded);
         }
-        if recv.fill().await? == 0 {
+        let read = until(timer, deadline_after(read_timeout), recv.fill())
+            .await
+            .ok_or(Error::Timeout(Timeout::BodyRead))??;
+        if read == 0 {
             return Ok(decoder.decode_eof(&mut recv.buf, limits)?);
         }
     }

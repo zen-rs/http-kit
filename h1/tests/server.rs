@@ -10,7 +10,7 @@ use http::{HeaderMap, HeaderValue, StatusCode, header};
 use http_kit::{Body, BodyFrame, Request, Response};
 use http_kit_h1::{Error, ParseError, ServerConfig, ServerConnection, ServerOutcome};
 use http_kit_io::{BufResult, Read as _, Write as _};
-use support::{CJK, PipeReader, PipeWriter, connection, within_reads};
+use support::{CJK, NeverTimer, PipeReader, PipeWriter, connection, within_reads};
 
 fn config() -> ServerConfig {
     ServerConfig {
@@ -23,8 +23,11 @@ fn text(response: &[u8]) -> String {
     String::from_utf8(response.to_vec()).expect("responses here are UTF-8")
 }
 
-fn server(reader: PipeReader, writer: PipeWriter) -> ServerConnection<PipeReader, PipeWriter> {
-    ServerConnection::new(reader, writer, config())
+fn server(
+    reader: PipeReader,
+    writer: PipeWriter,
+) -> ServerConnection<PipeReader, PipeWriter, NeverTimer> {
+    ServerConnection::new(reader, writer, NeverTimer, config())
 }
 
 /// The body's data and trailers.
@@ -315,7 +318,7 @@ fn received_bodies_are_not_copied() {
             client_out.send(piece);
         }
         client_out.close();
-        let connection = ServerConnection::new(reader, writer, config);
+        let connection = ServerConnection::new(reader, writer, NeverTimer, config);
         let (outcome, wire) = zip(connection.serve(&service), client_in.read_to_end()).await;
         assert!(matches!(outcome.unwrap(), ServerOutcome::Closed));
         let total = body.len().to_string();
@@ -461,7 +464,7 @@ fn date_is_added_when_absent() {
         let service = |_: Request| async { Response::new(Body::empty()) };
         client_out.send(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
         client_out.close();
-        let connection = ServerConnection::new(reader, writer, ServerConfig::default());
+        let connection = ServerConnection::new(reader, writer, NeverTimer, ServerConfig::default());
         let (_, wire) = zip(connection.serve(&service), client_in.read_to_end()).await;
         let wire = text(&wire);
         let date = wire

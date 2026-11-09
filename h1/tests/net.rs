@@ -122,13 +122,13 @@ where
             inner: writer,
             sent: sent.clone(),
         };
-        ServerConnection::new(reader, writer, ServerConfig::default())
+        ServerConnection::new(reader, writer, io.clone(), ServerConfig::default())
             .serve(&service)
             .await
     };
     let client = async {
         let stream = io.connect(addr).await.expect("connect");
-        let (send, conn) = handshake_stream(stream, ClientConfig::default());
+        let (send, conn) = handshake_stream(stream, io.clone(), ClientConfig::default());
         let (ran, output) = zip(conn.run(), client(send)).await;
         assert!(matches!(
             ran.expect("client connection"),
