@@ -19,6 +19,13 @@
 //! `http_body::Body` implementation reads them out too, since that trait has
 //! no frame for a file.
 //!
+//! # Flavours
+//!
+//! A body erases its source, so whether it may cross threads is fixed by its
+//! [flavour](crate::flavor): [`Body`] is [`GenericBody<Shared>`], whose
+//! sources are `Send + Sync`, and [`LocalBody`] is [`GenericBody<Local>`],
+//! whose sources need not be. A `Body` converts into a `LocalBody` for free.
+//!
 //! # Format Support
 //!
 //! The body type provides convenient methods for working with common formats:
@@ -72,7 +79,8 @@
 mod convert;
 mod error_type;
 mod frame;
-mod into_bytes;
+pub(crate) mod into_bytes;
+use crate::flavor::{Flavor, Holds, Local, Shared};
 use crate::sse::{Event, SseStream};
 pub use error_type::Error;
 pub use frame::BodyFrame;
@@ -82,7 +90,6 @@ pub use frame::{FileRegion, FileRegionStream};
 extern crate std;
 use futures_lite::{ready, Stream, StreamExt};
 use http_body::Frame;
-use http_body_util::BodyExt;
 use mime::Mime;
 
 use bytestr::ByteStr;
@@ -95,16 +102,19 @@ use core::mem::{replace, swap, take};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-type BoxHttpBody =
-    Pin<Box<dyn http_body::Body<Data = Bytes, Error = Error> + Send + Sync + 'static>>;
-
-type BoxFrameStream = Pin<Box<dyn Stream<Item = Result<BodyFrame, Error>> + Send + Sync + 'static>>;
-
 pub use http_body::Body as HttpBody;
+
+/// A body whose sources are `Send + Sync`, so it may cross threads.
+pub type Body = GenericBody<Shared>;
+
+/// A body whose sources may be bound to one thread, such as an `Rc` or a
+/// socket that a thread-per-core runtime owns.
+pub type LocalBody = GenericBody<Local>;
 
 /// Flexible HTTP body that can represent data in various forms.
 ///
-/// `Body` is the core type for representing HTTP request and response bodies.
+/// `GenericBody` is the core type for representing HTTP request and response
+/// bodies, written through its two flavours: [`Body`] and [`LocalBody`].
 /// It can efficiently handle different data sources:
 ///
 /// - **In-memory data**: Bytes, strings, vectors
@@ -135,12 +145,12 @@ pub use http_body::Body as HttpBody;
 ///     println!("Body is empty");
 /// }
 /// ```
-pub struct Body {
+pub struct GenericBody<F: Flavor> {
     mime: Option<Mime>,
-    inner: BodyInner,
+    inner: BodyInner<F>,
 }
 
-impl Debug for Body {
+impl<F: Flavor> Debug for GenericBody<F> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Body")
     }
@@ -151,7 +161,7 @@ impl_error!(
     "Body was frozen,it may have been consumed by `take()`"
 );
 
-enum BodyInner {
+enum BodyInner<F: Flavor> {
     Once(Bytes),
     /// A body that is one file region.
     #[cfg(feature = "fs")]
@@ -159,15 +169,15 @@ enum BodyInner {
     /// A one-region body being read out at the `http_body::Body` boundary.
     #[cfg(feature = "fs")]
     Reading(FileRegionStream),
-    Frames(Frames),
-    HttpBody(BoxHttpBody),
+    Frames(Frames<F>),
+    HttpBody(Pin<Box<F::HttpBody>>),
     Freeze,
 }
 
 /// A frame stream, with the region it yielded last when that region is being
 /// read out at the `http_body::Body` boundary.
-struct Frames {
-    stream: BoxFrameStream,
+struct Frames<F: Flavor> {
+    stream: Pin<Box<F::Frames>>,
     // Boxed so a frame-stream body is no larger than an in-memory one: every
     // request and response carries a `Body`, and only a read-out region uses it.
     #[cfg(feature = "fs")]
@@ -185,13 +195,13 @@ fn from_http_frame(frame: Frame<Bytes>) -> BodyFrame {
     }
 }
 
-impl Default for BodyInner {
+impl<F: Flavor> Default for BodyInner<F> {
     fn default() -> Self {
         Self::Once(Bytes::new())
     }
 }
 
-impl Body {
+impl<F: Flavor> GenericBody<F> {
     /// Creates a new empty body.
     ///
     /// This creates a body with zero bytes that can be used as a placeholder
@@ -234,13 +244,14 @@ impl Body {
     /// ```
     pub fn new<B>(body: B) -> Self
     where
-        B: Send + Sync + http_body::Body + 'static,
+        B: http_body::Body + 'static,
         B::Data: Into<Bytes>,
         B::Error: Into<Error>,
+        F: Holds<B>,
     {
         Self {
             mime: None,
-            inner: BodyInner::HttpBody(Box::pin(into_bytes::IntoBytes::new(body))),
+            inner: BodyInner::HttpBody(F::http_body(body)),
         }
     }
 
@@ -292,13 +303,25 @@ impl Body {
     /// ```
     pub fn from_frames<E, S>(stream: S) -> Self
     where
-        E: Into<Error>,
-        S: Stream<Item = Result<BodyFrame, E>> + Send + Sync + 'static,
+        E: Into<Error> + 'static,
+        S: Stream<Item = Result<BodyFrame, E>> + 'static,
+        F: Holds<S>,
+    {
+        Self::from_mapped_frames(stream, |result| result)
+    }
+
+    fn from_mapped_frames<I: 'static, E: Into<Error> + 'static, S>(
+        stream: S,
+        map: fn(I) -> Result<BodyFrame, E>,
+    ) -> Self
+    where
+        S: Stream<Item = I> + 'static,
+        F: Holds<S>,
     {
         Self {
             mime: None,
             inner: BodyInner::Frames(Frames {
-                stream: Box::pin(stream.map(|result| result.map_err(Into::into))),
+                stream: F::frames(stream, map),
                 #[cfg(feature = "fs")]
                 reading: None,
             }),
@@ -365,11 +388,14 @@ impl Body {
     /// ```
     pub fn from_stream<T, E, S>(stream: S) -> Self
     where
-        T: Into<Bytes> + Send + 'static,
-        E: Into<Error>,
-        S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
+        T: Into<Bytes> + 'static,
+        E: Into<Error> + 'static,
+        S: Stream<Item = Result<T, E>> + 'static,
+        F: Holds<S>,
     {
-        Self::from_frames(stream.map(|result| result.map(|data| BodyFrame::Data(data.into()))))
+        Self::from_mapped_frames(stream, |result: Result<T, E>| {
+            result.map(|data| BodyFrame::Data(data.into()))
+        })
     }
     /// Creates a body from bytes or byte-like data.
     ///
@@ -599,16 +625,15 @@ impl Body {
     /// ```
     pub fn from_sse<S, E>(s: S) -> Self
     where
-        S: Stream<Item = Result<Event, E>> + Send + Sync + 'static,
-        E: Into<Error> + Send + Sync + 'static,
+        S: Stream<Item = Result<Event, E>> + 'static,
+        E: Into<Error> + 'static,
+        F: Holds<S>,
     {
         Self {
             mime: Some(mime::TEXT_EVENT_STREAM),
-            inner: BodyInner::HttpBody(Box::pin(
-                crate::sse::into_body(s)
-                    .map_frame(|result| result.map_data(|data| data))
-                    .map_err(|e| e.into()),
-            )),
+            ..Self::from_mapped_frames(s, |result: Result<Event, E>| {
+                result.map(|event| BodyFrame::Data(Bytes::from(event.encode().into_bytes())))
+            })
         }
     }
 
@@ -779,7 +804,7 @@ impl Body {
     /// # }
     /// ```
     #[must_use]
-    pub const fn into_data_stream(self) -> DataStream {
+    pub const fn into_data_stream(self) -> DataStream<F> {
         DataStream { body: self }
     }
 
@@ -787,7 +812,7 @@ impl Body {
     ///
     /// This method transforms the body into a stream of SSE events, which can be used
     /// to handle eventsource responses in HTTP servers or clients.
-    pub fn into_sse(self) -> SseStream {
+    pub fn into_sse(self) -> SseStream<F> {
         SseStream::new(self)
     }
 
@@ -970,7 +995,7 @@ impl Body {
     /// // `body` now contains "replacement"
     /// // `old_body` contains "original"
     /// ```
-    pub fn replace(&mut self, body: Body) -> Body {
+    pub fn replace(&mut self, body: Self) -> Self {
         replace(self, body)
     }
 
@@ -997,7 +1022,7 @@ impl Body {
     /// // Now body1 contains "second" and body2 contains "first"
     /// # Ok::<(), http_kit::BodyError>(())
     /// ```
-    pub fn swap(&mut self, body: &mut Body) -> Result<(), BodyFrozen> {
+    pub fn swap(&mut self, body: &mut Self) -> Result<(), BodyFrozen> {
         if self.is_frozen() {
             Err(BodyFrozen::new())
         } else {
@@ -1154,21 +1179,21 @@ fn into_http_frame(frame: BodyFrame) -> Frame<Bytes> {
 
 /// The data of a [`Body`], with file regions read out and trailers dropped.
 ///
-/// Created by [`Body::into_data_stream`].
+/// Created by [`GenericBody::into_data_stream`].
 #[derive(Debug)]
-pub struct DataStream {
-    body: Body,
+pub struct DataStream<F: Flavor = Shared> {
+    body: GenericBody<F>,
 }
 
-impl DataStream {
+impl<F: Flavor> DataStream<F> {
     /// Returns the body the data is read from.
     #[must_use]
-    pub fn into_inner(self) -> Body {
+    pub fn into_inner(self) -> GenericBody<F> {
         self.body
     }
 }
 
-impl Stream for DataStream {
+impl<F: Flavor> Stream for DataStream<F> {
     type Item = Result<Bytes, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -1183,9 +1208,39 @@ impl Stream for DataStream {
     }
 }
 
-impl Default for Body {
+impl<F: Flavor> Default for GenericBody<F> {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+/// Drops the `Send + Sync` guarantee; the sources are kept as they are.
+impl From<Body> for LocalBody {
+    fn from(body: Body) -> Self {
+        let inner = match body.inner {
+            BodyInner::Once(bytes) => BodyInner::Once(bytes),
+            #[cfg(feature = "fs")]
+            BodyInner::File(region) => BodyInner::File(region),
+            #[cfg(feature = "fs")]
+            BodyInner::Reading(stream) => BodyInner::Reading(stream),
+            BodyInner::Frames(frames) => {
+                let stream: Pin<Box<<Local as Flavor>::Frames>> = frames.stream;
+                BodyInner::Frames(Frames {
+                    stream,
+                    #[cfg(feature = "fs")]
+                    reading: frames.reading,
+                })
+            }
+            BodyInner::HttpBody(body) => {
+                let body: Pin<Box<<Local as Flavor>::HttpBody>> = body;
+                BodyInner::HttpBody(body)
+            }
+            BodyInner::Freeze => BodyInner::Freeze,
+        };
+        Self {
+            mime: body.mime,
+            inner,
+        }
     }
 }
 
@@ -1193,7 +1248,7 @@ impl Default for Body {
 ///
 /// A region that the `http_body::Body` side has started to read out continues
 /// here as data frames, so the two views never skip or repeat bytes.
-impl Stream for Body {
+impl<F: Flavor> Stream for GenericBody<F> {
     type Item = Result<BodyFrame, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -1271,7 +1326,7 @@ impl Stream for Body {
 
 /// Data and trailers, with each file region read out into data frames
 /// through [`FileRegion::into_stream`].
-impl http_body::Body for Body {
+impl<F: Flavor> http_body::Body for GenericBody<F> {
     type Data = Bytes;
 
     type Error = Error;
@@ -1324,7 +1379,7 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
     use futures_lite::{stream, StreamExt};
-    use http_body_util::StreamBody;
+    use http_body_util::{BodyExt, StreamBody};
 
     #[tokio::test]
     async fn basic_body_operations() {
