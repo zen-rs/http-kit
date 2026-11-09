@@ -23,11 +23,11 @@ use bytes::{Bytes, BytesMut};
 use futures_lite::future::{or, poll_once};
 use http::{HeaderValue, Method, StatusCode, Version, response};
 use http_kit::{Body, Request, Response};
-use http_kit_io::{Read, SendFile, Split, Write};
+use http_kit_io::{Read, SendFile, Split, Timer, Write};
 
 use crate::{
-    Error, ParseError, ServerConfig, Upgraded, body,
-    conn::{Outbox, Pumped, Recv, pump_body, send_message, while_driving},
+    Error, ParseError, ServerConfig, Timeout, Upgraded, body,
+    conn::{Outbox, Pumped, Recv, deadline_after, pump_body, send_message, until, while_driving},
     proto::{
         BodyDecoder, BodyKind, RequestHead, RequestInfo, encode_response_head, parse_request_head,
     },
@@ -82,14 +82,15 @@ impl<R, W> std::fmt::Debug for ServerOutcome<R, W> {
 }
 
 /// One server connection.
-pub struct ServerConnection<R, W> {
+pub struct ServerConnection<R, W, T> {
     recv: Recv<R>,
     writer: W,
+    timer: T,
     config: ServerConfig,
     date: DateCache,
 }
 
-impl<R, W> std::fmt::Debug for ServerConnection<R, W> {
+impl<R, W, T> std::fmt::Debug for ServerConnection<R, W, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerConnection")
             .field("buffered", &self.recv.buf.len())
@@ -98,16 +99,19 @@ impl<R, W> std::fmt::Debug for ServerConnection<R, W> {
     }
 }
 
-impl<R, W> ServerConnection<R, W>
+impl<R, W, T> ServerConnection<R, W, T>
 where
     R: Read,
     W: Write + SendFile,
+    T: Timer,
 {
-    /// A connection over a socket's read and write halves.
-    pub fn new(reader: R, writer: W, config: ServerConfig) -> Self {
+    /// A connection over a socket's read and write halves, with its
+    /// deadlines (see [`ServerConfig`]) driven by `timer`.
+    pub fn new(reader: R, writer: W, timer: T, config: ServerConfig) -> Self {
         Self {
             recv: Recv::new(reader, config.read_buffer_size),
             writer,
+            timer,
             config,
             date: DateCache::default(),
         }
@@ -118,8 +122,9 @@ where
     /// # Errors
     ///
     /// The transport failed, the client sent an invalid request (answered
-    /// with its status code first, where one applies), or a response could
-    /// not be sent as the service produced it.
+    /// with its status code first, where one applies), a response could
+    /// not be sent as the service produced it, or a configured deadline
+    /// passed ([`Error::Timeout`]).
     pub async fn serve<S: Service>(self, service: &S) -> Result<ServerOutcome<R, W>, Error> {
         self.serve_until(service, pending()).await
     }
@@ -139,8 +144,9 @@ where
     ) -> Result<ServerOutcome<R, W>, Error> {
         let mut shutdown = pin!(shutdown);
         let mut stopping = false;
+        let mut served = false;
         loop {
-            let head = match self.next_head(&mut shutdown, &mut stopping).await {
+            let head = match self.next_head(&mut shutdown, &mut stopping, served).await {
                 Ok(Some(head)) => head,
                 Ok(None) => return self.close().await,
                 Err(Error::Parse(error)) => {
@@ -153,7 +159,7 @@ where
                 stopping = true;
             }
             match self.exchange(service, head, stopping).await? {
-                Next::KeepAlive => {}
+                Next::KeepAlive => served = true,
                 Next::Close => return self.close().await,
                 Next::Upgrade(response) => {
                     return Ok(ServerOutcome::Upgraded {
@@ -171,33 +177,62 @@ where
 
     /// Reads the next request head; `None` when the connection should close
     /// without one (end of stream, or shutdown while idle).
+    ///
+    /// Waiting for the first byte is bounded by the keep-alive timeout once a
+    /// request was served and by the header timeout before that; from the
+    /// first byte on, the whole head is bounded by the header timeout. A
+    /// timeout with part of a head received is answered with `408`.
     async fn next_head<F: Future<Output = ()>>(
         &mut self,
         shutdown: &mut std::pin::Pin<&mut F>,
         stopping: &mut bool,
+        served: bool,
     ) -> Result<Option<RequestHead>, Error> {
+        let header_timeout = self.config.header_read_timeout;
+        let (mut deadline, mut expiry) = if self.recv.buf.is_empty() && served {
+            (
+                deadline_after(self.config.keep_alive_timeout),
+                Timeout::KeepAliveIdle,
+            )
+        } else {
+            (deadline_after(header_timeout), Timeout::HeadRead)
+        };
         loop {
             if let Some(head) = parse_request_head(&mut self.recv.buf, &self.config.limits)? {
                 tracing::trace!(method = %head.parts.method, uri = %head.parts.uri, "request");
                 return Ok(Some(head));
             }
             let idle = self.recv.buf.is_empty();
+            let fill = until(&self.timer, deadline, self.recv.fill());
             let read = if idle && !*stopping {
-                let fill = async { Some(self.recv.fill().await) };
+                let fill = async { Some(fill.await) };
                 let stop = async {
                     shutdown.as_mut().await;
                     None
                 };
                 match or(fill, stop).await {
-                    Some(read) => read?,
+                    Some(read) => read,
                     None => {
                         *stopping = true;
                         return Ok(None);
                     }
                 }
             } else {
-                self.recv.fill().await?
+                fill.await
             };
+            let Some(read) = read else {
+                tracing::debug!(%expiry, "closing the connection");
+                if !idle {
+                    self.send_status(StatusCode::REQUEST_TIMEOUT).await;
+                }
+                return Err(Error::Timeout(expiry));
+            };
+            let read = read?;
+            if idle && read > 0 {
+                // The head's own clock starts at its first byte.
+                deadline = deadline_after(header_timeout);
+                expiry = Timeout::HeadRead;
+            }
             if read == 0 {
                 return if self.recv.buf.is_empty() {
                     Ok(None)
@@ -216,6 +251,8 @@ where
     ) -> Result<Next, Error> {
         let info = head.info();
         let limits = &self.config.limits;
+        let body_timeout = self.config.body_read_timeout;
+        let timer = &self.timer;
         let expect_continue = head.expect_continue && head.body != BodyKind::Empty;
         let (body, pump) = match head.body {
             BodyKind::Empty => (Body::empty(), None),
@@ -252,7 +289,16 @@ where
                     }
                 }
             };
-            pump_body(recv, decoder, limits, sender, first_read).await
+            pump_body(
+                recv,
+                decoder,
+                limits,
+                sender,
+                timer,
+                body_timeout,
+                first_read,
+            )
+            .await
         };
 
         let writer = &mut self.writer;
@@ -328,9 +374,14 @@ where
     /// Answers an invalid request with its status, where one applies.
     async fn reject(&mut self, error: &ParseError) {
         tracing::debug!(%error, "rejecting an invalid request");
-        let Some(status) = error.status() else {
-            return;
-        };
+        if let Some(status) = error.status() {
+            self.send_status(status).await;
+        }
+    }
+
+    /// Sends an empty response with `status` that closes the connection,
+    /// and shuts the write side down.
+    async fn send_status(&mut self, status: StatusCode) {
         let mut outbox = Outbox::default();
         outbox.push(rejection(status));
         if let Err(error) = outbox.flush(&mut self.writer).await {
@@ -347,19 +398,20 @@ where
     }
 }
 
-impl<R, W> ServerConnection<R, W>
+impl<R, W, T> ServerConnection<R, W, T>
 where
     R: Read,
     W: Write + SendFile,
+    T: Timer,
 {
     /// A connection over a whole socket, split into halves so that request
     /// and response bodies flow at the same time.
-    pub fn from_stream<T>(stream: T, config: ServerConfig) -> Self
+    pub fn from_stream<S>(stream: S, timer: T, config: ServerConfig) -> Self
     where
-        T: Split<ReadHalf = R, WriteHalf = W>,
+        S: Split<ReadHalf = R, WriteHalf = W>,
     {
         let (reader, writer) = stream.split();
-        Self::new(reader, writer, config)
+        Self::new(reader, writer, timer, config)
     }
 }
 

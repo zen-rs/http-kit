@@ -12,7 +12,7 @@ use http_kit::{Body, BodyFrame, Request, Response};
 use http_kit_h1::{
     ClientConfig, ClientOutcome, Error, SendRequest, ServerConfig, ServerConnection, handshake,
 };
-use support::{CJK, connection, within_reads};
+use support::{CJK, NeverTimer, connection, within_reads};
 
 fn request(method: Method, uri: &str, body: Body) -> Request {
     let mut request = Request::new(body);
@@ -51,8 +51,9 @@ fn streaming_round_trip_with_trailers_and_keep_alive() {
             }
         };
         let server =
-            ServerConnection::new(server_in, server_out, ServerConfig::default()).serve(&service);
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+            ServerConnection::new(server_in, server_out, NeverTimer, ServerConfig::default())
+                .serve(&service);
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
 
         let client = async move {
             for round in 0..2 {
@@ -103,7 +104,7 @@ fn expect_continue_waits_for_the_server() {
         let ends = connection();
         let (mut server_in, server_out) = ends.server;
         let (client_in, client_out) = ends.client;
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let peer = async move {
             let head = server_in.until(b"\r\n\r\n").await;
             assert!(text(&head).contains("expect: 100-continue\r\n"));
@@ -142,7 +143,7 @@ fn a_final_response_before_continue_withholds_the_body() {
         let ends = connection();
         let (mut server_in, server_out) = ends.server;
         let (client_in, client_out) = ends.client;
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let peer = async move {
             server_in.until(b"\r\n\r\n").await;
             server_out.send(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n");
@@ -175,7 +176,7 @@ fn upgrade_hands_back_the_socket_and_early_bytes() {
         let ends = connection();
         let (mut server_in, server_out) = ends.server;
         let (client_in, client_out) = ends.client;
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let early = "早上好 おはよう 좋은 아침";
         let peer = async move {
             let head = text(&server_in.until(b"\r\n\r\n").await);
@@ -211,7 +212,7 @@ fn an_unrequested_upgrade_fails() {
         let ends = connection();
         let (mut server_in, server_out) = ends.server;
         let (client_in, client_out) = ends.client;
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let peer = async move {
             server_in.until(b"\r\n\r\n").await;
             server_out.send(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
@@ -234,7 +235,7 @@ fn close_delimited_responses_are_zero_copy() {
         let (mut server_in, mut server_out) = ends.server;
         let (client_in, client_out) = ends.client;
         let reads = client_in.reads();
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let body = CJK.repeat(30);
         let peer = async {
             server_in.until(b"\r\n\r\n").await;
@@ -274,7 +275,7 @@ fn interim_responses_are_skipped() {
         let ends = connection();
         let (mut server_in, server_out) = ends.server;
         let (client_in, client_out) = ends.client;
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let peer = async move {
             server_in.until(b"\r\n\r\n").await;
             server_out.send(b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
@@ -299,7 +300,7 @@ fn a_closed_connection_fails_the_request() {
         let ends = connection();
         let (mut server_in, mut server_out) = ends.server;
         let (client_in, client_out) = ends.client;
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let peer = async {
             server_in.until(b"\r\n\r\n").await;
             server_out.close();
@@ -320,7 +321,7 @@ fn invalid_responses_fail_the_request() {
         let ends = connection();
         let (mut server_in, server_out) = ends.server;
         let (client_in, client_out) = ends.client;
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let peer = async move {
             server_in.until(b"\r\n\r\n").await;
             server_out
@@ -355,8 +356,9 @@ fn an_unsendable_request_leaves_the_connection_usable() {
         let (client_in, client_out) = ends.client;
         let service = |_: Request| async { Response::new(Body::from_bytes("ok")) };
         let server =
-            ServerConnection::new(server_in, server_out, ServerConfig::default()).serve(&service);
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+            ServerConnection::new(server_in, server_out, NeverTimer, ServerConfig::default())
+                .serve(&service);
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let client = async move {
             // No authority and no Host field.
             let error = send

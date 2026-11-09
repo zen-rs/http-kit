@@ -173,6 +173,30 @@ pub enum Error {
     /// The connection closed before the request was answered.
     #[error("connection closed")]
     ConnectionClosed,
+    /// A deadline from the connection's configuration passed.
+    #[error("timed out: {0}")]
+    Timeout(Timeout),
+}
+
+/// Which deadline of a [`ServerConfig`](crate::ServerConfig) passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Timeout {
+    /// A request head did not arrive in full within
+    /// [`header_read_timeout`](crate::ServerConfig::header_read_timeout). A
+    /// server that had received part of the head answered `408 Request
+    /// Timeout` before closing (RFC 9110 §15.5.9).
+    #[error("request head not received in time")]
+    HeadRead,
+    /// A keep-alive connection sat idle for
+    /// [`keep_alive_timeout`](crate::ServerConfig::keep_alive_timeout). This
+    /// is how an idle connection normally ends; callers usually just log it.
+    #[error("keep-alive connection idle for too long")]
+    KeepAliveIdle,
+    /// A read of the request body delivered nothing within
+    /// [`body_read_timeout`](crate::ServerConfig::body_read_timeout).
+    #[error("request body stalled")]
+    BodyRead,
 }
 
 impl From<io::Error> for Error {
