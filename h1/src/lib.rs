@@ -23,8 +23,10 @@
 //! # Request smuggling
 //!
 //! Framing follows RFC 9112 §6.3 strictly: `Content-Length` together with
-//! `Transfer-Encoding`, differing `Content-Length` values, a transfer coding
-//! other than a lone final `chunked`, `Transfer-Encoding` in HTTP/1.0,
+//! `Transfer-Encoding`, differing `Content-Length` values, a request whose
+//! transfer coding is other than a lone final `chunked` (a response whose
+//! final coding is not `chunked` is read until the connection closes, as
+//! RFC 9112 §6.3 says), `Transfer-Encoding` in HTTP/1.0,
 //! obs-fold and bare CR in a request, and chunk lines not ended by CRLF are
 //! all rejected and end the connection. Head size, field count and chunk
 //! line length are bounded by [`Limits`].
@@ -94,6 +96,7 @@ pub use crate::{
     client::{ClientOutcome, Connection, SendRequest, handshake, handshake_stream},
     config::{ClientConfig, Limits, ServerConfig},
     error::{Error, ParseError},
+    proto::RequestTarget,
     server::{ServerConnection, ServerOutcome, Service},
 };
 

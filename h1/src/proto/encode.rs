@@ -339,10 +339,23 @@ pub struct RequestPlan {
     pub upgrade: bool,
 }
 
+/// The form of the request target a client writes (RFC 9112 §3.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RequestTarget {
+    /// The URI's path and query, for a request to the origin server.
+    #[default]
+    Origin,
+    /// The whole URI, scheme and authority included, for a request to a
+    /// forward proxy. The URI must carry both; a `userinfo` is left out, as
+    /// RFC 9112 §3.2.2 requires.
+    Absolute,
+}
+
 /// Encodes a request head into `dst` and decides its body's framing.
 ///
-/// The request target is the URI's authority for `CONNECT` and its path and
-/// query otherwise. A `Host` field is added from the URI's authority when the
+/// The request target is the URI's authority for `CONNECT` and otherwise,
+/// per `form`, either its path and query or the whole URI. A `Host` field is added from the URI's authority when the
 /// request has none. Framing fields it lacks are added: `Content-Length` when
 /// the length is known (omitted for an empty body unless the method expects
 /// one), otherwise `Transfer-Encoding: chunked`.
@@ -350,9 +363,11 @@ pub struct RequestPlan {
 /// # Errors
 ///
 /// A request that cannot be sent as given: an unsupported version, no host,
-/// framing fields that are invalid or contradict the body.
+/// an absolute-form target without a scheme and authority, framing fields
+/// that are invalid or contradict the body.
 pub fn encode_request_head(
     request: &request::Parts,
+    form: RequestTarget,
     body_len: Option<u64>,
     dst: &mut BytesMut,
 ) -> Result<RequestPlan, Error> {
@@ -369,10 +384,26 @@ pub fn encode_request_head(
             .rsplit_once('@')
             .map_or(authority, |(_, host)| host)
     });
+    let path = request.uri.path_and_query().map_or("/", |pq| pq.as_str());
+    // The scheme that goes before `://` in an absolute-form target.
+    let scheme = match (connect, form) {
+        (false, RequestTarget::Absolute) => {
+            if authority.is_none() {
+                return Err(Error::AbsoluteTargetIncomplete);
+            }
+            Some(
+                request
+                    .uri
+                    .scheme_str()
+                    .ok_or(Error::AbsoluteTargetIncomplete)?,
+            )
+        }
+        _ => None,
+    };
     let target = if connect {
         authority.ok_or(Error::MissingHost)?
     } else {
-        request.uri.path_and_query().map_or("/", |pq| pq.as_str())
+        path
     };
     let host = if request.headers.contains_key(HOST) {
         None
@@ -426,6 +457,11 @@ pub fn encode_request_head(
 
     dst.put_slice(method.as_str().as_bytes());
     dst.put_u8(b' ');
+    if let Some(scheme) = scheme {
+        dst.put_slice(scheme.as_bytes());
+        dst.put_slice(b"://");
+        dst.put_slice(authority.expect("checked above").as_bytes());
+    }
     dst.put_slice(target.as_bytes());
     dst.put_slice(if http11 {
         b" HTTP/1.1\r\n"

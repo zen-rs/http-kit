@@ -3,6 +3,8 @@
 //! Every value here is an operator setting: the defaults are a starting point
 //! sized for typical traffic, not a ceiling the crate enforces.
 
+use crate::proto::RequestTarget;
+
 /// Limits on what a peer may send, applied to every message received.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
@@ -54,6 +56,11 @@ pub struct ClientConfig {
     pub limits: Limits,
     /// How many bytes of room each read asks the socket to fill.
     pub read_buffer_size: usize,
+    /// The form of the request target every request on the connection
+    /// carries: [`RequestTarget::Absolute`] on a connection to a forward
+    /// proxy, [`RequestTarget::Origin`] otherwise. `CONNECT` always carries
+    /// the authority.
+    pub request_target: RequestTarget,
 }
 
 impl Default for ClientConfig {
@@ -61,6 +68,7 @@ impl Default for ClientConfig {
         Self {
             limits: Limits::default(),
             read_buffer_size: 16 * 1024,
+            request_target: RequestTarget::Origin,
         }
     }
 }

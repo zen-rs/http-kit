@@ -23,7 +23,8 @@ mod head;
 
 pub use decode::{BodyDecoder, Decoded};
 pub use encode::{
-    BodyEncoder, Framing, RequestPlan, ResponsePlan, encode_request_head, encode_response_head,
+    BodyEncoder, Framing, RequestPlan, RequestTarget, ResponsePlan, encode_request_head,
+    encode_response_head,
 };
 pub use head::{
     BodyKind, RequestHead, RequestInfo, ResponseHead, parse_request_head, parse_response_head,
