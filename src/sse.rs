@@ -33,7 +33,7 @@ use serde::Serialize;
 #[cfg(feature = "json")]
 use serde_json::{self, to_string};
 
-use crate::Body;
+use crate::{Body, DataStream};
 
 /// Represents a Server-Sent Event that can be sent to clients.
 #[derive(Debug)]
@@ -232,7 +232,7 @@ pin_project! {
     /// Server-Sent Events, allowing you to process SSE data asynchronously.
     pub struct SseStream{
         #[pin]
-        body:Body,
+        body: DataStream,
         buffer: Vec<u8>,
         partial_event: PartialEvent,
     }
@@ -253,7 +253,7 @@ impl SseStream {
     /// asynchronously parse Server-Sent Events from the body data.
     pub fn new(body: Body) -> Self {
         Self {
-            body,
+            body: body.into_data_stream(),
             buffer: Vec::new(),
             partial_event: PartialEvent::default(),
         }

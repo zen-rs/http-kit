@@ -1,10 +1,8 @@
 use alloc::{borrow::Cow, boxed::Box, string::String, vec::Vec};
 use bytes::Bytes;
 use bytestr::ByteStr;
-use core::pin::Pin;
-use futures_lite::AsyncBufRead;
 
-use super::{Body, BodyInner};
+use super::Body;
 
 macro_rules! from_bytes {
     ($($ty:ty),*) => {
@@ -46,20 +44,9 @@ impl From<&[u8]> for Body {
     }
 }
 
-impl From<Box<dyn AsyncBufRead + Send + Sync + 'static>> for Body {
-    fn from(reader: Box<dyn AsyncBufRead + Send + Sync + 'static>) -> Self {
-        Pin::from(reader).into()
-    }
-}
-
-impl From<Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>> for Body {
-    fn from(reader: Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>) -> Self {
-        Self {
-            mime: None,
-            inner: BodyInner::Reader {
-                reader,
-                length: None,
-            },
-        }
+#[cfg(feature = "fs")]
+impl From<super::FileRegion> for Body {
+    fn from(region: super::FileRegion) -> Self {
+        Body::from_file_region(region)
     }
 }

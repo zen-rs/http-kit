@@ -19,7 +19,7 @@
 //!
 //! - `json` - JSON serialization/deserialization via serde_json (enabled by default)
 //! - `form` - Form data handling via serde_urlencoded (enabled by default)
-//! - `fs` - File upload support with MIME type detection
+//! - `fs` - File-region bodies (`FileRegion`, `Body::from_file`) with MIME type detection
 //! - `mime` - MIME type parsing and manipulation
 //! - `http_body` - Implementation of http_body traits
 //! - `std` - Enable standard library support (enabled by default)
@@ -34,8 +34,10 @@ pub mod error;
 pub use error::{BoxHttpError, Error, HttpError, Result, ResultExt};
 mod body;
 
-pub use body::Body;
 pub use body::Error as BodyError;
+pub use body::{Body, BodyFrame, DataStream};
+#[cfg(feature = "fs")]
+pub use body::{FileRegion, FileRegionStream};
 
 pub mod middleware;
 #[doc(inline)]
