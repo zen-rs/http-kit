@@ -1,0 +1,42 @@
+[package]
+name = "http-kit-h1"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Lexo Liu <me@lexo.cool>"]
+license = "MIT"
+description = "Sans-IO HTTP/1.1 server and client with zero-copy bodies, driven over owned-buffer I/O"
+documentation = "https://docs.rs/http-kit-h1"
+repository = "https://github.com/lexoooooo/http-kit"
+homepage = "https://github.com/lexoooooo/http-kit"
+keywords = ["http", "http1", "sans-io", "io-uring", "server"]
+categories = ["network-programming", "web-programming::http-server", "web-programming::http-client"]
+
+[features]
+## File-region body frames, sent with the I/O layer's file-to-socket path.
+fs = ["http-kit/fs"]
+
+[dependencies]
+http-kit = { version = "0.4.4", path = "..", default-features = false, features = ["std"] }
+http-kit-io = { version = "0.1.0", path = "../io" }
+http = { version = "1.5.0", default-features = false, features = ["std"] }
+bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+httparse = { version = "1.10.1", default-features = false }
+httpdate = { version = "1.0.3", default-features = false }
+async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.17", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+http-kit-io = { version = "0.1.0", path = "../io", features = ["tokio", "compio"] }
+compio = { version = "0.19.2", default-features = false, features = ["runtime"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[package.metadata.docs.rs]
+all-features = true

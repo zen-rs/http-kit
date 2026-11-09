@@ -1,5 +1,5 @@
 [workspace]
-members = ["io"]
+members = ["io", "h1"]
 
 [package]
 name = "http-kit"
