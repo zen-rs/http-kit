@@ -521,6 +521,57 @@ mod files {
     }
 
     #[test]
+    fn regions_of_one_shared_file_each_send_their_bytes() {
+        use std::sync::Arc;
+
+        let contents = "静态文件直接交给内核。静的ファイルはカーネルに直接渡す。정적 파일은 커널에 바로 넘긴다."
+            .as_bytes();
+        let path =
+            std::env::temp_dir().join(format!("http-kit-h1-shared-{}.txt", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        let shared = Arc::new(File::open(&path).unwrap());
+
+        block_on(async {
+            for (offset, len) in [
+                (0, contents.len() / 2),
+                (contents.len() / 3, contents.len() / 2),
+            ] {
+                let ends = connection();
+                let (reader, writer) = ends.server;
+                let calls = writer.send_file_calls();
+                let (mut client_in, mut client_out) = ends.client;
+                let file = Arc::clone(&shared);
+                let service = move |_: Request| {
+                    let file = Arc::clone(&file);
+                    async move {
+                        Response::new(Body::from_file_region(FileRegion::new(
+                            file,
+                            offset as u64,
+                            len as u64,
+                        )))
+                    }
+                };
+                client_out.send(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+                client_out.close();
+                let (outcome, wire) = zip(
+                    server(reader, writer).serve(&service),
+                    client_in.read_to_end(),
+                )
+                .await;
+                assert!(matches!(outcome.unwrap(), ServerOutcome::Closed));
+                let mut expected =
+                    format!("HTTP/1.1 200 OK\r\ncontent-length: {len}\r\n\r\n").into_bytes();
+                expected.extend(&contents[offset..offset + len]);
+                assert!(wire == expected, "the region at {offset} arrived intact");
+                assert_eq!(calls.get(), 1);
+            }
+        });
+        assert_eq!(Arc::strong_count(&shared), 1, "no region kept the file");
+        drop(shared);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn file_regions_are_chunked_between_data_and_trailers() {
         block_on(async {
             let ends = connection();
