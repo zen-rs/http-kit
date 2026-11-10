@@ -94,6 +94,11 @@ mod fields;
 #[cfg(feature = "quiche")]
 mod retry;
 
+/// The `http-kit-io` this crate's sockets and timers come from: its
+/// `DatagramSocket` and `Timer` traits are part of this crate's API, so naming
+/// them through this path keeps an application on the same release.
+pub use http_kit_io;
+
 #[cfg(feature = "quiche")]
 pub use crate::{
     client::{Client, Connection, SendRequest},
