@@ -2,14 +2,9 @@
 //! and the kernel file-to-socket paths.
 
 use std::{
-    io,
-    mem::{self, MaybeUninit},
-    num::NonZeroU16,
+    io, mem,
     os::fd::{AsRawFd, BorrowedFd},
-    ptr, slice,
 };
-
-use compio_buf::{IoBuf, IoBufMut, SetLen};
 
 /// The most segments one GSO send may carry (`UDP_MAX_SEGMENTS` in
 /// `include/linux/udp.h`).
@@ -70,102 +65,6 @@ fn unknown_option(err: io::Error) -> io::Result<()> {
         Ok(())
     } else {
         Err(err)
-    }
-}
-
-/// Room for the one control message either direction carries: `UDP_SEGMENT`
-/// (a `u16`) on send, `UDP_GRO` (a `c_int`) on receive.
-// SAFETY: `CMSG_SPACE` is pure arithmetic.
-const CONTROL_LEN: usize =
-    unsafe { libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as libc::c_uint) } as usize;
-
-/// An owned control-message buffer, aligned for `cmsghdr` as `sendmsg` and
-/// `recvmsg` require. Every byte is initialized.
-#[repr(C, align(8))]
-pub(crate) struct ControlBuf {
-    bytes: [MaybeUninit<u8>; CONTROL_LEN],
-    len: usize,
-}
-
-impl ControlBuf {
-    /// An empty buffer to receive control messages into.
-    pub(crate) fn new() -> Self {
-        Self {
-            bytes: [MaybeUninit::new(0); CONTROL_LEN],
-            len: 0,
-        }
-    }
-
-    /// The `UDP_SEGMENT` message asking the kernel to split a send into
-    /// `size`-byte datagrams.
-    pub(crate) fn segment(size: NonZeroU16) -> Self {
-        let mut buf = Self::new();
-        // SAFETY: `CMSG_SPACE` is pure arithmetic.
-        let space = unsafe { libc::CMSG_SPACE(mem::size_of::<u16>() as libc::c_uint) } as usize;
-        // SAFETY: an all-zero `msghdr` is a valid value.
-        let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
-        hdr.msg_control = buf.bytes.as_mut_ptr().cast();
-        hdr.msg_controllen = space as _;
-        // SAFETY: the control area is `space <= CONTROL_LEN` bytes, aligned
-        // for `cmsghdr`, so the first header and its `u16` payload fit in it.
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&raw const hdr);
-            (*cmsg).cmsg_level = libc::SOL_UDP;
-            (*cmsg).cmsg_type = libc::UDP_SEGMENT;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of::<u16>() as libc::c_uint) as _;
-            ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<u16>(), size.get());
-        }
-        buf.len = space;
-        buf
-    }
-
-    /// The coalesced segment size from the first `len` bytes of control data
-    /// a receive returned, or `None` if the kernel did not coalesce.
-    pub(crate) fn gro_segment(&self, len: usize) -> Option<usize> {
-        assert!(len <= CONTROL_LEN, "control length beyond the buffer");
-        // SAFETY: an all-zero `msghdr` is a valid value.
-        let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
-        hdr.msg_control = self.bytes.as_ptr().cast_mut().cast();
-        hdr.msg_controllen = len as _;
-        // SAFETY: `hdr` describes `len` initialized, aligned bytes of
-        // control data; the macros return null or a header inside them.
-        let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const hdr) };
-        while !cmsg.is_null() {
-            // SAFETY: as above, `cmsg` points at a header inside the data.
-            let header = unsafe { &*cmsg };
-            if header.cmsg_level == libc::SOL_UDP && header.cmsg_type == libc::UDP_GRO {
-                // SAFETY: a `UDP_GRO` message carries one `c_int`.
-                let size =
-                    unsafe { ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>()) };
-                return Some(
-                    usize::try_from(size).expect("the kernel reports a positive segment size"),
-                );
-            }
-            // SAFETY: as above.
-            cmsg = unsafe { libc::CMSG_NXTHDR(&raw const hdr, cmsg) };
-        }
-        None
-    }
-}
-
-impl IoBuf for ControlBuf {
-    fn as_init(&self) -> &[u8] {
-        // SAFETY: every byte of `bytes` is initialized, and `len` never
-        // exceeds it (`set_len` callers guarantee as much).
-        unsafe { slice::from_raw_parts(self.bytes.as_ptr().cast(), self.len) }
-    }
-}
-
-impl IoBufMut for ControlBuf {
-    fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        &mut self.bytes
-    }
-}
-
-impl SetLen for ControlBuf {
-    unsafe fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= CONTROL_LEN);
-        self.len = len;
     }
 }
 

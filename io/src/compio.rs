@@ -15,7 +15,13 @@
 //! cannot read into a buffer borrowed for one poll.
 
 use std::{
-    borrow::Borrow, fmt, fs::File, future::Future, io, net::SocketAddr, num::NonZeroU16,
+    borrow::Borrow,
+    fmt,
+    fs::File,
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU16,
     time::Instant,
 };
 
@@ -361,6 +367,12 @@ pub struct UdpSocket {
 
 impl UdpSocket {
     fn new(inner: net::UdpSocket) -> io::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            use std::os::fd::AsFd;
+
+            crate::sys::control::enable_pktinfo(inner.as_fd(), inner.local_addr()?)?;
+        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let max_segments = {
             use std::os::fd::AsFd;
@@ -387,17 +399,26 @@ impl UdpSocket {
         buf: B,
         segment: Option<NonZeroU16>,
         target: SocketAddr,
+        source: Option<IpAddr>,
     ) -> BufResult<usize, B> {
-        match segment {
-            None => self.inner.send_to(buf, target).await,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            Some(size) => {
-                let control = crate::sys::linux::ControlBuf::segment(size);
+        match (segment, source) {
+            (None, None) => self.inner.send_to(buf, target).await,
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            (segment, source) => {
+                let control = crate::sys::control::ControlBuf::send(segment, source);
                 let BufResult(res, (buf, _)) = self.inner.send_msg(buf, control, target).await;
                 BufResult(res, buf)
             }
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            Some(_) => unreachable!("segmented sends need segmentation offload"),
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+            (None, Some(_)) => BufResult(
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "choosing a datagram's source address is not supported on this platform",
+                )),
+                buf,
+            ),
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+            (Some(_), _) => unreachable!("segmented sends need segmentation offload"),
         }
     }
 }
@@ -418,44 +439,57 @@ impl DatagramSocket for UdpSocket {
         self.max_segments
     }
 
-    fn send_to<B: IoBuf>(
+    fn send_from<B: IoBuf>(
         &self,
         buf: B,
         target: SocketAddr,
+        source: Option<IpAddr>,
     ) -> impl Future<Output = BufResult<usize, B>> {
-        self.send_one(buf, None, target)
+        self.send_one(buf, None, target, source)
     }
 
-    fn send_segments<B: IoBuf>(
+    fn send_segments_from<B: IoBuf>(
         &self,
         buf: B,
         segment_size: NonZeroU16,
         target: SocketAddr,
+        source: Option<IpAddr>,
     ) -> impl Future<Output = BufResult<usize, B>> {
         send_batched(buf, segment_size, self.max_segments, move |slice, gso| {
-            self.send_one(slice, gso, target)
+            self.send_one(slice, gso, target, source)
         })
     }
 
     async fn recv_from<B: IoBufMut>(&self, mut buf: B) -> BufResult<RecvMeta, B> {
         // As for stream reads: compio only grows the length.
         buf.clear();
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         {
             use ::compio::driver::op::ReturnFlags;
 
-            let control = crate::sys::linux::ControlBuf::new();
-            let BufResult(res, (buf, control)) = self.inner.recv_msg(buf, control).await;
-            let res = res.and_then(|(n, control_len, from, flags)| {
+            /// On Linux a truncation could have cut whole coalesced
+            /// datagrams; elsewhere UDP's truncation is the contract.
+            fn check_truncation(flags: ReturnFlags) -> io::Result<()> {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 if flags.contains(ReturnFlags::TRUNC) {
                     return Err(crate::datagram::truncated_coalesced());
                 }
-                let segment = control.gro_segment(control_len).unwrap_or(n);
-                Ok(RecvMeta::new(n, segment, from))
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let _ = flags;
+                Ok(())
+            }
+
+            let control = crate::sys::control::ControlBuf::new();
+            let BufResult(res, (buf, control)) = self.inner.recv_msg(buf, control).await;
+            let res = res.and_then(|(n, control_len, from, flags)| {
+                check_truncation(flags)?;
+                let received = control.parse(control_len);
+                let segment = received.segment.unwrap_or(n);
+                Ok(RecvMeta::new(n, segment, from).with_destination(received.destination))
             });
             BufResult(res, buf)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
         {
             let BufResult(res, buf) = self.inner.recv_from(buf).await;
             BufResult(res.map(|(n, from)| RecvMeta::single(n, from)), buf)
