@@ -683,6 +683,84 @@ where
     assert_bytes(&echoed, &body);
 }
 
+/// A stream a caller joins from two halves it holds, as an HTTP client does
+/// after CONNECT through an HTTPS proxy.
+struct Joined<R, W>(R, W);
+
+impl<R: Read + 'static, W: Write + 'static> Split for Joined<R, W> {
+    type ReadHalf = R;
+    type WriteHalf = W;
+
+    fn split(self) -> (R, W) {
+        (self.0, self.1)
+    }
+}
+
+/// A TLS session over a stream joined from a TLS connection's two halves is a
+/// [`Transport`] whatever the features, and stays in user space.
+async fn tls_over_joined_halves<I: Io>(io: I)
+where
+    I::TcpStream: Transport,
+{
+    let proxy = Identity::new();
+    let origin = Identity::new();
+    let body = cjk_body(2_000);
+    let sent = body.clone();
+    let inner_acceptor = acceptor(&origin, TLS13_AES_128, &[]);
+    let inner_connector = connector(&origin, TLS13_AES_128, &[]);
+    let server_io = io.clone();
+    let client_io = io.clone();
+    let (served, echoed) = tls_pair(
+        io,
+        acceptor(&proxy, TLS13_AES_128, &[]),
+        connector(&proxy, TLS13_AES_128, &[]),
+        |outer| async move {
+            let (read, write) = outer.split();
+            let inner = inner_acceptor
+                .accept(Joined(read, write), &server_io)
+                .await
+                .expect("inner server handshake");
+            assert_eq!(inner.mode(), Mode::User);
+            let (mut read, mut write) = inner.split();
+            let mut buf = Vec::with_capacity(20_000);
+            let mut echoed = 0;
+            loop {
+                let BufResult(res, filled) = read.read(buf).await;
+                if res.expect("inner server read") == 0 {
+                    break;
+                }
+                let BufResult(res, filled) = write.write_all(filled).await;
+                res.expect("inner server write");
+                echoed += filled.len();
+                buf = filled;
+            }
+            write.shutdown().await.expect("inner server shutdown");
+            echoed
+        },
+        |outer| async move {
+            let (read, write) = outer.split();
+            let inner = inner_connector
+                .connect(localhost(), Joined(read, write), &client_io)
+                .await
+                .expect("inner client handshake");
+            assert_eq!(inner.mode(), Mode::User);
+            let (mut read, mut write) = inner.split();
+            let send = async {
+                for piece in sent.chunks(30_011) {
+                    let BufResult(res, _) = write.write_all(piece.to_vec()).await;
+                    res.expect("inner client write");
+                }
+                write.shutdown().await.expect("inner client shutdown");
+            };
+            let ((), echoed) = zip(send, read_to_end(&mut read)).await;
+            echoed.expect("inner client read")
+        },
+    )
+    .await;
+    assert_eq!(served, body.len());
+    assert_bytes(&echoed, &body);
+}
+
 macro_rules! suite {
     ($io:expr, $run:expr) => {
         #[test]
@@ -706,6 +784,11 @@ macro_rules! suite {
         #[test]
         fn tls_in_tls() {
             $run(super::tls_in_tls($io));
+        }
+
+        #[test]
+        fn tls_over_joined_halves() {
+            $run(super::tls_over_joined_halves($io));
         }
 
         #[test]

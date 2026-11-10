@@ -723,6 +723,12 @@ impl<W: Write + SendFile + WriteControl + AsFd, D: Side> Writer<W, D> {
 }
 
 impl<R: Read + AsFd, D: Side> KernelRead<R, D> for Reader<R, D> {
+    const SOCKET: bool = true;
+
+    fn adopt(reader: Self) -> Self {
+        reader
+    }
+
     fn get_ref(&self) -> &R {
         Self::get_ref(self)
     }

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/zen-rs/http-kit/compare/tls/v0.2.0...tls/v0.2.1) - 2026-11-10
+
+### Fixed
+
+- *(tls)* mark the kernel socket reader as a socket half
+- *(tls)* one Transport impl for every Split of transport halves
+
 ## [0.2.0](https://github.com/zen-rs/http-kit/compare/tls/v0.1.0...tls/v0.2.0) - 2026-11-10
 
 ### Added
