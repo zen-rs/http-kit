@@ -74,7 +74,14 @@ pub trait Io: Timer + Clone + 'static {
     /// A connected stream socket.
     type TcpStream: Read + Write + SendFile + Split + IntoPoll + 'static;
     /// A listening stream socket.
-    type TcpListener: Listener<Stream = Self::TcpStream> + 'static;
+    type TcpListener: Listener<Stream = Self::TcpStream, Addr = SocketAddr> + 'static;
+    /// A connected Unix-domain stream socket.
+    #[cfg(unix)]
+    type UnixStream: Read + Write + SendFile + Split + IntoPoll + 'static;
+    /// A listening Unix-domain stream socket.
+    #[cfg(unix)]
+    type UnixListener: Listener<Stream = Self::UnixStream, Addr = std::os::unix::net::SocketAddr>
+        + 'static;
     /// A datagram socket.
     type UdpSocket: DatagramSocket + 'static;
 
@@ -88,6 +95,18 @@ pub trait Io: Timer + Clone + 'static {
     ///
     /// Fails if the socket cannot be registered with the driver.
     fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<Self::TcpListener>;
+
+    /// Adopts a bound, listening std Unix-domain socket, as
+    /// [`tcp_listener`](Self::tcp_listener) adopts a TCP one.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the socket cannot be registered with the driver.
+    #[cfg(unix)]
+    fn unix_listener(
+        &self,
+        listener: std::os::unix::net::UnixListener,
+    ) -> io::Result<Self::UnixListener>;
 
     /// Adopts a bound std datagram socket.
     ///

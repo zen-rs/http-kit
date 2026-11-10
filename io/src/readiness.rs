@@ -48,9 +48,22 @@ pub(crate) mod sealed {
             op: impl FnMut(SockRef<'_>) -> io::Result<R>,
         ) -> impl Future<Output = io::Result<R>>;
     }
+
+    /// A stream socket of one address family, which reports that family's
+    /// address type.
+    pub trait Family: Ready {
+        /// The family's address.
+        type Addr;
+
+        /// The local address.
+        fn local_addr(&self) -> io::Result<Self::Addr>;
+
+        /// The peer's address.
+        fn peer_addr(&self) -> io::Result<Self::Addr>;
+    }
 }
 
-use sealed::Ready;
+use sealed::{Family, Ready};
 
 /// A connected stream socket on a readiness reactor.
 pub struct Stream<T>(T);
@@ -73,14 +86,14 @@ impl<T> Stream<T> {
     }
 }
 
-impl<T: Ready> Stream<T> {
+impl<T: Family> Stream<T> {
     /// The local address.
     ///
     /// # Errors
     ///
     /// Fails if the operating system cannot report it.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        socket_addr(self.0.sock().local_addr()?)
+    pub fn local_addr(&self) -> io::Result<T::Addr> {
+        self.0.local_addr()
     }
 
     /// The peer's address.
@@ -88,10 +101,53 @@ impl<T: Ready> Stream<T> {
     /// # Errors
     ///
     /// Fails if the socket is not connected.
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        socket_addr(self.0.sock().peer_addr()?)
+    pub fn peer_addr(&self) -> io::Result<T::Addr> {
+        self.0.peer_addr()
     }
 }
+
+/// Implements [`Family`] for an IP stream socket.
+macro_rules! impl_tcp_family {
+    ($ty:ty) => {
+        impl $crate::readiness::sealed::Family for $ty {
+            type Addr = ::std::net::SocketAddr;
+
+            fn local_addr(&self) -> ::std::io::Result<Self::Addr> {
+                $crate::readiness::socket_addr(
+                    $crate::readiness::sealed::Ready::sock(self).local_addr()?,
+                )
+            }
+
+            fn peer_addr(&self) -> ::std::io::Result<Self::Addr> {
+                $crate::readiness::socket_addr(
+                    $crate::readiness::sealed::Ready::sock(self).peer_addr()?,
+                )
+            }
+        }
+    };
+}
+
+/// Implements [`Family`] for a Unix-domain stream socket.
+#[cfg(unix)]
+macro_rules! impl_unix_family {
+    ($ty:ty) => {
+        impl $crate::readiness::sealed::Family for $ty {
+            type Addr = ::std::os::unix::net::SocketAddr;
+
+            fn local_addr(&self) -> ::std::io::Result<Self::Addr> {
+                $crate::sys::unix::local_addr(self)
+            }
+
+            fn peer_addr(&self) -> ::std::io::Result<Self::Addr> {
+                $crate::sys::unix::peer_addr(self)
+            }
+        }
+    };
+}
+
+pub(crate) use impl_tcp_family;
+#[cfg(unix)]
+pub(crate) use impl_unix_family;
 
 impl<T: fmt::Debug> fmt::Debug for Stream<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -106,7 +162,7 @@ impl<T: std::os::fd::AsFd> std::os::fd::AsFd for Stream<T> {
     }
 }
 
-fn socket_addr(addr: SockAddr) -> io::Result<SocketAddr> {
+pub(crate) fn socket_addr(addr: SockAddr) -> io::Result<SocketAddr> {
     addr.as_socket().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,

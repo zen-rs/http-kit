@@ -26,7 +26,7 @@ use std::{
 };
 
 use ::compio::{
-    io::{AsyncRead as _, AsyncWrite as _},
+    io::{AsyncRead, AsyncWrite},
     net,
 };
 use compio_buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf};
@@ -53,6 +53,10 @@ impl Timer for Compio {
 impl Io for Compio {
     type TcpStream = TcpStream;
     type TcpListener = TcpListener;
+    #[cfg(unix)]
+    type UnixStream = UnixStream;
+    #[cfg(unix)]
+    type UnixListener = UnixListener;
     type UdpSocket = UdpSocket;
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
@@ -61,6 +65,14 @@ impl Io for Compio {
 
     fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
         net::TcpListener::from_std(listener).map(TcpListener)
+    }
+
+    #[cfg(unix)]
+    fn unix_listener(
+        &self,
+        listener: std::os::unix::net::UnixListener,
+    ) -> io::Result<UnixListener> {
+        net::UnixListener::from_std(listener).map(UnixListener)
     }
 
     fn udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<UdpSocket> {
@@ -77,8 +89,81 @@ impl Io for Compio {
 }
 
 /// A connected TCP stream.
-pub struct TcpStream {
-    inner: net::TcpStream,
+pub type TcpStream = Stream<net::TcpStream>;
+/// A connected Unix-domain stream socket.
+#[cfg(unix)]
+pub type UnixStream = Stream<net::UnixStream>;
+
+/// A stream socket of compio's, which the operations below drive through a
+/// shared reference.
+trait Socket: Clone + 'static {
+    fn read<B: IoBufMut>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
+    fn write<B: IoBuf>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
+    fn write_vectored<B: IoVectoredBuf>(&self, buf: B)
+    -> impl Future<Output = BufResult<usize, B>>;
+    fn shutdown(&self) -> impl Future<Output = io::Result<()>>;
+    /// `sendfile(2)` of a region once the socket is writable.
+    #[cfg(target_vendor = "apple")]
+    fn sendfile(
+        &self,
+        file: &File,
+        offset: u64,
+        len: usize,
+    ) -> impl Future<Output = io::Result<usize>>;
+}
+
+macro_rules! impl_socket {
+    ($ty:ty) => {
+        impl Socket for $ty {
+            async fn read<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
+                let mut stream = self;
+                AsyncRead::read(&mut stream, buf).await
+            }
+
+            async fn write<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
+                let mut stream = self;
+                AsyncWrite::write(&mut stream, buf).await
+            }
+
+            async fn write_vectored<B: IoVectoredBuf>(&self, buf: B) -> BufResult<usize, B> {
+                let mut stream = self;
+                AsyncWrite::write_vectored(&mut stream, buf).await
+            }
+
+            async fn shutdown(&self) -> io::Result<()> {
+                let mut stream = self;
+                AsyncWrite::shutdown(&mut stream).await
+            }
+
+            #[cfg(target_vendor = "apple")]
+            async fn sendfile(&self, file: &File, offset: u64, len: usize) -> io::Result<usize> {
+                use std::os::fd::AsRawFd;
+
+                let poll_fd = <$ty>::to_poll_fd(self)?;
+                loop {
+                    std::future::poll_fn(|cx| poll_fd.poll_write_ready(cx)).await?;
+                    match crate::sys::apple::sendfile(
+                        poll_fd.as_raw_fd(),
+                        file.as_raw_fd(),
+                        offset,
+                        len,
+                    ) {
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        res => return res,
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_socket!(net::TcpStream);
+#[cfg(unix)]
+impl_socket!(net::UnixStream);
+
+/// A connected stream socket.
+pub struct Stream<S> {
+    inner: S,
     /// The pipe file transfers splice through, kept between transfers. A
     /// transfer takes it out while data may sit in it, so one that fails or
     /// is cancelled midway drops it instead of leaving stale bytes behind.
@@ -86,8 +171,8 @@ pub struct TcpStream {
     pipe: std::cell::Cell<Option<splice::Pipe>>,
 }
 
-impl TcpStream {
-    fn new(inner: net::TcpStream) -> Self {
+impl<S> Stream<S> {
+    fn new(inner: S) -> Self {
         Self {
             inner,
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -97,10 +182,33 @@ impl TcpStream {
 
     /// compio's stream.
     #[must_use]
-    pub fn get_ref(&self) -> &net::TcpStream {
+    pub fn get_ref(&self) -> &S {
         &self.inner
     }
+}
 
+#[cfg(unix)]
+impl Stream<net::UnixStream> {
+    /// The local address.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the operating system cannot report it.
+    pub fn local_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        crate::sys::unix::local_addr(&self.inner)
+    }
+
+    /// The peer's address.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the socket is not connected.
+    pub fn peer_addr(&self) -> io::Result<std::os::unix::net::SocketAddr> {
+        crate::sys::unix::peer_addr(&self.inner)
+    }
+}
+
+impl Stream<net::TcpStream> {
     /// The local address.
     ///
     /// # Errors
@@ -120,43 +228,39 @@ impl TcpStream {
     }
 }
 
-impl fmt::Debug for TcpStream {
+impl<S: fmt::Debug> fmt::Debug for Stream<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TcpStream")
+        f.debug_struct("Stream")
             .field("inner", &self.inner)
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(unix)]
-impl std::os::fd::AsFd for TcpStream {
+impl<S: std::os::fd::AsFd> std::os::fd::AsFd for Stream<S> {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.inner.as_fd()
     }
 }
 
-impl SharedStream for TcpStream {
+impl<S: Socket> SharedStream for Stream<S> {
     async fn read<B: IoBufMut>(&self, mut buf: B) -> BufResult<usize, B> {
         // compio writes from the start but only ever grows the length; the
         // contract is a length of exactly what was read.
         buf.clear();
-        let mut stream = &self.inner;
-        stream.read(buf).await
+        self.inner.read(buf).await
     }
 
     async fn write<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
-        let mut stream = &self.inner;
-        stream.write(buf).await
+        self.inner.write(buf).await
     }
 
     async fn write_vectored<B: IoVectoredBuf>(&self, buf: B) -> BufResult<usize, B> {
-        let mut stream = &self.inner;
-        stream.write_vectored(buf).await
+        self.inner.write_vectored(buf).await
     }
 
     async fn shutdown(&self) -> io::Result<()> {
-        let mut stream = &self.inner;
-        stream.shutdown().await
+        self.inner.shutdown().await
     }
 
     async fn send_file<F: Borrow<File> + 'static>(
@@ -174,22 +278,8 @@ impl SharedStream for TcpStream {
         }
         #[cfg(target_vendor = "apple")]
         {
-            use std::os::fd::AsRawFd;
-
-            let poll_fd = match self.inner.to_poll_fd() {
-                Ok(poll_fd) => poll_fd,
-                Err(e) => return BufResult(Err(e), file),
-            };
-            loop {
-                if let Err(e) = std::future::poll_fn(|cx| poll_fd.poll_write_ready(cx)).await {
-                    return BufResult(Err(e), file);
-                }
-                let f: &File = file.borrow();
-                match crate::sys::apple::sendfile(poll_fd.as_raw_fd(), f.as_raw_fd(), offset, len) {
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    res => return BufResult(res, file),
-                }
-            }
+            let res = self.inner.sendfile(file.borrow(), offset, len).await;
+            BufResult(res, file)
         }
         #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
         {
@@ -198,9 +288,9 @@ impl SharedStream for TcpStream {
     }
 }
 
-impl_stream!([] TcpStream);
+impl_stream!([S: Socket] Stream<S>);
 
-impl IntoPoll for TcpStream {
+impl<S: Socket> IntoPoll for Stream<S> {
     type Poll = CopyingPoll<Self>;
 
     fn into_poll(self) -> CopyingPoll<Self> {
@@ -221,7 +311,7 @@ mod splice {
     use ::compio::driver::op::{Splice, SpliceFlags};
     use compio_buf::{BufResult, IntoInner};
 
-    use super::TcpStream;
+    use super::{Socket, Stream};
 
     /// A pipe and how many bytes it holds before a writer would block.
     pub(super) struct Pipe {
@@ -262,8 +352,8 @@ mod splice {
 
     /// One round: up to a pipe's capacity from the file into the pipe, then
     /// all of it from the pipe into the socket.
-    pub(super) async fn send_file<F: Borrow<File> + 'static>(
-        stream: &TcpStream,
+    pub(super) async fn send_file<S: Socket + AsFd, F: Borrow<File> + 'static>(
+        stream: &Stream<S>,
         file: F,
         offset: u64,
         len: usize,
@@ -355,6 +445,7 @@ impl std::os::fd::AsFd for TcpListener {
 
 impl Listener for TcpListener {
     type Stream = TcpStream;
+    type Addr = SocketAddr;
 
     async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (stream, peer) = self.0.accept().await?;
@@ -363,6 +454,44 @@ impl Listener for TcpListener {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.0.local_addr()
+    }
+}
+
+/// A listening Unix-domain socket.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct UnixListener(net::UnixListener);
+
+#[cfg(unix)]
+impl UnixListener {
+    /// compio's listener.
+    #[must_use]
+    pub fn get_ref(&self) -> &net::UnixListener {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for UnixListener {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[cfg(unix)]
+impl Listener for UnixListener {
+    type Stream = UnixStream;
+    type Addr = std::os::unix::net::SocketAddr;
+
+    async fn accept(&self) -> io::Result<(UnixStream, Self::Addr)> {
+        let (stream, _) = self.0.accept().await?;
+        let stream = UnixStream::new(stream);
+        let peer = stream.peer_addr()?;
+        Ok((stream, peer))
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        crate::sys::unix::listener_addr(&self.0)
     }
 }
 

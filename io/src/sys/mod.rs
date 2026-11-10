@@ -23,6 +23,9 @@ pub(crate) mod apple;
 ))]
 pub(crate) mod control;
 
+#[cfg(all(unix, any(feature = "compio", feature = "tokio", feature = "async-io")))]
+pub(crate) mod unix;
+
 #[cfg(all(windows, any(feature = "tokio", feature = "async-io")))]
 pub(crate) mod winsock;
 

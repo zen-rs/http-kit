@@ -17,7 +17,7 @@ use std::{
     time::Instant,
 };
 
-use ::tokio::io::{AsyncRead as _, AsyncWrite as _, Interest, ReadBuf};
+use ::tokio::io::{Interest, ReadBuf};
 use socket2::SockRef;
 
 use crate::{
@@ -37,6 +37,12 @@ pub struct Tokio;
 pub type TcpStream = readiness::Stream<::tokio::net::TcpStream>;
 /// A listening TCP socket.
 pub type TcpListener = readiness::Listener<::tokio::net::TcpListener>;
+/// A connected Unix-domain stream socket.
+#[cfg(unix)]
+pub type UnixStream = readiness::Stream<::tokio::net::UnixStream>;
+/// A listening Unix-domain socket.
+#[cfg(unix)]
+pub type UnixListener = readiness::Listener<::tokio::net::UnixListener>;
 /// A UDP socket, with segmentation offload and receive coalescing on Linux.
 pub type UdpSocket = readiness::Datagram<::tokio::net::UdpSocket>;
 
@@ -49,6 +55,10 @@ impl Timer for Tokio {
 impl Io for Tokio {
     type TcpStream = TcpStream;
     type TcpListener = TcpListener;
+    #[cfg(unix)]
+    type UnixStream = UnixStream;
+    #[cfg(unix)]
+    type UnixListener = UnixListener;
     type UdpSocket = UdpSocket;
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
@@ -60,6 +70,15 @@ impl Io for Tokio {
     fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
         listener.set_nonblocking(true)?;
         ::tokio::net::TcpListener::from_std(listener).map(readiness::Listener::new)
+    }
+
+    #[cfg(unix)]
+    fn unix_listener(
+        &self,
+        listener: std::os::unix::net::UnixListener,
+    ) -> io::Result<UnixListener> {
+        listener.set_nonblocking(true)?;
+        ::tokio::net::UnixListener::from_std(listener).map(readiness::Listener::new)
     }
 
     fn udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<UdpSocket> {
@@ -94,9 +113,16 @@ macro_rules! impl_ready {
 
 impl_ready!(::tokio::net::TcpStream);
 impl_ready!(::tokio::net::UdpSocket);
+#[cfg(unix)]
+impl_ready!(::tokio::net::UnixStream);
+
+readiness::impl_tcp_family!(::tokio::net::TcpStream);
+#[cfg(unix)]
+readiness::impl_unix_family!(::tokio::net::UnixStream);
 
 impl Listener for TcpListener {
     type Stream = TcpStream;
+    type Addr = SocketAddr;
 
     async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (stream, peer) = self.get_ref().accept().await?;
@@ -108,6 +134,21 @@ impl Listener for TcpListener {
     }
 }
 
+#[cfg(unix)]
+impl Listener for UnixListener {
+    type Stream = UnixStream;
+    type Addr = std::os::unix::net::SocketAddr;
+
+    async fn accept(&self) -> io::Result<(UnixStream, Self::Addr)> {
+        let (stream, peer) = self.get_ref().accept().await?;
+        Ok((readiness::Stream::new(stream), peer.into()))
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.get_ref().local_addr().map(Into::into)
+    }
+}
+
 impl IntoPoll for TcpStream {
     type Poll = PollStream;
 
@@ -116,20 +157,29 @@ impl IntoPoll for TcpStream {
     }
 }
 
+#[cfg(unix)]
+impl IntoPoll for UnixStream {
+    type Poll = PollStream<::tokio::net::UnixStream>;
+
+    fn into_poll(self) -> Self::Poll {
+        PollStream(self.into_inner())
+    }
+}
+
 /// tokio's stream behind `futures_io`'s traits: tokio reads into the
 /// caller's buffer directly, so nothing is copied.
 #[derive(Debug)]
-pub struct PollStream(::tokio::net::TcpStream);
+pub struct PollStream<S = ::tokio::net::TcpStream>(S);
 
-impl PollStream {
+impl<S> PollStream<S> {
     /// tokio's stream.
     #[must_use]
-    pub fn into_inner(self) -> ::tokio::net::TcpStream {
+    pub fn into_inner(self) -> S {
         self.0
     }
 }
 
-impl futures_io::AsyncRead for PollStream {
+impl<S: ::tokio::io::AsyncRead + Unpin> futures_io::AsyncRead for PollStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -141,7 +191,7 @@ impl futures_io::AsyncRead for PollStream {
     }
 }
 
-impl futures_io::AsyncWrite for PollStream {
+impl<S: ::tokio::io::AsyncWrite + Unpin> futures_io::AsyncWrite for PollStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
