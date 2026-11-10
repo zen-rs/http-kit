@@ -10,14 +10,14 @@ pin_project! {
     /// Converts an `http_body::Body`'s data into `Bytes` and its errors into
     /// [`Error`]. Unlike `BodyExt::map_frame`, it keeps the inner size hint:
     /// the conversion never changes a frame's length.
-    pub(super) struct IntoBytes<B> {
+    pub(crate) struct IntoBytes<B> {
         #[pin]
         inner: B,
     }
 }
 
 impl<B> IntoBytes<B> {
-    pub(super) const fn new(inner: B) -> Self {
+    pub(crate) const fn new(inner: B) -> Self {
         Self { inner }
     }
 }

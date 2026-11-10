@@ -15,6 +15,23 @@
 //! - **Middleware system** - Extensible middleware architecture for request/response processing
 //! - **Async/await ready** - Built on top of `futures-lite` for async I/O operations
 //!
+//! # Threads
+//!
+//! Nothing here has to be `Send`. An endpoint, a middleware or a future is
+//! `Send` when its parts are, so a concrete endpoint built from `Send` parts
+//! still goes to a work-stealing executor, and one holding an `Rc` serves a
+//! thread-per-core runtime. A body erases its source, so it comes in two
+//! [flavours](flavor): [`Body`] (`Send + Sync`) and [`LocalBody`].
+//!
+//! Generic code cannot see through a trait method's future, so code that must
+//! move one across threads without knowing the concrete type bounds on
+//! [`SendEndpoint`] and [`SendMiddleware`], whose futures are `Send` by
+//! contract. The type-erased forms come in the same two flavours:
+//! [`AnyEndpoint`](endpoint::AnyEndpoint) and
+//! [`AnySendEndpoint`](endpoint::AnySendEndpoint),
+//! [`AnyMiddleware`](middleware::AnyMiddleware) and
+//! [`AnySendMiddleware`](middleware::AnySendMiddleware).
+//!
 //! # Optional Features
 //!
 //! - `json` - JSON serialization/deserialization via serde_json (enabled by default)
@@ -35,23 +52,31 @@ pub use error::{BoxHttpError, Error, HttpError, Result, ResultExt};
 mod body;
 
 pub use body::Error as BodyError;
-pub use body::{Body, BodyFrame, DataStream};
+pub use body::{Body, BodyFrame, DataStream, GenericBody, LocalBody};
 #[cfg(feature = "fs")]
 pub use body::{FileRegion, FileRegionStream};
 
+pub mod flavor;
+
 pub mod middleware;
 #[doc(inline)]
-pub use middleware::Middleware;
+pub use middleware::{Middleware, SendMiddleware};
 
 pub mod endpoint;
 #[doc(inline)]
-pub use endpoint::Endpoint;
+pub use endpoint::{Endpoint, SendEndpoint};
 
 pub mod utils;
-/// A type alias for HTTP requests with a custom `Body` type.
-pub type Request = http::Request<Body>;
-/// A type alias for HTTP responses with a custom `Body` type.
-pub type Response = http::Response<Body>;
+/// An HTTP request whose body has flavour `F`: [`Shared`](flavor::Shared)
+/// unless stated, [`Local`](flavor::Local) for [`LocalRequest`].
+pub type Request<F = flavor::Shared> = http::Request<GenericBody<F>>;
+/// An HTTP response whose body has flavour `F`: [`Shared`](flavor::Shared)
+/// unless stated, [`Local`](flavor::Local) for [`LocalResponse`].
+pub type Response<F = flavor::Shared> = http::Response<GenericBody<F>>;
+/// An HTTP request whose body may be bound to one thread.
+pub type LocalRequest = Request<flavor::Local>;
+/// An HTTP response whose body may be bound to one thread.
+pub type LocalResponse = Response<flavor::Local>;
 
 #[cfg(feature = "cookie")]
 pub use cookie;

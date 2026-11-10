@@ -32,9 +32,19 @@
 //! }
 //! ```
 //!
-//! The middleware can then be composed with endpoints using [`WithMiddleware`].
-//! Multiple middleware can be chained together using tuples like `(Middleware1, Middleware2)`.
-use crate::{endpoint::EndpointImpl, error::BoxHttpError, Endpoint, HttpError, Request, Response};
+//! The middleware can then be composed with endpoints using
+//! [`WithMiddleware`](crate::endpoint::WithMiddleware).
+//!
+//! # Threads
+//!
+//! As with [`Endpoint`], nothing here has to be `Send`. Generic code that
+//! moves a middleware's future across threads bounds on [`SendMiddleware`].
+use crate::{
+    endpoint::{EndpointImpl, SendEndpoint, SendEndpointImpl},
+    error::BoxHttpError,
+    flavor::{Flavor, Shared},
+    Endpoint, HttpError, Request, Response,
+};
 use alloc::boxed::Box;
 use core::{
     any::type_name,
@@ -56,6 +66,10 @@ use http::StatusCode;
 /// - Decide whether to call the next middleware/endpoint in the chain
 /// - Inspect and modify the outgoing response
 /// - Handle errors and implement fallback behavior
+///
+/// `F` is the [flavour](crate::flavor) of the request and response bodies:
+/// [`Shared`] unless stated. Neither the middleware nor its future has to be
+/// `Send`; see [`SendMiddleware`] for generic code that needs it.
 ///
 /// # Implementation Pattern
 ///
@@ -134,7 +148,7 @@ use http::StatusCode;
 ///     }
 /// }
 /// ```
-pub trait Middleware: Send {
+pub trait Middleware<F: Flavor = Shared> {
     /// The error type that this middleware can produce.
     type Error: HttpError;
     /// Processes a request through the middleware chain.
@@ -182,7 +196,49 @@ pub trait Middleware: Send {
     ///     }
     /// }
     /// ```
-    fn handle<E: Endpoint>(
+    fn handle<E: Endpoint<F>>(
+        &mut self,
+        request: &mut Request<F>,
+        next: E,
+    ) -> impl Future<Output = Result<Response<F>, MiddlewareError<E::Error, Self::Error>>>;
+}
+
+/// A [`Middleware`] whose future is `Send` whenever `next`'s is, for generic
+/// code that moves it across threads.
+///
+/// A concrete middleware implements it by handing `next` to its own
+/// [`Middleware::handle`] through [`SendNext`](crate::endpoint::SendNext),
+/// which makes `next`'s future the `Send` one;
+/// [`impl_send_middleware!`](crate::impl_send_middleware) writes this impl:
+///
+/// ```rust
+/// use core::future::Future;
+/// use http_kit::{endpoint::SendNext, middleware::MiddlewareError, BoxHttpError, Endpoint};
+/// use http_kit::{Middleware, Request, Response, SendEndpoint, SendMiddleware};
+///
+/// struct Logging;
+///
+/// impl Middleware for Logging {
+///     type Error = BoxHttpError;
+///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
+///         println!("{}", request.uri());
+///         next.respond(request).await.map_err(MiddlewareError::Endpoint)
+///     }
+/// }
+///
+/// impl SendMiddleware for Logging {
+///     fn handle_send<E: SendEndpoint>(
+///         &mut self,
+///         request: &mut Request,
+///         next: E,
+///     ) -> impl Future<Output = Result<Response, MiddlewareError<E::Error, Self::Error>>> + Send {
+///         self.handle(request, SendNext::new(next))
+///     }
+/// }
+/// ```
+pub trait SendMiddleware: Middleware + Send {
+    /// Processes a request like [`Middleware::handle`], with a `Send` future.
+    fn handle_send<E: SendEndpoint>(
         &mut self,
         request: &mut Request,
         next: E,
@@ -225,66 +281,112 @@ impl<N: HttpError, E: HttpError> HttpError for MiddlewareError<N, E> {
     }
 }
 
-pub(crate) trait MiddlewareImpl: Send {
-    fn handle_inner<'this, 'req, 'next, 'fut>(
-        &'this mut self,
-        request: &'req mut Request,
-        next: &'next mut dyn EndpointImpl,
-    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response, BoxHttpError>> + Send>>
-    where
-        'this: 'fut,
-        'req: 'fut,
-        'next: 'fut;
-    fn name(&self) -> &'static str {
-        type_name::<Self>()
-    }
+type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+type SendBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+trait MiddlewareImpl<F: Flavor> {
+    fn handle_inner<'a>(
+        &'a mut self,
+        request: &'a mut Request<F>,
+        next: &'a mut dyn EndpointImpl<F>,
+    ) -> LocalBoxFuture<'a, Result<Response<F>, BoxHttpError>>;
+    fn name(&self) -> &'static str;
 }
 
-impl<'a> Endpoint for &mut (dyn EndpointImpl + 'a) {
-    type Error = BoxHttpError;
-    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        self.respond_inner(request).await
-    }
-}
-
-impl<T: Middleware> MiddlewareImpl for T {
-    fn handle_inner<'this, 'req, 'next, 'fut>(
-        &'this mut self,
-        request: &'req mut Request,
-        next: &'next mut dyn EndpointImpl,
-    ) -> Pin<Box<dyn 'fut + Future<Output = Result<Response, BoxHttpError>> + Send>>
-    where
-        'this: 'fut,
-        'req: 'fut,
-        'next: 'fut,
-    {
+impl<F: Flavor, T: Middleware<F>> MiddlewareImpl<F> for T {
+    fn handle_inner<'a>(
+        &'a mut self,
+        request: &'a mut Request<F>,
+        next: &'a mut dyn EndpointImpl<F>,
+    ) -> LocalBoxFuture<'a, Result<Response<F>, BoxHttpError>> {
         Box::pin(async move {
             self.handle(request, next)
                 .await
                 .map_err(|e| Box::new(e) as BoxHttpError)
         })
     }
-}
-
-impl<M: Middleware> Middleware for &mut M {
-    type Error = M::Error;
-    async fn handle<E: Endpoint>(
-        &mut self,
-        request: &mut Request,
-        next: E,
-    ) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
-        Middleware::handle(*self, request, next).await
+    fn name(&self) -> &'static str {
+        type_name::<T>()
     }
 }
 
-impl<M: Middleware> Middleware for Box<M> {
+trait SendMiddlewareImpl: Send {
+    fn handle_local<'a>(
+        &'a mut self,
+        request: &'a mut Request,
+        next: &'a mut dyn EndpointImpl<Shared>,
+    ) -> LocalBoxFuture<'a, Result<Response, BoxHttpError>>;
+    fn handle_send<'a>(
+        &'a mut self,
+        request: &'a mut Request,
+        next: &'a mut dyn SendEndpointImpl,
+    ) -> SendBoxFuture<'a, Result<Response, BoxHttpError>>;
+    fn name(&self) -> &'static str;
+}
+
+impl<T: SendMiddleware> SendMiddlewareImpl for T {
+    fn handle_local<'a>(
+        &'a mut self,
+        request: &'a mut Request,
+        next: &'a mut dyn EndpointImpl<Shared>,
+    ) -> LocalBoxFuture<'a, Result<Response, BoxHttpError>> {
+        MiddlewareImpl::handle_inner(self, request, next)
+    }
+    fn handle_send<'a>(
+        &'a mut self,
+        request: &'a mut Request,
+        next: &'a mut dyn SendEndpointImpl,
+    ) -> SendBoxFuture<'a, Result<Response, BoxHttpError>> {
+        Box::pin(async move {
+            SendMiddleware::handle_send(self, request, next)
+                .await
+                .map_err(|e| Box::new(e) as BoxHttpError)
+        })
+    }
+    fn name(&self) -> &'static str {
+        type_name::<T>()
+    }
+}
+
+impl<F: Flavor, M: Middleware<F>> Middleware<F> for &mut M {
     type Error = M::Error;
-    async fn handle<E: Endpoint>(
+    fn handle<E: Endpoint<F>>(
+        &mut self,
+        request: &mut Request<F>,
+        next: E,
+    ) -> impl Future<Output = Result<Response<F>, MiddlewareError<E::Error, Self::Error>>> {
+        Middleware::handle(*self, request, next)
+    }
+}
+
+impl<M: SendMiddleware> SendMiddleware for &mut M {
+    fn handle_send<E: SendEndpoint>(
         &mut self,
         request: &mut Request,
         next: E,
-    ) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
-        Middleware::handle(self.deref_mut(), request, next).await
+    ) -> impl Future<Output = Result<Response, MiddlewareError<E::Error, Self::Error>>> + Send {
+        SendMiddleware::handle_send(*self, request, next)
+    }
+}
+
+impl<F: Flavor, M: Middleware<F>> Middleware<F> for Box<M> {
+    type Error = M::Error;
+    fn handle<E: Endpoint<F>>(
+        &mut self,
+        request: &mut Request<F>,
+        next: E,
+    ) -> impl Future<Output = Result<Response<F>, MiddlewareError<E::Error, Self::Error>>> {
+        Middleware::handle(self.deref_mut(), request, next)
+    }
+}
+
+impl<M: SendMiddleware> SendMiddleware for Box<M> {
+    fn handle_send<E: SendEndpoint>(
+        &mut self,
+        request: &mut Request,
+        next: E,
+    ) -> impl Future<Output = Result<Response, MiddlewareError<E::Error, Self::Error>>> + Send {
+        SendMiddleware::handle_send(self.deref_mut(), request, next)
     }
 }
 
@@ -346,15 +448,18 @@ where
 /// - Plugin systems where middleware is loaded dynamically
 /// - Configuration-driven middleware stacks
 /// - Storing middleware in collections or registries
-pub struct AnyMiddleware(Box<dyn MiddlewareImpl>);
+///
+/// It is the local flavour: the middleware may be `!Send`, and so are
+/// `AnyMiddleware` and its future. [`AnySendMiddleware`] is the `Send` one.
+pub struct AnyMiddleware<F: Flavor = Shared>(Box<dyn MiddlewareImpl<F>>);
 
-impl Debug for AnyMiddleware {
+impl<F: Flavor> Debug for AnyMiddleware<F> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_fmt(format_args!("AnyMiddleware[{}]", self.name()))
     }
 }
 
-impl AnyMiddleware {
+impl<F: Flavor> AnyMiddleware<F> {
     /// Creates a new type-erased middleware wrapper around the given middleware implementation.
     ///
     /// This method takes any type that implements `Middleware` and wraps it in an
@@ -386,7 +491,7 @@ impl AnyMiddleware {
     /// let middleware = CustomMiddleware { prefix: "API".to_string() };
     /// let any_middleware = AnyMiddleware::new(middleware);
     /// ```
-    pub fn new(middleware: impl Middleware + 'static) -> Self {
+    pub fn new(middleware: impl Middleware<F> + 'static) -> Self {
         AnyMiddleware(Box::new(middleware))
     }
 
@@ -419,7 +524,44 @@ impl AnyMiddleware {
     }
 }
 
-impl Middleware for AnyMiddleware {
+impl<F: Flavor> Middleware<F> for AnyMiddleware<F> {
+    type Error = BoxHttpError;
+    async fn handle<E: Endpoint<F>>(
+        &mut self,
+        request: &mut Request<F>,
+        mut next: E,
+    ) -> Result<Response<F>, MiddlewareError<E::Error, Self::Error>> {
+        self.0
+            .handle_inner(request, &mut next)
+            .await
+            .map_err(MiddlewareError::<E::Error, _>::Middleware)
+    }
+}
+
+/// Type-erased [`SendMiddleware`]: the `Send` flavour of [`AnyMiddleware`].
+///
+/// Both it and, given a [`SendEndpoint`] to call, its future are `Send`.
+pub struct AnySendMiddleware(Box<dyn SendMiddlewareImpl>);
+
+impl Debug for AnySendMiddleware {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!("AnySendMiddleware[{}]", self.name()))
+    }
+}
+
+impl AnySendMiddleware {
+    /// Erases `middleware`.
+    pub fn new(middleware: impl SendMiddleware + 'static) -> Self {
+        Self(Box::new(middleware))
+    }
+
+    /// Returns the type name of the underlying middleware implementation.
+    pub fn name(&self) -> &'static str {
+        self.0.name()
+    }
+}
+
+impl Middleware for AnySendMiddleware {
     type Error = BoxHttpError;
     async fn handle<E: Endpoint>(
         &mut self,
@@ -427,7 +569,20 @@ impl Middleware for AnyMiddleware {
         mut next: E,
     ) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
         self.0
-            .handle_inner(request, &mut next)
+            .handle_local(request, &mut next)
+            .await
+            .map_err(MiddlewareError::<E::Error, _>::Middleware)
+    }
+}
+
+impl SendMiddleware for AnySendMiddleware {
+    async fn handle_send<E: SendEndpoint>(
+        &mut self,
+        request: &mut Request,
+        mut next: E,
+    ) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
+        self.0
+            .handle_send(request, &mut next)
             .await
             .map_err(MiddlewareError::<E::Error, _>::Middleware)
     }
@@ -440,14 +595,26 @@ impl Middleware for AnyMiddleware {
 /// - Default values in generic contexts
 /// - Conditional middleware application
 /// - Testing scenarios where middleware is optional
-impl Middleware for () {
+impl<F: Flavor> Middleware<F> for () {
     type Error = Infallible;
-    async fn handle<E: Endpoint>(
+    async fn handle<E: Endpoint<F>>(
+        &mut self,
+        request: &mut Request<F>,
+        mut next: E,
+    ) -> Result<Response<F>, MiddlewareError<E::Error, Self::Error>> {
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::<_, Self::Error>::Endpoint)
+    }
+}
+
+impl SendMiddleware for () {
+    async fn handle_send<E: SendEndpoint>(
         &mut self,
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
-        next.respond(request)
+        next.respond_send(request)
             .await
             .map_err(MiddlewareError::<_, Self::Error>::Endpoint)
     }
