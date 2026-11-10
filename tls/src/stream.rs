@@ -73,6 +73,14 @@ impl Negotiated {
 /// [`Never`], so a connection over it cannot be in kernel mode.
 #[doc(hidden)]
 pub trait KernelRead<R, D: Side>: Sized {
+    /// Whether this is the kernel half of a socket, so the kernel may take
+    /// the connection it belongs to.
+    const SOCKET: bool;
+
+    /// Wraps a socket's reading half; reached only where [`SOCKET`](Self::SOCKET).
+    #[cfg(all(target_os = "linux", feature = "kernel"))]
+    fn adopt(reader: crate::kernel::linux::Reader<R, D>) -> Self;
+
     fn get_ref(&self) -> &R;
 
     fn read<B: IoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
@@ -109,6 +117,13 @@ pub trait KernelWrite<W, D: Side>: Sized {
 pub enum Never {}
 
 impl<R, D: Side> KernelRead<R, D> for Never {
+    const SOCKET: bool = false;
+
+    #[cfg(all(target_os = "linux", feature = "kernel"))]
+    fn adopt(_reader: crate::kernel::linux::Reader<R, D>) -> Self {
+        unreachable!("only a socket's reading half is adopted by the kernel")
+    }
+
     fn get_ref(&self) -> &R {
         match *self {}
     }
@@ -173,6 +188,21 @@ pub trait TransportWrite: Write + SendFile + Sized + 'static {
     /// kernel can encrypt for this half.
     #[doc(hidden)]
     type Kernel<D: Side>: KernelWrite<Self, D>;
+
+    /// Settles where the records of a connection whose handshake completed
+    /// are encrypted. User space, unless this is a socket's half whose
+    /// reading half is a socket's too and the kernel takes the connection.
+    #[doc(hidden)]
+    fn secure<R: TransportRead, D: Side>(
+        engine: Engine<D>,
+        reader: R,
+        writer: Self,
+        #[cfg(feature = "kernel")] kernel: Option<&crate::KernelTls>,
+    ) -> impl Future<Output = io::Result<(ReadInner<R, D>, WriteInner<Self, D>)>> {
+        #[cfg(feature = "kernel")]
+        let _ = kernel;
+        secure_in_user_space(engine, reader, writer)
+    }
 }
 
 #[cfg(not(all(target_os = "linux", feature = "kernel")))]
@@ -195,6 +225,29 @@ impl<W: Write + SendFile + http_kit_io::WriteControl + std::os::fd::AsFd + 'stat
     for W
 {
     type Kernel<D: Side> = crate::kernel::linux::Writer<W, D>;
+
+    async fn secure<R: TransportRead, D: Side>(
+        mut engine: Engine<D>,
+        mut reader: R,
+        mut writer: Self,
+        kernel: Option<&crate::KernelTls>,
+    ) -> io::Result<(ReadInner<R, D>, WriteInner<Self, D>)> {
+        use crate::kernel::linux::{self, Switched};
+
+        if let Some(kernel) = kernel.filter(|_| <R::Kernel<D> as KernelRead<R, D>>::SOCKET) {
+            match linux::switch(engine, &mut reader, &mut writer, kernel).await? {
+                Switched::Kernel(shared, carried) => {
+                    let (read, write) = linux::split(shared, carried, (reader, writer));
+                    return Ok((
+                        ReadInner::Kernel(<R::Kernel<D> as KernelRead<R, D>>::adopt(read)),
+                        WriteInner::Kernel(write),
+                    ));
+                }
+                Switched::User(returned) => engine = returned,
+            }
+        }
+        secure_in_user_space(engine, reader, writer).await
+    }
 }
 
 /// A TLS connection's halves are user-space transports: nothing below them
@@ -248,7 +301,6 @@ async fn secure_in_user_space<R: TransportRead, W: TransportWrite, D: Side>(
     Ok((ReadInner::User(read), WriteInner::User(write)))
 }
 
-#[cfg(not(all(target_os = "linux", feature = "kernel")))]
 impl<S: Split<ReadHalf: TransportRead, WriteHalf: TransportWrite> + 'static> Transport for S {
     async fn secure<D: Side>(
         engine: Engine<D>,
@@ -256,50 +308,14 @@ impl<S: Split<ReadHalf: TransportRead, WriteHalf: TransportWrite> + 'static> Tra
         writer: Self::WriteHalf,
         #[cfg(feature = "kernel")] kernel: Option<&crate::KernelTls>,
     ) -> io::Result<Secured<Self, D>> {
-        #[cfg(feature = "kernel")]
-        let _ = kernel;
-        secure_in_user_space(engine, reader, writer).await
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "kernel"))]
-impl<
-    S: Split<
-            ReadHalf: Read + std::os::fd::AsFd + 'static,
-            WriteHalf: Write + SendFile + http_kit_io::WriteControl + std::os::fd::AsFd + 'static,
-        > + 'static,
-> Transport for S
-{
-    async fn secure<D: Side>(
-        mut engine: Engine<D>,
-        mut reader: Self::ReadHalf,
-        mut writer: Self::WriteHalf,
-        kernel: Option<&crate::KernelTls>,
-    ) -> io::Result<Secured<Self, D>> {
-        use crate::kernel::linux::{self, Switched};
-
-        if let Some(kernel) = kernel {
-            match linux::switch(engine, &mut reader, &mut writer, kernel).await? {
-                Switched::Kernel(shared, carried) => {
-                    let (read, write) = linux::split(shared, carried, (reader, writer));
-                    return Ok((ReadInner::Kernel(read), WriteInner::Kernel(write)));
-                }
-                Switched::User(returned) => engine = returned,
-            }
-        }
-        secure_in_user_space(engine, reader, writer).await
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "kernel"))]
-impl<S: Transport, D: Side> Transport for TlsStream<S, D> {
-    async fn secure<E: Side>(
-        engine: Engine<E>,
-        reader: Self::ReadHalf,
-        writer: Self::WriteHalf,
-        _kernel: Option<&crate::KernelTls>,
-    ) -> io::Result<Secured<Self, E>> {
-        secure_in_user_space(engine, reader, writer).await
+        <Self::WriteHalf as TransportWrite>::secure(
+            engine,
+            reader,
+            writer,
+            #[cfg(feature = "kernel")]
+            kernel,
+        )
+        .await
     }
 }
 
