@@ -27,7 +27,7 @@ use http_kit_io::{BufResult, DatagramSocket, Timer, datagram::MAX_COALESCED_BYTE
 use quiche::h3::{self, Header, WireErrorCode};
 
 use crate::{
-    ClientConfig, Error,
+    ClientConfig, Error, TrySendError,
     body::{self, Command},
     config::H3Settings,
     conn::{Conn, Outgoing, Recv, Send, Stream, StreamRef, code},
@@ -113,9 +113,51 @@ impl Client {
     }
 }
 
+/// A request on its way to the connection.
+///
+/// One that is dropped before the connection took it (the connection ended
+/// while it waited in the queue) hands its request back to the caller that
+/// sent it: nothing of it was sent.
 struct Exchange {
-    request: Request,
-    respond: Sender<Result<Response, Error>>,
+    request: Option<Request>,
+    respond: Sender<Result<Response, TrySendError>>,
+}
+
+impl Exchange {
+    fn new(request: Request, respond: Sender<Result<Response, TrySendError>>) -> Self {
+        Self {
+            request: Some(request),
+            respond,
+        }
+    }
+
+    /// The request and where its answer goes; the connection has taken it.
+    fn take(mut self) -> (Request, Sender<Result<Response, TrySendError>>) {
+        let request = self
+            .request
+            .take()
+            .expect("an exchange holds its request until taken");
+        (request, self.respond.clone())
+    }
+
+    /// Answers with `error`, handing the request back.
+    fn refuse(mut self, error: Error) {
+        if let Some(request) = self.request.take() {
+            self.respond
+                .try_send(Err(TrySendError::unsent(error, request)))
+                .ok();
+        }
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            self.respond
+                .try_send(Err(TrySendError::unsent(Error::ConnectionClosed, request)))
+                .ok();
+        }
+    }
 }
 
 /// Sends requests on a connection.
@@ -149,12 +191,34 @@ impl SendRequest {
     /// GOAWAY has been read the handle is closed, and a request fails with
     /// [`Error::ConnectionClosed`] without being sent.
     pub async fn send(&self, request: Request) -> Result<Response, Error> {
+        self.try_send(request).await.map_err(Error::from)
+    }
+
+    /// As [`send`](Self::send), but a failure that left the request unsent
+    /// gives it back, its body unread: the handle was closed (the
+    /// connection ended, or the server's GOAWAY was read), the connection
+    /// ended or read a GOAWAY before it opened a stream for the request
+    /// (including a handshake that failed), or the server refused the
+    /// request unprocessed ([`Error::RequestRejected`]). A pool can send it
+    /// again on another connection, whatever its method or body.
+    ///
+    /// A request refused after its stream opened is given back only when its
+    /// body is known to be empty: a body that may hold data was handed to
+    /// the stream as soon as it opened, and is not recoverable.
+    ///
+    /// # Errors
+    ///
+    /// As [`send`](Self::send), with the request in the [`TrySendError`]
+    /// when it can be recovered.
+    pub async fn try_send(&self, request: Request) -> Result<Response, TrySendError> {
         let (respond, response) = async_channel::bounded(1);
-        self.exchanges
-            .send(Exchange { request, respond })
+        if let Err(refused) = self.exchanges.send(Exchange::new(request, respond)).await {
+            refused.into_inner().refuse(Error::ConnectionClosed);
+        }
+        response
+            .recv()
             .await
-            .map_err(|_| Error::ConnectionClosed)?;
-        response.recv().await.map_err(|_| Error::ConnectionClosed)?
+            .map_err(|_| TrySendError::from(Error::ConnectionClosed))?
     }
 
     /// Resolves when the connection's handshake completes: the server's
@@ -212,16 +276,18 @@ impl<S, T> fmt::Debug for Connection<S, T> {
 /// A request waiting for a stream.
 struct Queued {
     fields: Vec<Header>,
-    body: Body,
     fin: bool,
     declared: Option<u64>,
     head: bool,
-    respond: Sender<Result<Response, Error>>,
+    /// The request, until a stream took it. Dropped queued, it goes back to
+    /// the caller: nothing of it was sent.
+    request: Option<(http::request::Parts, Body)>,
+    respond: Sender<Result<Response, TrySendError>>,
 }
 
 impl Queued {
     fn new(exchange: Exchange) -> Option<Self> {
-        let Exchange { request, respond } = exchange;
+        let (request, respond) = exchange.take();
         let (parts, body) = request.into_parts();
         let len = body.len().map(|len| len as u64);
         match fields::encode_request(&parts, len) {
@@ -234,14 +300,39 @@ impl Queued {
                         .then(|| fields::declared_length(&parts.headers).or(len))
                         .flatten(),
                     head: parts.method == Method::HEAD,
-                    body,
+                    request: Some((parts, body)),
                     respond,
                 })
             }
             Err(error) => {
-                respond.try_send(Err(error)).ok();
+                respond.try_send(Err(error.into())).ok();
                 None
             }
+        }
+    }
+
+    /// Fails the request with `error`, handing it back.
+    fn refuse(mut self, error: Error) {
+        if let Some((parts, body)) = self.request.take() {
+            self.respond
+                .try_send(Err(TrySendError::unsent(
+                    error,
+                    Request::from_parts(parts, body),
+                )))
+                .ok();
+        }
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        if let Some((parts, body)) = self.request.take() {
+            self.respond
+                .try_send(Err(TrySendError::unsent(
+                    Error::ConnectionClosed,
+                    Request::from_parts(parts, body),
+                )))
+                .ok();
         }
     }
 }
@@ -358,7 +449,11 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
                 accepting = false;
                 exchanges.close();
                 for queued in waiting.drain(..) {
-                    queued.respond.try_send(Err(Error::RequestRejected)).ok();
+                    queued.refuse(Error::RequestRejected);
+                }
+                // Sent before the handle closed, and not yet taken.
+                while let Ok(exchange) = exchanges.try_recv() {
+                    exchange.refuse(Error::RequestRejected);
                 }
             }
             conn.write_unblocked();
@@ -379,11 +474,11 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
                 ready.report(Err(error.clone()));
                 conn.fail_all(&error);
                 for queued in waiting.drain(..) {
-                    queued.respond.try_send(Err(error.clone())).ok();
+                    queued.refuse(error.clone());
                 }
                 exchanges.close();
                 while let Ok(exchange) = exchanges.try_recv() {
-                    exchange.respond.try_send(Err(error.clone())).ok();
+                    exchange.refuse(error.clone());
                 }
                 return outcome;
             }
@@ -404,10 +499,21 @@ fn open_next(
     let h3 = conn.h3.as_mut()?;
     match h3.send_request(&mut conn.quic, &queued.fields, queued.fin) {
         Ok(id) => {
-            let queued = waiting.pop_front().expect("looked at above");
+            let mut queued = waiting.pop_front().expect("looked at above");
+            let (parts, body) = queued
+                .request
+                .take()
+                .expect("a queued request holds its request until a stream takes it");
             let stream = conn.stream_ref(id);
             tracing::trace!(stream = id, "request");
             let (credit, credits) = async_channel::bounded(1);
+            // A body known to be empty is never read, so it stays whole for
+            // the caller if the server rejects the stream unprocessed.
+            let (unsent, body) = if queued.fin {
+                (Some((parts, body)), None)
+            } else {
+                (None, Some(body))
+            };
             conn.streams.insert(
                 id,
                 Stream {
@@ -418,22 +524,23 @@ fn open_next(
                         Send::Body(Outgoing::new(queued.declared))
                     },
                     credit: (!queued.fin).then_some(credit),
-                    respond: Some(queued.respond),
+                    respond: Some(queued.respond.clone()),
+                    unsent,
                     head_request: queued.head,
                 },
             );
-            if queued.fin {
+            let Some(body) = body else {
                 return Some(None);
-            }
+            };
             conn.write(id);
-            Some(Some(pump(queued.body, stream, mailbox.clone(), credits)))
+            Some(Some(pump(body, stream, mailbox.clone(), credits)))
         }
         Err(h3::Error::StreamBlocked | h3::Error::TransportError(quiche::Error::StreamLimit)) => {
             None
         }
         Err(error) => {
             let queued = waiting.pop_front().expect("looked at above");
-            queued.respond.try_send(Err(error.into())).ok();
+            queued.refuse(error.into());
             Some(None)
         }
     }

@@ -1,6 +1,6 @@
 //! Error types.
 
-use std::{io, sync::Arc};
+use std::{fmt, io, sync::Arc};
 
 use http::StatusCode;
 use http_kit::BodyError;
@@ -160,5 +160,82 @@ impl From<BodyError> for Error {
 impl From<Error> for BodyError {
     fn from(error: Error) -> Self {
         Self::Other(Box::new(error))
+    }
+}
+
+/// A request that failed, and the request itself if nothing of it was sent.
+///
+/// Like hyper's and `http-kit-h1`'s `TrySendError`: when the connection had
+/// stopped taking requests, had not yet opened a stream for this one, or the
+/// server refused it unprocessed ([`Error::RequestRejected`]),
+/// [`take_request`](Self::take_request) returns the request as it was handed
+/// in, its body unread, and it can be sent on another connection whatever
+/// its method or body. A failure after the request's body began to be read
+/// leaves nothing to give back.
+pub struct TrySendError {
+    error: Error,
+    /// Boxed: a request is large, and an error is returned by value.
+    request: Option<Box<http_kit::Request>>,
+}
+
+impl TrySendError {
+    pub(crate) fn unsent(error: Error, request: http_kit::Request) -> Self {
+        Self {
+            error,
+            request: Some(Box::new(request)),
+        }
+    }
+
+    /// Why the request failed.
+    #[must_use]
+    pub const fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// Why the request failed, dropping the request.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        self.error
+    }
+
+    /// The request, if none of it was sent. It is returned once.
+    pub fn take_request(&mut self) -> Option<http_kit::Request> {
+        self.request.take().map(|request| *request)
+    }
+}
+
+impl From<Error> for TrySendError {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            request: None,
+        }
+    }
+}
+
+impl From<TrySendError> for Error {
+    fn from(error: TrySendError) -> Self {
+        error.error
+    }
+}
+
+impl fmt::Debug for TrySendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrySendError")
+            .field("error", &self.error)
+            .field("unsent", &self.request.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Display for TrySendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for TrySendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
