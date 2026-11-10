@@ -31,6 +31,15 @@
 //! all rejected and end the connection. Head size, field count and chunk
 //! line length are bounded by [`Limits`].
 //!
+//! # Timeouts
+//!
+//! Deadlines are driven by a [`Timer`](http_kit_io::Timer) handed to
+//! [`ServerConnection`] and [`handshake`] (every [`Io`](http_kit_io::Io)
+//! implementation is one). A server bounds the time to receive a request
+//! head, the idle time between keep-alive requests and each read of a
+//! request body; a client bounds its wait for `100 Continue`. The durations
+//! are fields of [`ServerConfig`] and [`ClientConfig`].
+//!
 //! # Threads
 //!
 //! No future, body or service is required to be `Send`: a connection lives
@@ -56,12 +65,12 @@
 //!     };
 //!     let server = async {
 //!         let (stream, _) = listener.accept().await?;
-//!         let connection = ServerConnection::from_stream(stream, ServerConfig::default());
+//!         let connection = ServerConnection::from_stream(stream, Compio, ServerConfig::default());
 //!         connection.serve(&service).await.map_err(std::io::Error::other)
 //!     };
 //!     let client = async {
 //!         let stream = Compio.connect(addr).await?;
-//!         let (send, connection) = handshake_stream(stream, ClientConfig::default());
+//!         let (send, connection) = handshake_stream(stream, Compio, ClientConfig::default());
 //!         let request = async move {
 //!             let mut request = Request::new(Body::empty());
 //!             *request.uri_mut() = format!("http://{addr}/hello").parse().unwrap();
@@ -95,7 +104,7 @@ use bytes::Bytes;
 pub use crate::{
     client::{ClientOutcome, Connection, SendRequest, handshake, handshake_stream},
     config::{ClientConfig, Limits, ServerConfig},
-    error::{Error, ParseError},
+    error::{Error, ParseError, Timeout},
     proto::RequestTarget,
     server::{ServerConnection, ServerOutcome, Service},
 };

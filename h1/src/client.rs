@@ -15,11 +15,11 @@ use async_channel::{Receiver, Sender};
 use bytes::BytesMut;
 use http::{Method, StatusCode};
 use http_kit::{Body, Request, Response};
-use http_kit_io::{Read, SendFile, Split, Write};
+use http_kit_io::{Read, SendFile, Split, Timer, Write};
 
 use crate::{
     ClientConfig, Error, ParseError, Upgraded, body,
-    conn::{Outbox, Pumped, Recv, pump_body, send_message, while_driving},
+    conn::{Outbox, Pumped, Recv, deadline_after, pump_body, send_message, until, while_driving},
     proto::{BodyDecoder, BodyKind, ResponseHead, encode_request_head, parse_response_head},
 };
 
@@ -47,8 +47,10 @@ impl SendRequest {
     /// body streams from the connection as it is read.
     ///
     /// A request with `Expect: 100-continue` holds its body back until the
-    /// server answers `100 Continue`; a final response before that leaves the
-    /// body unsent and closes the connection after the response.
+    /// server answers `100 Continue`, or
+    /// [`expect_continue_timeout`](ClientConfig::expect_continue_timeout)
+    /// passes and the body is sent anyway; a final response before either
+    /// leaves the body unsent and closes the connection after the response.
     ///
     /// # Errors
     ///
@@ -90,14 +92,15 @@ impl<R, W> fmt::Debug for ClientOutcome<R, W> {
 
 /// The socket side of a client connection: drive it with
 /// [`run`](Self::run).
-pub struct Connection<R, W> {
+pub struct Connection<R, W, T> {
     recv: Recv<R>,
     writer: W,
+    timer: T,
     exchanges: Receiver<Exchange>,
     config: ClientConfig,
 }
 
-impl<R, W> fmt::Debug for Connection<R, W> {
+impl<R, W, T> fmt::Debug for Connection<R, W, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection")
             .field("buffered", &self.recv.buf.len())
@@ -106,15 +109,18 @@ impl<R, W> fmt::Debug for Connection<R, W> {
     }
 }
 
-/// Starts a client connection over a socket's read and write halves.
-pub fn handshake<R, W>(
+/// Starts a client connection over a socket's read and write halves, with
+/// its deadlines (see [`ClientConfig`]) driven by `timer`.
+pub fn handshake<R, W, T>(
     reader: R,
     writer: W,
+    timer: T,
     config: ClientConfig,
-) -> (SendRequest, Connection<R, W>)
+) -> (SendRequest, Connection<R, W, T>)
 where
     R: Read,
     W: Write + SendFile,
+    T: Timer,
 {
     let (send, exchanges) = async_channel::bounded(1);
     (
@@ -122,6 +128,7 @@ where
         Connection {
             recv: Recv::new(reader, config.read_buffer_size),
             writer,
+            timer,
             exchanges,
             config,
         },
@@ -130,16 +137,18 @@ where
 
 /// Starts a client connection over a whole socket, split into halves so
 /// that request and response bodies flow at the same time.
-pub fn handshake_stream<T>(
-    stream: T,
+pub fn handshake_stream<S, T>(
+    stream: S,
+    timer: T,
     config: ClientConfig,
-) -> (SendRequest, Connection<T::ReadHalf, T::WriteHalf>)
+) -> (SendRequest, Connection<S::ReadHalf, S::WriteHalf, T>)
 where
-    T: Split,
-    T::WriteHalf: SendFile,
+    S: Split,
+    S::WriteHalf: SendFile,
+    T: Timer,
 {
     let (reader, writer) = stream.split();
-    handshake(reader, writer, config)
+    handshake(reader, writer, timer, config)
 }
 
 enum Next {
@@ -148,10 +157,11 @@ enum Next {
     Upgrade,
 }
 
-impl<R, W> Connection<R, W>
+impl<R, W, T> Connection<R, W, T>
 where
     R: Read,
     W: Write + SendFile,
+    T: Timer,
 {
     /// Answers requests until every [`SendRequest`] is dropped, the
     /// connection cannot persist, or the server switches protocols.
@@ -205,6 +215,8 @@ where
         let expect_continue = plan.expect_continue;
         let requested_upgrade = plan.upgrade;
         let limits = &self.config.limits;
+        let continue_timeout = self.config.expect_continue_timeout;
+        let timer = &self.timer;
 
         // A message once the server answered `100 Continue`; closed once a
         // final response made the body moot.
@@ -220,10 +232,13 @@ where
             outbox.push(head.freeze());
             if expect_continue {
                 outbox.flush(writer).await?;
-                if proceed.recv().await.is_err() {
+                match until(timer, deadline_after(continue_timeout), proceed.recv()).await {
+                    Some(Ok(())) => {}
                     // Withheld: the head announced a body that never follows,
                     // so the connection closes after the response.
-                    return Ok(false);
+                    Some(Err(_)) => return Ok(false),
+                    // The server stayed silent; send the body anyway.
+                    None => tracing::debug!("no 100 Continue in time, sending the body"),
                 }
             }
             send_message(writer, &mut outbox, Some(body), &mut plan.encoder).await?;
@@ -266,7 +281,7 @@ where
             let pumped = match pump {
                 None => Pumped::Complete,
                 Some((sender, decoder)) => {
-                    pump_body(recv, decoder, limits, sender, async {}).await?
+                    pump_body(recv, decoder, limits, sender, timer, None, async {}).await?
                 }
             };
             Ok(Received::Response {

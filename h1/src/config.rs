@@ -3,6 +3,8 @@
 //! Every value here is an operator setting: the defaults are a starting point
 //! sized for typical traffic, not a ceiling the crate enforces.
 
+use std::time::Duration;
+
 use crate::proto::RequestTarget;
 
 /// Limits on what a peer may send, applied to every message received.
@@ -37,6 +39,20 @@ pub struct ServerConfig {
     /// Whether a response without a `Date` field gets one (RFC 9110 §6.6.1
     /// requires it of an origin server with a clock).
     pub date_header: bool,
+    /// How long a request head may take to arrive in full, counted from its
+    /// first byte (from the start of serving, for the connection's first
+    /// request). `None` waits without bound.
+    pub header_read_timeout: Option<Duration>,
+    /// How long a keep-alive connection may sit idle, with no byte of the
+    /// next request received. At the deadline the connection closes
+    /// normally ([`ServerOutcome::Closed`](crate::ServerOutcome::Closed)).
+    /// `None` waits without bound.
+    pub keep_alive_timeout: Option<Duration>,
+    /// How long a single read of a request body may take to deliver bytes.
+    /// It bounds the socket, not the consumer: time spent waiting for the
+    /// service to ask for more data does not count. `None` waits without
+    /// bound.
+    pub body_read_timeout: Option<Duration>,
 }
 
 impl Default for ServerConfig {
@@ -45,6 +61,9 @@ impl Default for ServerConfig {
             limits: Limits::default(),
             read_buffer_size: 16 * 1024,
             date_header: true,
+            header_read_timeout: Some(Duration::from_secs(30)),
+            keep_alive_timeout: Some(Duration::from_secs(60)),
+            body_read_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -61,6 +80,10 @@ pub struct ClientConfig {
     /// proxy, [`RequestTarget::Origin`] otherwise. `CONNECT` always carries
     /// the authority.
     pub request_target: RequestTarget,
+    /// How long a request with `Expect: 100-continue` waits for the server's
+    /// `100 Continue` before sending its body anyway (RFC 9110 §10.1.1).
+    /// `None` waits until the server answers.
+    pub expect_continue_timeout: Option<Duration>,
 }
 
 impl Default for ClientConfig {
@@ -69,6 +92,7 @@ impl Default for ClientConfig {
             limits: Limits::default(),
             read_buffer_size: 16 * 1024,
             request_target: RequestTarget::Origin,
+            expect_continue_timeout: Some(Duration::from_secs(1)),
         }
     }
 }

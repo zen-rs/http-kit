@@ -9,13 +9,25 @@ use std::{
     borrow::Borrow,
     cell::{Cell, RefCell},
     fs::File,
+    future::{Future, pending},
     io,
     ops::Range,
     rc::Rc,
+    time::Instant,
 };
 
 use async_channel::{Receiver, Sender};
-use http_kit_io::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, Write};
+use http_kit_io::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, Timer, Write};
+
+/// A timer whose deadlines never pass, for tests that run no timeouts.
+#[derive(Debug, Clone, Copy)]
+pub struct NeverTimer;
+
+impl Timer for NeverTimer {
+    fn sleep_until(&self, _deadline: Instant) -> impl Future<Output = ()> {
+        pending()
+    }
+}
 
 /// Greetings in Chinese, Japanese and Korean, for bodies and fields.
 pub const CJK: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
