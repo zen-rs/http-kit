@@ -10,7 +10,8 @@ use std::{fmt, sync::Arc, time::Duration};
 use boring::{
     pkey::PKey,
     ssl::{
-        NameType, SslAlert, SslContextBuilder, SslMethod, SslRef, SslVerifyError, SslVerifyMode,
+        NameType, SelectCertError, SslAlert, SslContextBuilder, SslMethod, SslRef, SslVerifyError,
+        SslVerifyMode,
     },
     x509::{X509, X509Ref},
 };
@@ -113,6 +114,7 @@ impl Default for TransportConfig {
 pub struct Identity {
     cert_chain: Vec<u8>,
     private_key: Vec<u8>,
+    ocsp_response: Option<Vec<u8>>,
 }
 
 impl Identity {
@@ -122,7 +124,19 @@ impl Identity {
         Self {
             cert_chain: cert_chain.into(),
             private_key: private_key.into(),
+            ocsp_response: None,
         }
+    }
+
+    /// Staples `response`, a DER OCSP response for the leaf, to every
+    /// handshake whose client asks for one (`status_request`, RFC 6066 §8).
+    ///
+    /// The server sends it as given: renewing it before it expires is the
+    /// operator's work, by building a new [`ServerConfig`].
+    #[must_use]
+    pub fn with_ocsp_response(mut self, response: impl Into<Vec<u8>>) -> Self {
+        self.ocsp_response = Some(response.into());
+        self
     }
 }
 
@@ -134,6 +148,7 @@ impl fmt::Debug for Identity {
                 &format_args!("{} bytes", self.cert_chain.len()),
             )
             .field("private_key", &format_args!("<redacted>"))
+            .field("ocsp_response", &self.ocsp_response.as_ref().map(Vec::len))
             .finish()
     }
 }
@@ -176,16 +191,30 @@ impl Rejection {
     }
 }
 
-type VerifyFn = dyn Fn(&[Vec<u8>], &str) -> Result<(), Rejection> + Send + Sync;
+/// What a server presented in its handshake, as a [`Verifier`] is shown it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Presented<'a> {
+    /// The certificate chain as the server sent it, each certificate
+    /// DER-encoded and the leaf first.
+    pub chain: &'a [Vec<u8>],
+    /// The server name the client connected to.
+    pub server_name: &'a str,
+    /// The DER OCSP response the server stapled, empty when it sent none.
+    /// The client asks for one in every handshake a [`Verifier`] judges.
+    pub ocsp_response: &'a [u8],
+}
 
-/// Decides whether a server's certificate chain is acceptable: the platform
+type VerifyFn = dyn Fn(&Presented<'_>) -> Result<(), Rejection> + Send + Sync;
+
+/// Decides whether what a server presented is acceptable: the platform
 /// verifier, a revocation set, a pinned key.
 ///
-/// The function receives the chain as the server sent it, each certificate
-/// DER-encoded and the leaf first, and the server name the client connected
-/// to. Its verdict decides the handshake: `Ok` lets it go on, a
-/// [`Rejection`] fails it. Nothing else is checked, the name included:
-/// matching the leaf against the server name is the verifier's work.
+/// The function receives the [`Presented`] chain, server name and stapled
+/// OCSP response. Its verdict decides the handshake: `Ok` lets it go on, a
+/// [`Rejection`] fails it. Nothing else is checked, the name and the
+/// revocation status included: matching the leaf against the server name and
+/// reading the stapled response are the verifier's work.
 ///
 /// It runs inside the handshake on the connection's thread, so it must not
 /// block.
@@ -195,7 +224,7 @@ pub struct Verifier(Arc<VerifyFn>);
 impl Verifier {
     /// A verifier calling `verify`.
     pub fn new(
-        verify: impl Fn(&[Vec<u8>], &str) -> Result<(), Rejection> + Send + Sync + 'static,
+        verify: impl Fn(&Presented<'_>) -> Result<(), Rejection> + Send + Sync + 'static,
     ) -> Self {
         Self(Arc::new(verify))
     }
@@ -214,7 +243,12 @@ impl Verifier {
             .map(X509Ref::to_der)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE))?;
-        (self.0)(&chain, name).map_err(|rejection| SslVerifyError::Invalid(rejection.alert()))
+        let presented = Presented {
+            chain: &chain,
+            server_name: name,
+            ocsp_response: ssl.ocsp_status().unwrap_or_default(),
+        };
+        (self.0)(&presented).map_err(|rejection| SslVerifyError::Invalid(rejection.alert()))
     }
 }
 
@@ -297,6 +331,14 @@ impl ServerConfig {
         let key = PKey::private_key_from_pem(&self.identity.private_key)?;
         tls.set_private_key(&key)?;
         tls.check_private_key()?;
+        if let Some(response) = self.identity.ocsp_response.clone() {
+            tls.set_select_certificate_callback(move |mut hello| {
+                hello
+                    .ssl_mut()
+                    .set_ocsp_status(&response)
+                    .map_err(|_| SelectCertError::ERROR)
+            });
+        }
         let mut quic = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)?;
         self.transport.apply(&mut quic)?;
         quic.verify_peer(false);
@@ -374,6 +416,7 @@ impl ClientConfig {
             }
             Trust::Verifier(verifier) => {
                 let verifier = verifier.clone();
+                tls.enable_ocsp_stapling();
                 tls.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| verifier.check(ssl));
             }
         }

@@ -104,8 +104,8 @@ pub use http_kit_io;
 pub use crate::{
     client::{Client, Connection, SendRequest},
     config::{
-        ClientConfig, CongestionControl, Identity, Rejection, Roots, ServerConfig, TransportConfig,
-        Trust, Verifier,
+        ClientConfig, CongestionControl, Identity, Presented, Rejection, Roots, ServerConfig,
+        TransportConfig, Trust, Verifier,
     },
     conn::ConnectionInfo,
     error::{Error, Malformed},

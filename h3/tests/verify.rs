@@ -33,13 +33,17 @@ const UNKNOWN_CA: u64 = 48;
 const BAD_CERTIFICATE: u64 = 42;
 
 /// What the verifier was shown.
-type Seen = Arc<Mutex<Vec<(Vec<Vec<u8>>, String)>>>;
+type Seen = Arc<Mutex<Vec<(Vec<Vec<u8>>, String, Vec<u8>)>>>;
 
 /// A verifier that records what it is shown and returns `verdict`.
 fn recording(seen: &Seen, verdict: Result<(), Rejection>) -> Verifier {
     let seen = seen.clone();
-    Verifier::new(move |chain, name| {
-        seen.lock().unwrap().push((chain.to_vec(), name.to_owned()));
+    Verifier::new(move |presented| {
+        seen.lock().unwrap().push((
+            presented.chain.to_vec(),
+            presented.server_name.to_owned(),
+            presented.ocsp_response.to_vec(),
+        ));
         verdict
     })
 }
@@ -118,9 +122,10 @@ async fn allowed_chain<I: Io>(io: I) {
     ran.unwrap();
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1, "the verifier ran once");
-    let (chain, name) = &seen[0];
+    let (chain, name, ocsp) = &seen[0];
     assert_eq!(chain, &[pki.leaf.clone(), pki.ca.clone()], "leaf first");
     assert_eq!(name, "localhost");
+    assert!(ocsp.is_empty(), "nothing was stapled");
 }
 
 #[test]
@@ -182,9 +187,9 @@ async fn pinned_leaf<I: Io>(io: I) {
     let pki = pki();
     let other = support::pki();
     for (pinned, accepted) in [(pki.leaf.clone(), true), (other.leaf, false)] {
-        let verifier = Verifier::new(move |chain, name| {
-            assert_eq!(name, "localhost");
-            if chain.first() == Some(&pinned) {
+        let verifier = Verifier::new(move |presented| {
+            assert_eq!(presented.server_name, "localhost");
+            if presented.chain.first() == Some(&pinned) {
                 Ok(())
             } else {
                 Err(Rejection::BadCertificate)
@@ -218,4 +223,79 @@ fn pinned_leaf_on_compio() {
 #[test]
 fn pinned_leaf_on_tokio() {
     on_tokio(pinned_leaf);
+}
+
+const CERTIFICATE_REVOKED: u64 = 44;
+
+/// The stapled bytes: the verifier is shown them exactly as the server sent
+/// them, whatever they hold.
+fn stapled() -> Vec<u8> {
+    CJK.concat().into_bytes()
+}
+
+/// A response the server staples reaches the verifier byte for byte, and the
+/// handshake goes on when the verifier accepts it.
+async fn stapled_response<I: Io>(io: I) {
+    let mut pki = pki();
+    pki.identity = pki.identity.clone().with_ocsp_response(stapled());
+    let seen = Seen::default();
+    let config = ClientConfig::with_verifier(recording(&seen, Ok(())), MAX_FIELD_SECTION);
+    let ((), ran) = exchange(io, &pki, config, |send, port, _| async move {
+        let response = send.send(get(port)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(send);
+    })
+    .await;
+    ran.unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].2, stapled());
+}
+
+#[test]
+fn stapled_response_on_compio() {
+    on_compio(stapled_response);
+}
+
+#[test]
+fn stapled_response_on_tokio() {
+    on_tokio(stapled_response);
+}
+
+/// A verifier that reads a revoked status out of the stapled response fails
+/// the handshake with `certificate_revoked`, and nothing is sent.
+async fn revoked_status<I: Io>(io: I) {
+    let mut pki = pki();
+    let revoked = stapled();
+    pki.identity = pki.identity.clone().with_ocsp_response(revoked.clone());
+    let verifier = Verifier::new(move |presented| {
+        if presented.ocsp_response == revoked {
+            Err(Rejection::Revoked)
+        } else {
+            Ok(())
+        }
+    });
+    let config = ClientConfig::with_verifier(verifier, MAX_FIELD_SECTION);
+    let ((ready, answered), ran) = exchange(io, &pki, config, |send, _, answered| async move {
+        (send.ready().await, answered.load(Ordering::SeqCst))
+    })
+    .await;
+    let alert = Error::LocallyClosed {
+        application: false,
+        code: crypto_error(CERTIFICATE_REVOKED),
+    }
+    .to_string();
+    assert_eq!(ready.unwrap_err().to_string(), alert);
+    assert_eq!(answered, 0);
+    assert_eq!(ran.unwrap_err().to_string(), alert);
+}
+
+#[test]
+fn revoked_status_on_compio() {
+    on_compio(revoked_status);
+}
+
+#[test]
+fn revoked_status_on_tokio() {
+    on_tokio(revoked_status);
 }
