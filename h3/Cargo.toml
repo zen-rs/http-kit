@@ -34,7 +34,7 @@ fs = ["quiche", "http-kit/fs"]
 [dependencies]
 quiche = { version = "0.30.0", default-features = false, features = ["boringssl-boring-crate"], optional = true }
 boring = { version = "5.4.0", default-features = false, optional = true }
-http-kit = { version = "0.4.4", path = "..", default-features = false, features = ["std"], optional = true }
+http-kit = { version = "0.5.0", path = "..", default-features = false, features = ["std"], optional = true }
 http-kit-io = { version = "0.1.0", path = "../io", optional = true }
 http = { version = "1.5.0", default-features = false, features = ["std"], optional = true }
 bytes = { version = "1.12.1", default-features = false, features = ["std"], optional = true }
