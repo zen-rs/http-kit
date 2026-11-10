@@ -2,6 +2,9 @@
 //!
 //! Every value here is an operator setting: the defaults are a starting point
 //! sized for typical traffic, not a ceiling the crate enforces.
+//!
+//! Each struct is `#[non_exhaustive]`, so a new setting never breaks a
+//! caller: start from `default()` and assign the fields that differ.
 
 use std::time::Duration;
 
@@ -9,6 +12,7 @@ use crate::proto::RequestTarget;
 
 /// Limits on what a peer may send, applied to every message received.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Limits {
     /// The largest message head (start line and header section) and the
     /// largest trailer section, in bytes.
@@ -31,6 +35,7 @@ impl Default for Limits {
 
 /// Settings for one server connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServerConfig {
     /// Limits on received requests.
     pub limits: Limits,
@@ -70,6 +75,7 @@ impl Default for ServerConfig {
 
 /// Settings for one client connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// Limits on received responses.
     pub limits: Limits,

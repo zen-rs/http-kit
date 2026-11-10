@@ -22,13 +22,12 @@ const DEADLINE: Duration = Duration::from_millis(150);
 const SLACK: Duration = Duration::from_secs(5);
 
 fn server_config() -> ServerConfig {
-    ServerConfig {
-        date_header: false,
-        header_read_timeout: Some(Duration::from_secs(600)),
-        keep_alive_timeout: Some(Duration::from_secs(600)),
-        body_read_timeout: Some(Duration::from_secs(600)),
-        ..ServerConfig::default()
-    }
+    let mut config = ServerConfig::default();
+    config.date_header = false;
+    config.header_read_timeout = Some(Duration::from_secs(600));
+    config.keep_alive_timeout = Some(Duration::from_secs(600));
+    config.body_read_timeout = Some(Duration::from_secs(600));
+    config
 }
 
 #[track_caller]
@@ -49,10 +48,8 @@ async fn stalled_head<T: Timer>(timer: T) {
     let ends = connection();
     let (reader, writer) = ends.server;
     let (mut client_in, client_out) = ends.client;
-    let config = ServerConfig {
-        header_read_timeout: Some(DEADLINE),
-        ..server_config()
-    };
+    let mut config = server_config();
+    config.header_read_timeout = Some(DEADLINE);
     client_out.send(b"GET / HTTP/1.1\r\nHost: a\r\n");
     let started = Instant::now();
     let (outcome, wire) = zip(
@@ -80,10 +77,8 @@ async fn silent_connection<T: Timer>(timer: T) {
     let ends = connection();
     let (reader, writer) = ends.server;
     let (mut client_in, client_out) = ends.client;
-    let config = ServerConfig {
-        header_read_timeout: Some(DEADLINE),
-        ..server_config()
-    };
+    let mut config = server_config();
+    config.header_read_timeout = Some(DEADLINE);
     let started = Instant::now();
     let (outcome, wire) = zip(
         ServerConnection::new(reader, writer, timer, config).serve(&ok),
@@ -105,10 +100,8 @@ async fn idle_keep_alive<T: Timer>(timer: T) {
     let ends = connection();
     let (reader, writer) = ends.server;
     let (mut client_in, client_out) = ends.client;
-    let config = ServerConfig {
-        keep_alive_timeout: Some(DEADLINE),
-        ..server_config()
-    };
+    let mut config = server_config();
+    config.keep_alive_timeout = Some(DEADLINE);
     client_out.send(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
     let started = Instant::now();
     let (outcome, wire) = zip(
@@ -130,10 +123,8 @@ async fn stalled_second_head<T: Timer>(timer: T) {
     let ends = connection();
     let (reader, writer) = ends.server;
     let (mut client_in, client_out) = ends.client;
-    let config = ServerConfig {
-        header_read_timeout: Some(DEADLINE),
-        ..server_config()
-    };
+    let mut config = server_config();
+    config.header_read_timeout = Some(DEADLINE);
     client_out.send(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET /two HTTP/1.1\r\nHo");
     let (outcome, wire) = zip(
         ServerConnection::new(reader, writer, timer, config).serve(&ok),
@@ -156,10 +147,8 @@ async fn stalled_body<T: Timer>(timer: T) {
     let ends = connection();
     let (reader, writer) = ends.server;
     let (_client_in, client_out) = ends.client;
-    let config = ServerConfig {
-        body_read_timeout: Some(DEADLINE),
-        ..server_config()
-    };
+    let mut config = server_config();
+    config.body_read_timeout = Some(DEADLINE);
     client_out.send(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc");
     let service = |request: Request| async move {
         let body = request.into_body().into_bytes().await;
@@ -185,10 +174,8 @@ async fn unanswered_continue<T: Timer>(timer: T) {
     let ends = connection();
     let (mut server_in, server_out) = ends.server;
     let (client_in, client_out) = ends.client;
-    let config = ClientConfig {
-        expect_continue_timeout: Some(DEADLINE),
-        ..ClientConfig::default()
-    };
+    let mut config = ClientConfig::default();
+    config.expect_continue_timeout = Some(DEADLINE);
     let (send, conn) = handshake(client_in, client_out, timer, config);
     let started = Instant::now();
     let peer = async move {
@@ -220,10 +207,9 @@ async fn unanswered_continue<T: Timer>(timer: T) {
 }
 
 fn client_config() -> ClientConfig {
-    ClientConfig {
-        read_timeout: Some(DEADLINE),
-        ..ClientConfig::default()
-    }
+    let mut config = ClientConfig::default();
+    config.read_timeout = Some(DEADLINE);
+    config
 }
 
 fn get(uri: &str) -> Request {

@@ -322,10 +322,8 @@ fn accepts_chunk_extensions_with_whitespace() {
 
 #[test]
 fn bounds_chunk_lines() {
-    let limits = Limits {
-        max_chunk_line_size: 16,
-        ..Limits::default()
-    };
+    let mut limits = Limits::default();
+    limits.max_chunk_line_size = 16;
     let mut buf = BytesMut::from(&b"3;aaaaaaaaaaaaaaaaaaaaaaaaaaaa"[..]);
     let mut decoder = BodyDecoder::new(BodyKind::Chunked);
     assert_eq!(
@@ -336,11 +334,9 @@ fn bounds_chunk_lines() {
 
 #[test]
 fn bounds_head_size_and_field_count() {
-    let limits = Limits {
-        max_head_size: 64,
-        max_headers: 2,
-        ..Limits::default()
-    };
+    let mut limits = Limits::default();
+    limits.max_head_size = 64;
+    limits.max_headers = 2;
     let long = format!("GET / HTTP/1.1\r\nHost: a\r\nX: {}\r\n", "a".repeat(80));
     assert_eq!(
         parse_request_head(&mut BytesMut::from(long.as_bytes()), &limits).map(|_| ()),
@@ -355,10 +351,8 @@ fn bounds_head_size_and_field_count() {
 
 #[test]
 fn parses_more_fields_than_the_stack_holds() {
-    let limits = Limits {
-        max_headers: 300,
-        ..Limits::default()
-    };
+    let mut limits = Limits::default();
+    limits.max_headers = 300;
     let mut raw = String::from("GET / HTTP/1.1\r\nHost: a\r\n");
     for i in 0..200 {
         raw.push_str(&format!("X-{i}: v{i}\r\n"));
@@ -369,10 +363,8 @@ fn parses_more_fields_than_the_stack_holds() {
         .unwrap();
     assert_eq!(head.parts.headers.len(), 201);
     assert_eq!(head.parts.headers["x-199"], "v199");
-    let over = Limits {
-        max_headers: 150,
-        ..Limits::default()
-    };
+    let mut over = Limits::default();
+    over.max_headers = 150;
     assert_eq!(
         parse_request_head(&mut BytesMut::from(raw.as_bytes()), &over).map(|_| ()),
         Err(ParseError::TooManyHeaders { limit: 150 })
@@ -381,10 +373,8 @@ fn parses_more_fields_than_the_stack_holds() {
 
 #[test]
 fn bounds_trailer_sections() {
-    let limits = Limits {
-        max_headers: 1,
-        ..Limits::default()
-    };
+    let mut limits = Limits::default();
+    limits.max_headers = 1;
     let mut buf = BytesMut::from(&b"0\r\nA: 1\r\nB: 2\r\n\r\n"[..]);
     let mut decoder = BodyDecoder::new(BodyKind::Chunked);
     assert_eq!(
