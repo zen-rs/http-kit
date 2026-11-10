@@ -11,6 +11,7 @@
 //! # Traits
 //!
 //! - [`Read`], [`Write`], [`Split`] and [`Listener`]: stream sockets.
+//! - [`TcpOptions`]: socket options of a connected TCP stream.
 //! - [`SendFile`]: file-to-socket transfer, through `sendfile`/`splice` where
 //!   the platform has them.
 //! - `WriteControl` (Unix): a write carrying control messages, for
@@ -62,7 +63,7 @@ pub use compio_buf::{self, BufResult, IntoInner, IoBuf, IoBufMut, IoVectoredBuf,
 pub use crate::{
     datagram::{DatagramSocket, RecvMeta},
     poll::{CopyingPoll, IntoPoll},
-    stream::{Listener, Read, ReadHalf, SendFile, Split, Write, WriteHalf},
+    stream::{Listener, Read, ReadHalf, SendFile, Split, TcpOptions, Write, WriteHalf},
     time::Timer,
 };
 
@@ -77,7 +78,7 @@ pub use crate::stream::WriteControl;
 /// on a thread where the implementation's runtime is running.
 pub trait Io: Timer + Clone + 'static {
     /// A connected stream socket.
-    type TcpStream: Read + Write + SendFile + Split + IntoPoll + 'static;
+    type TcpStream: Read + Write + SendFile + Split + IntoPoll + TcpOptions + 'static;
     /// A listening stream socket.
     type TcpListener: Listener<Stream = Self::TcpStream, Addr = SocketAddr> + 'static;
     /// A connected Unix-domain stream socket.
@@ -92,6 +93,13 @@ pub trait Io: Timer + Clone + 'static {
 
     /// Opens a stream connection to `addr`.
     fn connect(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::TcpStream>>;
+
+    /// Opens a stream connection to the Unix-domain socket at `path`.
+    #[cfg(unix)]
+    fn connect_unix(
+        &self,
+        path: &std::path::Path,
+    ) -> impl Future<Output = io::Result<Self::UnixStream>>;
 
     /// Adopts a bound, listening std socket, configured however the caller
     /// needs (`SO_REUSEPORT` for one listener per thread, a backlog, ...).
