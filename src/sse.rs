@@ -19,21 +19,22 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use bytes::Bytes;
 use core::error::Error as StdError;
 use core::fmt;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use futures_lite::{Stream, StreamExt};
-use http_body::Frame;
-use http_body_util::StreamBody;
+use futures_lite::Stream;
 use pin_project_lite::pin_project;
 #[cfg(feature = "json")]
 use serde::Serialize;
 #[cfg(feature = "json")]
 use serde_json::{self, to_string};
 
-use crate::{Body, DataStream};
+use crate::{
+    body::GenericBody,
+    flavor::{Flavor, Shared},
+    DataStream,
+};
 
 /// Represents a Server-Sent Event that can be sent to clients.
 #[derive(Debug)]
@@ -213,26 +214,14 @@ impl Event {
     }
 }
 
-pub(crate) fn into_body<S, E>(stream: S) -> impl http_body::Body<Data = Bytes, Error = E> + Send
-where
-    S: Stream<Item = Result<Event, E>> + Send,
-    E: Send,
-{
-    StreamBody::new(
-        stream.map(|result| {
-            result.map(|event| Frame::data(Bytes::from(event.encode().into_bytes())))
-        }),
-    )
-}
-
 pin_project! {
     /// A stream wrapper for Server-Sent Events over an HTTP body.
     ///
     /// This struct provides a way to parse an incoming HTTP body as a stream of
     /// Server-Sent Events, allowing you to process SSE data asynchronously.
-    pub struct SseStream{
+    pub struct SseStream<F: Flavor = Shared> {
         #[pin]
-        body: DataStream,
+        body: DataStream<F>,
         buffer: Vec<u8>,
         partial_event: PartialEvent,
     }
@@ -246,12 +235,12 @@ struct PartialEvent {
     retry: Option<u64>,
 }
 
-impl SseStream {
+impl<F: Flavor> SseStream<F> {
     /// Creates a new SSE stream from an HTTP body.
     ///
     /// This function wraps the provided body in an SSE stream parser that can
     /// asynchronously parse Server-Sent Events from the body data.
-    pub fn new(body: Body) -> Self {
+    pub fn new(body: GenericBody<F>) -> Self {
         Self {
             body: body.into_data_stream(),
             buffer: Vec::new(),
@@ -283,7 +272,7 @@ impl fmt::Display for ParseError {
 
 impl StdError for ParseError {}
 
-impl Stream for SseStream {
+impl<F: Flavor> Stream for SseStream<F> {
     type Item = Result<Event, ParseError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -391,7 +380,9 @@ fn finalize_event(partial_event: &mut PartialEvent) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Body;
     use alloc::{format, vec};
+    use bytes::Bytes;
     use futures_lite::StreamExt;
 
     #[tokio::test]
