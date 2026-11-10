@@ -574,6 +574,37 @@ mod compio {
     }
 
     suite!(http_kit_io::compio::Compio, run);
+
+    /// A connection accepted by a plain std listener on one thread is adopted
+    /// by a compio runtime on another and serves both directions there.
+    #[test]
+    fn a_std_stream_accepted_elsewhere_is_adopted() {
+        use http_kit_io::{Read as _, Write as _, compio::TcpStream};
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind(super::loopback()).expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let accepted = std::thread::spawn(move || listener.accept().expect("accept").0);
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        let accepted = accepted.join().expect("accept thread");
+        let server = std::thread::spawn(move || {
+            run(async move {
+                let mut stream =
+                    TcpStream::from(::compio::net::TcpStream::from_std(accepted).expect("adopt"));
+                let http_kit_io::BufResult(read, buf) = stream.read(Vec::with_capacity(64)).await;
+                read.expect("read");
+                let http_kit_io::BufResult(written, _) = stream.write(buf).await;
+                written.expect("write back");
+            });
+        });
+        client
+            .write_all("世界 せかい 세계".as_bytes())
+            .expect("send");
+        let mut echoed = vec![0; "世界 せかい 세계".len()];
+        client.read_exact(&mut echoed).expect("echo");
+        assert_eq!(echoed, "世界 せかい 세계".as_bytes());
+        server.join().expect("server thread");
+    }
 }
 
 #[cfg(feature = "tokio")]
