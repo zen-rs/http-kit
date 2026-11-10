@@ -1626,10 +1626,14 @@ mod tests {
             second.unwrap(),
             &bytes[(total / 3) as usize..(total / 3 + total / 2) as usize]
         );
-        // The shared file's cursor was never moved.
-        let mut all = Vec::new();
-        (&*shared).read_to_end(&mut all).unwrap();
-        assert_eq!(all, bytes);
+        // The shared file's cursor was never moved. Windows' positioned read
+        // moves it, which nothing depends on: every access is by offset.
+        #[cfg(not(windows))]
+        {
+            let mut all = Vec::new();
+            (&*shared).read_to_end(&mut all).unwrap();
+            assert_eq!(all, bytes);
+        }
     }
 
     #[tokio::test]
