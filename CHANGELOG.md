@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/zen-rs/http-kit/compare/v0.5.0...v0.5.1) - 2026-11-10
+
+### Added
+
+- *(h3)* use each datagram's destination address
+- *(io)* report a datagram's destination address and send from a chosen source on Windows
+- *(h3)* validate client addresses with a stateless Retry
+- *(io)* report a datagram's destination address and send from a chosen source
+- *(h3)* HTTP/3 server and client on quiche
+
+### Fixed
+
+- *(h3)* keep driver state off the caller's stack
+
+### Other
+
+- Merge pull request #57 from zen-rs/feat/51-h3-retry
+- Merge origin/dev into feat/55-io-windows-pktinfo
+- Merge origin/dev into feat/51-h3-retry
+- run the full OS matrix on a PR labelled os:all
+- Merge origin/dev into feat/52-io-recv-dest
+- install an HTTP/3 curl for h3's interop test; depend on http-kit 0.5
+- Merge origin/dev into feat/35-http-kit-h3
+- tag the main crate v<version> and the others <dir>/v<version>
+
 ## [0.5.0](https://github.com/zen-rs/http-kit/compare/http-kit-v0.4.4...http-kit-v0.5.0) - 2026-11-10
 
 ### Added

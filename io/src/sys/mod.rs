@@ -11,3 +11,20 @@ pub(crate) mod linux;
     any(feature = "compio", feature = "tokio", feature = "async-io")
 ))]
 pub(crate) mod apple;
+
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ),
+    any(feature = "compio", feature = "tokio", feature = "async-io")
+))]
+pub(crate) mod control;
+
+#[cfg(all(windows, any(feature = "tokio", feature = "async-io")))]
+pub(crate) mod winsock;
+
+#[cfg(all(windows, feature = "compio"))]
+pub(crate) mod iocp;

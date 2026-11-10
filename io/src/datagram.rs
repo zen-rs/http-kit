@@ -8,7 +8,13 @@
 //! send per segment and every receive returns one datagram, so callers write
 //! one code path.
 
-use std::{future::Future, io, net::SocketAddr, num::NonZeroU16, ops::Range};
+use std::{
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU16,
+    ops::Range,
+};
 
 use compio_buf::{BufResult, IoBuf, IoBufMut};
 
@@ -29,25 +35,62 @@ pub trait DatagramSocket {
     /// it does not. A caller sizes its batches by this.
     fn max_send_segments(&self) -> usize;
 
-    /// Sends `buf` as one datagram to `target`.
+    /// Sends `buf` as one datagram to `target`, from `source` when it is
+    /// `Some`.
+    ///
+    /// A socket bound to a wildcard address otherwise lets the kernel pick
+    /// the source address, which for a multi-homed host need not be the one
+    /// the peer wrote to; a server replies from
+    /// [`RecvMeta::destination`]. `source` must be a local address of the
+    /// socket's family, or an IPv4 address on a dual-stack IPv6 socket.
+    ///
+    /// # Errors
+    ///
+    /// With `Some(source)`, fails with [`io::ErrorKind::Unsupported`] on
+    /// platforms where the source cannot be chosen (the ones where
+    /// [`RecvMeta::destination`] is always `None`), and with the kernel's
+    /// error if `source` is not usable.
+    fn send_from<B: IoBuf>(
+        &self,
+        buf: B,
+        target: SocketAddr,
+        source: Option<IpAddr>,
+    ) -> impl Future<Output = BufResult<usize, B>>;
+
+    /// Sends `buf` to `target` as consecutive datagrams of `segment_size`
+    /// bytes each, from `source` when it is `Some`; the last may be shorter.
+    /// Returns the bytes sent, all of `buf` on success.
+    ///
+    /// Batches of up to [`max_send_segments`](Self::max_send_segments)
+    /// segments go out in one kernel call each.
+    fn send_segments_from<B: IoBuf>(
+        &self,
+        buf: B,
+        segment_size: NonZeroU16,
+        target: SocketAddr,
+        source: Option<IpAddr>,
+    ) -> impl Future<Output = BufResult<usize, B>>;
+
+    /// Sends `buf` as one datagram to `target`, from the address the kernel
+    /// picks.
     fn send_to<B: IoBuf>(
         &self,
         buf: B,
         target: SocketAddr,
-    ) -> impl Future<Output = BufResult<usize, B>>;
+    ) -> impl Future<Output = BufResult<usize, B>> {
+        self.send_from(buf, target, None)
+    }
 
-    /// Sends `buf` to `target` as consecutive datagrams of `segment_size`
-    /// bytes each; the last may be shorter. Returns the bytes sent, all of
-    /// `buf` on success.
-    ///
-    /// Batches of up to [`max_send_segments`](Self::max_send_segments)
-    /// segments go out in one kernel call each.
+    /// [`send_segments_from`](Self::send_segments_from) from the address the
+    /// kernel picks.
     fn send_segments<B: IoBuf>(
         &self,
         buf: B,
         segment_size: NonZeroU16,
         target: SocketAddr,
-    ) -> impl Future<Output = BufResult<usize, B>>;
+    ) -> impl Future<Output = BufResult<usize, B>> {
+        self.send_segments_from(buf, segment_size, target, None)
+    }
 
     /// Receives into `buf`, starting at its beginning, and sets its length to
     /// the bytes received.
@@ -72,6 +115,7 @@ pub struct RecvMeta {
     len: usize,
     segment_size: usize,
     from: SocketAddr,
+    destination: Option<IpAddr>,
 }
 
 impl RecvMeta {
@@ -92,7 +136,15 @@ impl RecvMeta {
             len,
             segment_size,
             from,
+            destination: None,
         }
+    }
+
+    /// Records the local address the datagrams were sent to.
+    #[must_use]
+    pub fn with_destination(mut self, destination: Option<IpAddr>) -> Self {
+        self.destination = destination;
+        self
     }
 
     /// A receive of exactly one datagram.
@@ -124,6 +176,19 @@ impl RecvMeta {
     #[must_use]
     pub fn from(&self) -> SocketAddr {
         self.from
+    }
+
+    /// The local address the datagrams were sent to: the one a wildcard-bound
+    /// socket cannot learn from [`DatagramSocket::local_addr`], and the
+    /// `source` to reply from. The port is the socket's own. An IPv4-mapped
+    /// IPv6 address (IPv4 traffic on a dual-stack socket) is reported as the
+    /// IPv4 address.
+    ///
+    /// Reported on Linux, Android, Apple platforms and Windows, where the
+    /// socket asks the kernel for it when adopted. `None` on other platforms.
+    #[must_use]
+    pub fn destination(&self) -> Option<IpAddr> {
+        self.destination
     }
 
     /// The byte ranges of each datagram within the receive buffer. An empty

@@ -27,5 +27,11 @@ jobs:
         with:
           shared-key: test-${{ matrix.os }}
       - uses: taiki-e/install-action@nextest
+      # http-kit-h3's interop test needs a curl built with HTTP/3; Ubuntu's is not.
+      - name: Install an HTTP/3 curl
+        if: runner.os == 'Linux'
+        run: |
+          /home/linuxbrew/.linuxbrew/bin/brew install curl
+          echo "HTTP_KIT_H3_CURL=$(/home/linuxbrew/.linuxbrew/bin/brew --prefix curl)/bin/curl" >> "$GITHUB_ENV"
       - run: cargo nextest run --workspace --all-features
       - run: cargo test --doc --workspace --all-features

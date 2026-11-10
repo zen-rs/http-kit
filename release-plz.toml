@@ -1,10 +1,25 @@
 [workspace]
 pr_draft = false
 pr_labels = ["release"]
-git_release_name = "v{{ version }}"
 publish = true
 git_tag_enable = true
 changelog_update = true
 
+# The main crate is tagged `v<version>`; every other crate is tagged with its
+# directory, `<dir>/v<version>`, and never marked as the latest release.
 [[package]]
 name = "http-kit"
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+
+[[package]]
+name = "http-kit-io"
+git_tag_name = "io/v{{ version }}"
+git_release_name = "io/v{{ version }}"
+git_release_latest = false
+
+[[package]]
+name = "http-kit-h1"
+git_tag_name = "h1/v{{ version }}"
+git_release_name = "h1/v{{ version }}"
+git_release_latest = false
