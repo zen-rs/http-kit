@@ -248,7 +248,7 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
         let inbox = pin!(inbox);
         let mut exchanges = pin!(exchanges);
         let mut sources = Sources::new(recv, sleep, inbox);
-        let mut transmit = Transmit::new(socket.max_send_segments());
+        let mut transmit = Transmit::new(socket.max_send_segments(), conn.info.local_addr());
         let mut commands = Vec::new();
         let mut waiting: VecDeque<Queued> = VecDeque::new();
         let mut accepting = true;

@@ -13,7 +13,7 @@ use std::{
     collections::BTreeSet,
     future::{Future, poll_fn},
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     num::NonZeroU16,
     pin::Pin,
     task::{Context, Poll},
@@ -23,7 +23,7 @@ use std::{
 use async_channel::Receiver;
 use futures_lite::Stream as _;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
-use http_kit_io::{BufResult, DatagramSocket, IntoInner as _, IoBuf as _};
+use http_kit_io::{BufResult, DatagramSocket, IntoInner as _, IoBuf as _, datagram::RecvMeta};
 
 use crate::{
     body::Command,
@@ -187,13 +187,34 @@ pub(crate) fn peer_error(error: &io::Error) -> bool {
     )
 }
 
-/// A run of datagrams in the send buffer, all for one peer and all of one
-/// size but the last, so one segmented send carries them.
+/// The local address a datagram was received on: the destination the socket
+/// reported with the socket's own port, or the bound address where the
+/// platform reports none (or it is the bound address itself, which keeps
+/// the bound address's IPv6 scope).
+pub(crate) fn received_on(bound: SocketAddr, meta: &RecvMeta) -> SocketAddr {
+    match meta.destination() {
+        Some(ip) if ip != bound.ip() => SocketAddr::new(ip, bound.port()),
+        _ => bound,
+    }
+}
+
+/// The source address to send from for a path whose local address is
+/// `local`: none when that is the bound address, which the kernel uses
+/// anyway (and which a platform that cannot choose a source could not be
+/// asked for).
+fn source_of(bound: SocketAddr, local: SocketAddr) -> Option<IpAddr> {
+    (local != bound).then(|| local.ip())
+}
+
+/// A run of datagrams in the send buffer, all for one peer from one local
+/// address and all of one size but the last, so one segmented send carries
+/// them.
 struct Batch {
     len: usize,
     segment: usize,
     count: usize,
     to: SocketAddr,
+    from: SocketAddr,
 }
 
 /// Sends connections' packets: as many as quiche has, batched for
@@ -201,14 +222,32 @@ struct Batch {
 pub(crate) struct Transmit {
     buf: Vec<u8>,
     max_segments: usize,
+    bound: SocketAddr,
 }
 
 impl Transmit {
-    pub(crate) fn new(max_segments: usize) -> Self {
+    /// A sender over a socket bound to `bound`.
+    pub(crate) fn new(max_segments: usize, bound: SocketAddr) -> Self {
         Self {
             buf: Vec::new(),
             max_segments: max_segments.max(1),
+            bound,
         }
+    }
+
+    /// Sends a stateless `reply` to `to` from the address `local` it was
+    /// received on.
+    pub(crate) async fn reply<S: DatagramSocket>(
+        &self,
+        socket: &S,
+        reply: Vec<u8>,
+        to: SocketAddr,
+        local: SocketAddr,
+    ) -> io::Result<()> {
+        let BufResult(sent, _) = socket
+            .send_from(reply, to, source_of(self.bound, local))
+            .await;
+        sent.map(drop)
     }
 
     /// Sends everything `conn` has to send now.
@@ -224,13 +263,13 @@ impl Transmit {
             if self.buf.len() < start + room {
                 self.buf.resize(start + room, 0);
             }
-            let (len, to) = if let Some(held) = conn.held.take() {
+            let (len, to, from) = if let Some(held) = conn.held.take() {
                 if held.at > Instant::now() {
                     conn.held = Some(held);
                     break;
                 }
                 self.buf[start..start + held.len].copy_from_slice(&conn.held_buf[..held.len]);
-                (held.len, held.to)
+                (held.len, held.to, held.from)
             } else {
                 match conn.quic.send(&mut self.buf[start..start + room]) {
                     Ok((len, info)) => {
@@ -241,12 +280,13 @@ impl Transmit {
                                 .extend_from_slice(&self.buf[start..start + len]);
                             conn.held = Some(Held {
                                 to: info.to,
+                                from: info.from,
                                 at: info.at,
                                 len,
                             });
                             break;
                         }
-                        (len, info.to)
+                        (len, info.to, info.from)
                     }
                     Err(quiche::Error::Done) => break,
                     Err(error) => {
@@ -260,7 +300,7 @@ impl Transmit {
             };
             let joins = batch
                 .as_ref()
-                .is_some_and(|batch| batch.to == to && len <= batch.segment);
+                .is_some_and(|batch| batch.to == to && batch.from == from && len <= batch.segment);
             if !joins && let Some(full) = batch.take() {
                 // The new datagram cannot join: send the batch, then move the
                 // datagram to the front of the buffer.
@@ -272,6 +312,7 @@ impl Transmit {
                 segment: len,
                 count: 0,
                 to,
+                from,
             });
             current.len += len;
             current.count += 1;
@@ -293,7 +334,12 @@ impl Transmit {
             .expect("a QUIC packet is non-empty and fits a UDP datagram");
         let buf = std::mem::take(&mut self.buf);
         let BufResult(result, slice) = socket
-            .send_segments(buf.slice(..batch.len), segment, batch.to)
+            .send_segments_from(
+                buf.slice(..batch.len),
+                segment,
+                batch.to,
+                source_of(self.bound, batch.from),
+            )
             .await;
         self.buf = slice.into_inner();
         if let Err(error) = result {

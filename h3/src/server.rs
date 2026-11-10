@@ -37,7 +37,7 @@ use crate::{
     body::{self, Command},
     config::H3Settings,
     conn::{Conn, ConnKey, Recv, Send, Stream, StreamRef, code},
-    driver::{Sources, Timers, Transmit, peer_error},
+    driver::{Sources, Timers, Transmit, peer_error, received_on},
     fields,
     retry::{Refused, RetryConfig, Validator},
 };
@@ -228,7 +228,7 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
         let mut shutdown = pin!(shutdown);
         let mut awaiting_shutdown = true;
         let mut sources = Sources::new(recv, sleep, inbox);
-        let mut transmit = Transmit::new(socket.max_send_segments());
+        let mut transmit = Transmit::new(socket.max_send_segments(), self.local);
         let mut commands = Vec::new();
         let mut spawns = Vec::new();
         let mut replies = Vec::new();
@@ -245,8 +245,9 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
             if let Some(BufResult(received, mut buf)) = woken.received {
                 match received {
                     Ok(meta) => {
+                        let to = received_on(endpoint.local, &meta);
                         for range in meta.segments() {
-                            endpoint.datagram(&mut buf[range], meta.from(), &mut replies);
+                            endpoint.datagram(&mut buf[range], meta.from(), to, &mut replies);
                         }
                     }
                     Err(error) if peer_error(&error) => {
@@ -256,9 +257,8 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
                 }
                 sources.rearm_recv(socket.recv_from(buf));
             }
-            for (reply, to) in replies.drain(..) {
-                let BufResult(sent, _) = socket.send_to(reply, to).await;
-                if let Err(error) = sent {
+            for (reply, to, local) in replies.drain(..) {
+                if let Err(error) = transmit.reply(socket, reply, to, local).await {
                     tracing::debug!(%error, %to, "stateless reply send failed");
                 }
             }
@@ -286,6 +286,10 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
         }
     }
 }
+
+/// A stateless reply: its bytes, the peer to send them to, and the local
+/// address the datagram that provoked it was received on.
+type Reply = (Vec<u8>, SocketAddr, SocketAddr);
 
 /// A request to hand to the service.
 struct Spawn {
@@ -365,12 +369,13 @@ impl Endpoint<'_> {
         }
     }
 
-    /// Routes one received datagram.
+    /// Routes one datagram received from `from` on the local address `to`.
     fn datagram(
         &mut self,
         packet: &mut [u8],
         from: SocketAddr,
-        replies: &mut Vec<(Vec<u8>, SocketAddr)>,
+        to: SocketAddr,
+        replies: &mut Vec<Reply>,
     ) {
         let header = match quiche::Header::from_slice(packet, quiche::MAX_CONN_ID_LEN) {
             Ok(header) => header,
@@ -391,7 +396,7 @@ impl Endpoint<'_> {
                 match quiche::negotiate_version(&header.scid, &header.dcid, &mut reply) {
                     Ok(len) => {
                         reply.truncate(len);
-                        replies.push((reply, from));
+                        replies.push((reply, from, to));
                     }
                     Err(error) => tracing::debug!(%error, %from, "version negotiation failed"),
                 }
@@ -407,24 +412,19 @@ impl Endpoint<'_> {
                 tracing::trace!(%from, len = packet.len(), "Initial in a short datagram");
                 return;
             }
-            let Some(admission) = self.validate(&header, from, replies) else {
+            let Some(admission) = self.validate(&header, from, to, replies) else {
                 return;
             };
-            let Some(key) = self.accept(&header.dcid, admission, from) else {
+            let Some(key) = self.accept(&header.dcid, admission, from, to) else {
                 return;
             };
             key
         };
-        let local = self.local;
         let served = self
             .conns
             .get_mut(&key)
             .expect("every routed ID has a connection");
-        match served
-            .conn
-            .quic
-            .recv(packet, quiche::RecvInfo { from, to: local })
-        {
+        match served.conn.quic.recv(packet, quiche::RecvInfo { from, to }) {
             Ok(_) | Err(quiche::Error::Done) => {}
             Err(error) => tracing::debug!(%error, %from, "packet rejected"),
         }
@@ -444,7 +444,8 @@ impl Endpoint<'_> {
         &mut self,
         header: &quiche::Header<'_>,
         from: SocketAddr,
-        replies: &mut Vec<(Vec<u8>, SocketAddr)>,
+        to: SocketAddr,
+        replies: &mut Vec<Reply>,
     ) -> Option<Admission> {
         let Some(retry) = self.retry.as_mut() else {
             return Some(Admission::Unvalidated);
@@ -477,7 +478,7 @@ impl Endpoint<'_> {
                 ) {
                     Ok(len) => {
                         reply.truncate(len);
-                        replies.push((reply, from));
+                        replies.push((reply, from, to));
                         ServerStats::count(&self.stats.0.retries);
                         tracing::trace!(%from, "Retry");
                     }
@@ -498,12 +499,13 @@ impl Endpoint<'_> {
         dcid: &ConnectionId<'_>,
         admission: Admission,
         from: SocketAddr,
+        to: SocketAddr,
     ) -> Option<ConnKey> {
         let (scid, odcid) = match admission {
             Admission::Validated { odcid } => (dcid.clone().into_owned(), Some(odcid)),
             Admission::Unvalidated => (random_cid(), None),
         };
-        let quic = match quiche::accept(&scid, odcid.as_ref(), self.local, from, self.quic) {
+        let quic = match quiche::accept(&scid, odcid.as_ref(), to, from, self.quic) {
             Ok(quic) => Box::new(quic),
             Err(error) => {
                 tracing::debug!(%error, %from, "connection refused");
@@ -526,7 +528,7 @@ impl Endpoint<'_> {
         self.conns.insert(
             key,
             Served {
-                conn: Conn::new(key, quic, self.local, from, self.read_size),
+                conn: Conn::new(key, quic, to, from, self.read_size),
                 cids,
                 max_request: None,
                 goaway: None,
@@ -750,6 +752,7 @@ fn request(
     // follows a migration and ignores datagrams that failed to decrypt.
     if let Some(path) = conn.quic.path_stats().find(|path| path.active) {
         conn.info.set_peer(path.peer_addr);
+        conn.info.set_local(path.local_addr);
     }
     parts.extensions.insert(conn.info);
     let stream = conn.stream_ref(id);
