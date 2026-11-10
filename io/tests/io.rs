@@ -176,12 +176,17 @@ async fn udp_segments<I: Io>(io: I) {
     assert_bytes(&datagrams.concat(), &data);
 }
 
-/// A socket bound to `wildcard` receives datagrams sent to each of
-/// `destinations`, reports each one's destination, and a reply sent from that
-/// address reaches the client from it.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-async fn udp_destination<I: Io>(io: &I, wildcard: SocketAddr, destinations: &[IpAddr]) {
-    let server = io.bind_udp(wildcard).expect("bind wildcard server");
+/// The socket `server`, bound to a wildcard address, receives datagrams sent
+/// to each of `destinations`, reports each one's destination, and a reply sent
+/// from that address reaches the client from it.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+))]
+async fn udp_destination<I: Io>(io: &I, server: std::net::UdpSocket, destinations: &[IpAddr]) {
+    let server = io.udp_socket(server).expect("adopt wildcard server");
     let port = server.local_addr().expect("server address").port();
     let question = include_bytes!("io.rs")[..300].to_vec();
 
@@ -220,7 +225,12 @@ async fn udp_destination<I: Io>(io: &I, wildcard: SocketAddr, destinations: &[Ip
 }
 
 /// The loopback address of the family of `ip`.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+))]
 fn loopback_for(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
@@ -228,12 +238,28 @@ fn loopback_for(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// An IPv6 wildcard socket is dual-stack: it sees both families.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+/// An IPv6 wildcard socket that sees both families. Whether a new one does
+/// depends on the platform (Windows makes it IPv6-only), so the test asks.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+))]
 async fn udp_destination_dual_stack<I: Io>(io: I) {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .expect("create IPv6 socket");
+    socket.set_only_v6(false).expect("make it dual-stack");
+    socket
+        .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
+        .expect("bind wildcard server");
     udp_destination(
         &io,
-        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        socket.into(),
         &[Ipv6Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()],
     )
     .await;
@@ -244,7 +270,7 @@ async fn udp_destination_dual_stack<I: Io>(io: I) {
 async fn udp_destination_v4<I: Io>(io: I) {
     udp_destination(
         &io,
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind wildcard server"),
         &[
             Ipv4Addr::LOCALHOST.into(),
             Ipv4Addr::new(127, 0, 0, 2).into(),
@@ -340,7 +366,12 @@ macro_rules! suite {
             $run(super::udp_segments($io));
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            windows
+        ))]
         #[test]
         fn udp_destination_dual_stack() {
             $run(super::udp_destination_dual_stack($io));

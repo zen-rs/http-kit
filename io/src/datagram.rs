@@ -184,11 +184,8 @@ impl RecvMeta {
     /// IPv6 address (IPv4 traffic on a dual-stack socket) is reported as the
     /// IPv4 address.
     ///
-    /// Reported on Linux, Android and Apple platforms, where the socket
-    /// asks the kernel for it when adopted. `None` on other platforms,
-    /// Windows included: reporting it there takes `WSARecvMsg`, which neither
-    /// tokio's nor async-io's sockets expose, so it is not implemented there
-    /// rather than approximated.
+    /// Reported on Linux, Android, Apple platforms and Windows, where the
+    /// socket asks the kernel for it when adopted. `None` on other platforms.
     #[must_use]
     pub fn destination(&self) -> Option<IpAddr> {
         self.destination
