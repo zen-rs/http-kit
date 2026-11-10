@@ -20,7 +20,9 @@
 //! sized for receive coalescing (GRO), splits it with
 //! [`RecvMeta::segments`](http_kit_io::RecvMeta::segments), and routes each
 //! datagram to its connection by destination connection ID; an Initial
-//! packet for an unknown ID opens a connection. quiche's timers are filed in
+//! packet for an unknown ID opens a connection, after a stateless Retry has
+//! validated its source address unless
+//! [`ServerConfig::retry`] says otherwise. quiche's timers are filed in
 //! one queue, earliest first, so the endpoint sleeps on a single deadline.
 //! After each wakeup it services the connections it touched and sends their
 //! packets: consecutive equal-sized packets to one peer go out as one
@@ -89,6 +91,8 @@ mod driver;
 mod error;
 #[cfg(feature = "quiche")]
 mod fields;
+#[cfg(feature = "quiche")]
+mod retry;
 
 #[cfg(feature = "quiche")]
 pub use crate::{
@@ -96,5 +100,6 @@ pub use crate::{
     config::{ClientConfig, CongestionControl, Identity, Roots, ServerConfig, TransportConfig},
     conn::ConnectionInfo,
     error::{Error, Malformed},
-    server::{Server, Service},
+    retry::{RetryConfig, RetryWhen, TokenKey},
+    server::{Server, ServerStats, Service},
 };

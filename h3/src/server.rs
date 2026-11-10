@@ -3,7 +3,9 @@
 //! [`Server`] is an endpoint: one socket, every connection that reaches it,
 //! and every request on those connections, driven by one future on one
 //! thread. Datagrams are routed to connections by destination connection
-//! ID; an Initial packet for an unknown ID opens a connection. Each request
+//! ID; an Initial packet for an unknown ID opens a connection, once its
+//! source address is validated with a stateless Retry when
+//! [`ServerConfig::retry`] requires it. Each request
 //! runs its [`Service`] call as a task inside that future, its request body
 //! streaming from the peer while its response body streams back.
 
@@ -13,7 +15,11 @@ use std::{
     mem,
     net::SocketAddr,
     pin::pin,
-    time::Instant,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Instant, SystemTime},
 };
 
 use async_channel::{Receiver, Sender};
@@ -33,6 +39,7 @@ use crate::{
     conn::{Conn, ConnKey, Recv, Send, Stream, StreamRef, code},
     driver::{Sources, Timers, Transmit, peer_error},
     fields,
+    retry::{Refused, RetryConfig, Validator},
 };
 
 /// Answers requests.
@@ -56,6 +63,53 @@ where
     }
 }
 
+/// Counters of a [`Server`]'s connection setup, readable from any thread
+/// while it serves.
+///
+/// Every clone reads the same counters; [`Server::stats`] hands one out.
+#[derive(Debug, Clone, Default)]
+pub struct ServerStats(Arc<Counters>);
+
+#[derive(Debug, Default)]
+struct Counters {
+    accepted: AtomicU64,
+    retries: AtomicU64,
+    invalid_tokens: AtomicU64,
+    expired_tokens: AtomicU64,
+}
+
+impl ServerStats {
+    /// Connections opened.
+    #[must_use]
+    pub fn connections_accepted(&self) -> u64 {
+        self.0.accepted.load(Ordering::Relaxed)
+    }
+
+    /// Retry packets written in answer to an Initial without a token.
+    #[must_use]
+    pub fn retries_sent(&self) -> u64 {
+        self.0.retries.load(Ordering::Relaxed)
+    }
+
+    /// Initials dropped because their token was not one this server minted
+    /// for that client address and connection ID.
+    #[must_use]
+    pub fn invalid_tokens(&self) -> u64 {
+        self.0.invalid_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Initials dropped because their token was authentic but older than
+    /// [`RetryConfig::validity`](crate::RetryConfig::validity).
+    #[must_use]
+    pub fn expired_tokens(&self) -> u64 {
+        self.0.expired_tokens.load(Ordering::Relaxed)
+    }
+
+    fn count(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// An HTTP/3 server endpoint on one socket.
 pub struct Server<S, T> {
     socket: S,
@@ -64,6 +118,8 @@ pub struct Server<S, T> {
     h3: H3Settings,
     read_size: usize,
     local: SocketAddr,
+    retry: Option<RetryConfig>,
+    stats: ServerStats,
 }
 
 impl<S, T> std::fmt::Debug for Server<S, T> {
@@ -91,6 +147,8 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
             h3,
             read_size: config.read_size,
             local,
+            retry: config.retry.clone(),
+            stats: ServerStats::default(),
         })
     }
 
@@ -98,6 +156,12 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.local
+    }
+
+    /// A handle on this server's counters.
+    #[must_use]
+    pub fn stats(&self) -> ServerStats {
+        self.stats.clone()
     }
 
     /// Serves until the socket fails.
@@ -138,6 +202,11 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
             timers: Timers::default(),
             dirty: Vec::new(),
             stopping: false,
+            retry: self
+                .retry
+                .take()
+                .map(|config| Validator::new(config, Instant::now())),
+            stats: self.stats.clone(),
         };
         let socket = &self.socket;
         let timer = &self.timer;
@@ -178,7 +247,7 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
             for (reply, to) in replies.drain(..) {
                 let BufResult(sent, _) = socket.send_to(reply, to).await;
                 if let Err(error) = sent {
-                    tracing::debug!(%error, %to, "version negotiation send failed");
+                    tracing::debug!(%error, %to, "stateless reply send failed");
                 }
             }
             if woken.timer {
@@ -270,6 +339,8 @@ struct Endpoint<'c> {
     timers: Timers,
     dirty: Vec<ConnKey>,
     stopping: bool,
+    retry: Option<Validator>,
+    stats: ServerStats,
 }
 
 impl Endpoint<'_> {
@@ -324,7 +395,10 @@ impl Endpoint<'_> {
                 tracing::trace!(%from, len = packet.len(), "Initial in a short datagram");
                 return;
             }
-            let Some(key) = self.accept(&header.dcid, from) else {
+            let Some(admission) = self.validate(&header, from, replies) else {
+                return;
+            };
+            let Some(key) = self.accept(&header.dcid, admission, from) else {
                 return;
             };
             key
@@ -345,11 +419,79 @@ impl Endpoint<'_> {
         self.touch(key);
     }
 
-    fn accept(&mut self, dcid: &ConnectionId<'_>, from: SocketAddr) -> Option<ConnKey> {
-        let mut id = vec![0; quiche::MAX_CONN_ID_LEN];
-        boring::rand::rand_bytes(&mut id).expect("BoringSSL's random generator does not fail");
-        let scid = ConnectionId::from_vec(id);
-        let quic = match quiche::accept(&scid, None, self.local, from, self.quic) {
+    /// Decides whether a new connection's Initial may open one, or `None`
+    /// when it is answered with a Retry or dropped; neither allocates
+    /// connection state.
+    ///
+    /// A token that fails its check is dropped rather than answered with
+    /// `INVALID_TOKEN` (RFC 9000 §8.1.3 permits either): closing needs
+    /// Initial keys and a TLS session per packet, work a flood of forged
+    /// tokens could then make the server do, and a reply a spoofed source
+    /// could aim at a victim. An honest client with a stale token times out.
+    fn validate(
+        &mut self,
+        header: &quiche::Header<'_>,
+        from: SocketAddr,
+        replies: &mut Vec<(Vec<u8>, SocketAddr)>,
+    ) -> Option<Admission> {
+        let Some(retry) = self.retry.as_mut() else {
+            return Some(Admission::Unvalidated);
+        };
+        match header.token.as_deref() {
+            Some(token) if !token.is_empty() => {
+                match retry.check(token, from, &header.dcid, SystemTime::now()) {
+                    Ok(odcid) => Some(Admission::Validated { odcid }),
+                    Err(refused) => {
+                        tracing::debug!(%from, ?refused, "Initial with a refused token");
+                        ServerStats::count(match refused {
+                            Refused::Invalid => &self.stats.0.invalid_tokens,
+                            Refused::Expired => &self.stats.0.expired_tokens,
+                        });
+                        None
+                    }
+                }
+            }
+            _ if retry.requires(Instant::now()) => {
+                let scid = random_cid();
+                let token = retry.mint(from, &header.dcid, &scid, SystemTime::now());
+                let mut reply = vec![0; quiche::MIN_CLIENT_INITIAL_LEN];
+                match quiche::retry(
+                    &header.scid,
+                    &header.dcid,
+                    &scid,
+                    &token,
+                    header.version,
+                    &mut reply,
+                ) {
+                    Ok(len) => {
+                        reply.truncate(len);
+                        replies.push((reply, from));
+                        ServerStats::count(&self.stats.0.retries);
+                        tracing::trace!(%from, "Retry");
+                    }
+                    Err(error) => tracing::debug!(%error, %from, "Retry failed"),
+                }
+                None
+            }
+            _ => Some(Admission::Unvalidated),
+        }
+    }
+
+    /// Opens a connection for an Initial sent to `dcid`. After a Retry,
+    /// `dcid` is the Retry's source ID, minted here and authenticated by the
+    /// token, and becomes the connection's, as the client's transport
+    /// parameter check expects.
+    fn accept(
+        &mut self,
+        dcid: &ConnectionId<'_>,
+        admission: Admission,
+        from: SocketAddr,
+    ) -> Option<ConnKey> {
+        let (scid, odcid) = match admission {
+            Admission::Validated { odcid } => (dcid.clone().into_owned(), Some(odcid)),
+            Admission::Unvalidated => (random_cid(), None),
+        };
+        let quic = match quiche::accept(&scid, odcid.as_ref(), self.local, from, self.quic) {
             Ok(quic) => quic,
             Err(error) => {
                 tracing::debug!(%error, %from, "connection refused");
@@ -358,15 +500,22 @@ impl Endpoint<'_> {
         };
         let key = self.next_key;
         self.next_key += 1;
-        tracing::debug!(%from, key, "new connection");
-        let odcid = dcid.clone().into_owned();
-        self.cids.insert(scid.clone(), key);
-        self.cids.insert(odcid.clone(), key);
+        ServerStats::count(&self.stats.0.accepted);
+        tracing::debug!(%from, key, validated = odcid.is_some(), "new connection");
+        // Until it switches to the server's ID, the client keeps sending to
+        // the ID it chose; after a Retry, that is the Retry's, now `scid`.
+        let mut cids = vec![scid.clone()];
+        if odcid.is_none() {
+            cids.push(dcid.clone().into_owned());
+        }
+        for cid in &cids {
+            self.cids.insert(cid.clone(), key);
+        }
         self.conns.insert(
             key,
             Served {
                 conn: Conn::new(key, quic, self.local, from, self.read_size),
-                cids: vec![scid, odcid],
+                cids,
                 max_request: None,
                 goaway: None,
             },
@@ -496,6 +645,21 @@ impl Endpoint<'_> {
         }
         served.conn.fail_all(&Error::ConnectionClosed);
     }
+}
+
+/// How a new connection's Initial was admitted.
+enum Admission {
+    /// No validation was required.
+    Unvalidated,
+    /// It echoed a valid token naming the client's original destination ID.
+    Validated { odcid: ConnectionId<'static> },
+}
+
+/// A fresh server connection ID, as long as QUIC allows.
+fn random_cid() -> ConnectionId<'static> {
+    let mut id = vec![0; quiche::MAX_CONN_ID_LEN];
+    boring::rand::rand_bytes(&mut id).expect("BoringSSL's random generator does not fail");
+    ConnectionId::from_vec(id)
 }
 
 /// Sends a connection its GOAWAY, or closes one that has not reached
