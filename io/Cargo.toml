@@ -33,7 +33,7 @@ socket2 = { version = "0.6.5", default-features = false, optional = true }
 libc = { version = "0.2.191", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Networking_WinSock", "Win32_System_IO"], optional = true }
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"], optional = true }
 
 [dev-dependencies]
 socket2 = { version = "0.6.5", default-features = false }
