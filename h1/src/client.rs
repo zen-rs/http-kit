@@ -197,15 +197,20 @@ where
         let Exchange { request, respond } = exchange;
         let (parts, body) = request.into_parts();
         let mut head = BytesMut::with_capacity(256);
-        let mut plan =
-            match encode_request_head(&parts, body.len().map(|len| len as u64), &mut head) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    // Nothing was written: the connection is still usable.
-                    respond.send(Err(error)).await.ok();
-                    return Ok(Next::KeepAlive);
-                }
-            };
+        let encoded = encode_request_head(
+            &parts,
+            self.config.request_target,
+            body.len().map(|len| len as u64),
+            &mut head,
+        );
+        let mut plan = match encoded {
+            Ok(plan) => plan,
+            Err(error) => {
+                // Nothing was written: the connection is still usable.
+                respond.send(Err(error)).await.ok();
+                return Ok(Next::KeepAlive);
+            }
+        };
         let method = parts.method;
         let expect_continue = plan.expect_continue;
         let requested_upgrade = plan.upgrade;

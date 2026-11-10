@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use crate::proto::RequestTarget;
+
 /// Limits on what a peer may send, applied to every message received.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
@@ -73,6 +75,11 @@ pub struct ClientConfig {
     pub limits: Limits,
     /// How many bytes of room each read asks the socket to fill.
     pub read_buffer_size: usize,
+    /// The form of the request target every request on the connection
+    /// carries: [`RequestTarget::Absolute`] on a connection to a forward
+    /// proxy, [`RequestTarget::Origin`] otherwise. `CONNECT` always carries
+    /// the authority.
+    pub request_target: RequestTarget,
     /// How long a request with `Expect: 100-continue` waits for the server's
     /// `100 Continue` before sending its body anyway (RFC 9110 §10.1.1).
     /// `None` waits until the server answers.
@@ -84,6 +91,7 @@ impl Default for ClientConfig {
         Self {
             limits: Limits::default(),
             read_buffer_size: 16 * 1024,
+            request_target: RequestTarget::Origin,
             expect_continue_timeout: Some(Duration::from_secs(1)),
         }
     }

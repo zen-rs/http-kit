@@ -156,6 +156,10 @@ pub enum Error {
     /// An outgoing request has neither a `Host` field nor an authority.
     #[error("request has neither a Host field nor an authority")]
     MissingHost,
+    /// An absolute-form request target was asked for, but the request's URI
+    /// lacks a scheme or an authority.
+    #[error("absolute-form request target needs a URI with scheme and authority")]
+    AbsoluteTargetIncomplete,
     /// A response is informational; only final responses can be sent.
     #[error("{0} is not a final response")]
     InformationalResponse(StatusCode),
