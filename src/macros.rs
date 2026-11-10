@@ -96,6 +96,105 @@ macro_rules! http_error {
     };
 }
 
+/// Implements [`SendEndpoint`](crate::SendEndpoint) for concrete endpoint
+/// types by forwarding to their [`Endpoint`](crate::Endpoint) implementation.
+///
+/// It compiles only where the type's `respond` future is `Send`, which the
+/// compiler checks for each named type. A generic type writes the impl by
+/// hand, calling `respond_send` on its generic parts.
+///
+/// # Examples
+///
+/// ```rust
+/// use http_kit::{impl_send_endpoint, Body, BoxHttpError, Endpoint, Request, Response};
+///
+/// struct Hello;
+///
+/// impl Endpoint for Hello {
+///     type Error = BoxHttpError;
+///     async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
+///         Ok(Response::new(Body::from_bytes("Hello")))
+///     }
+/// }
+///
+/// impl_send_endpoint!(Hello);
+/// ```
+#[macro_export]
+macro_rules! impl_send_endpoint {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl $crate::SendEndpoint for $ty {
+                fn respond_send(
+                    &mut self,
+                    request: &mut $crate::Request,
+                ) -> impl ::core::future::Future<
+                    Output = ::core::result::Result<
+                        $crate::Response,
+                        <Self as $crate::Endpoint>::Error,
+                    >,
+                > + ::core::marker::Send {
+                    $crate::Endpoint::respond(self, request)
+                }
+            }
+        )+
+    };
+}
+
+/// Implements [`SendMiddleware`](crate::SendMiddleware) for concrete
+/// middleware types by forwarding to their
+/// [`Middleware`](crate::Middleware) implementation, with `next` passed
+/// through [`SendNext`](crate::endpoint::SendNext).
+///
+/// It compiles only where the type's `handle` future is `Send` given a `Send`
+/// `next`, which the compiler checks for each named type.
+///
+/// # Examples
+///
+/// ```rust
+/// use http_kit::{impl_send_middleware, middleware::MiddlewareError, BoxHttpError};
+/// use http_kit::{Endpoint, Middleware, Request, Response};
+///
+/// struct Logging;
+///
+/// impl Middleware for Logging {
+///     type Error = BoxHttpError;
+///     async fn handle<E: Endpoint>(&mut self, request: &mut Request, mut next: E) -> Result<Response, MiddlewareError<E::Error, Self::Error>> {
+///         println!("{}", request.uri());
+///         next.respond(request).await.map_err(MiddlewareError::Endpoint)
+///     }
+/// }
+///
+/// impl_send_middleware!(Logging);
+/// ```
+#[macro_export]
+macro_rules! impl_send_middleware {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl $crate::SendMiddleware for $ty {
+                fn handle_send<E: $crate::SendEndpoint>(
+                    &mut self,
+                    request: &mut $crate::Request,
+                    next: E,
+                ) -> impl ::core::future::Future<
+                    Output = ::core::result::Result<
+                        $crate::Response,
+                        $crate::middleware::MiddlewareError<
+                            <E as $crate::Endpoint>::Error,
+                            <Self as $crate::Middleware>::Error,
+                        >,
+                    >,
+                > + ::core::marker::Send {
+                    $crate::Middleware::handle(
+                        self,
+                        request,
+                        $crate::endpoint::SendNext::new(next),
+                    )
+                }
+            }
+        )+
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{HttpError, StatusCode};

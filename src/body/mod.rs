@@ -5,12 +5,26 @@
 //!
 //! # Body Representation
 //!
-//! The body can hold data in different forms:
+//! A body is a stream of [`BodyFrame`]s: data, trailers and, with the `fs`
+//! feature, regions of files. It can hold:
 //!
-//! - **Bytes**: For simple in-memory bodies that fit entirely in memory
-//! - **AsyncReader**: For streaming from files or other async sources
-//! - **Stream**: For general async streaming data with backpressure support
-//! - **Frozen**: For consumed bodies that can no longer provide data
+//! - **Bytes**: an in-memory body that fits entirely in memory
+//! - **A file region**: part of an owned file, which a server can hand to the
+//!   kernel (sendfile, splice) instead of copying it through user space
+//! - **A frame stream**: any async source of frames, with backpressure
+//! - **Frozen**: a consumed body that can no longer provide data
+//!
+//! A consumer that needs bytes reads file regions explicitly, through
+//! [`Body::into_data_stream`] or [`FileRegion::into_stream`]. The
+//! `http_body::Body` implementation reads them out too, since that trait has
+//! no frame for a file.
+//!
+//! # Flavours
+//!
+//! A body erases its source, so whether it may cross threads is fixed by its
+//! [flavour](crate::flavor): [`Body`] is [`GenericBody<Shared>`], whose
+//! sources are `Send + Sync`, and [`LocalBody`] is [`GenericBody<Local>`],
+//! whose sources need not be. A `Body` converts into a `LocalBody` for free.
 //!
 //! # Format Support
 //!
@@ -18,7 +32,7 @@
 //!
 //! - **JSON** (with `json` feature): Serialize/deserialize to/from JSON
 //! - **URL-encoded forms** (with `form` feature): Handle form data
-//! - **Files** (with `fs` feature): Stream file contents with MIME detection
+//! - **Files** (with `fs` feature): File-region bodies with MIME detection
 //! - **Raw bytes**: Direct byte manipulation and string conversion
 //!
 //! # Examples
@@ -62,38 +76,25 @@
 /// # }
 /// ```
 //
-// ## File Streaming
-//
-// ```rust,no_run
-// # #[cfg(feature = "fs")]
-// # {
-// use http_kit::Body;
-//
-// // Stream file contents
-// let body = Body::from_file("large_file.dat").await?;
-// # }
-// # Ok::<(), std::io::Error>(())
-// ```
 mod convert;
 mod error_type;
-mod into_bytes;
-#[cfg(feature = "std")]
-mod utils;
+mod frame;
+pub(crate) mod into_bytes;
+use crate::flavor::{Flavor, Holds, Local, Shared};
 use crate::sse::{Event, SseStream};
 pub use error_type::Error;
+pub use frame::BodyFrame;
+#[cfg(feature = "fs")]
+pub use frame::{FileRegion, FileRegionStream};
 #[cfg(feature = "std")]
 extern crate std;
 use futures_lite::{ready, Stream, StreamExt};
 use http_body::Frame;
-use http_body_util::{BodyExt, StreamBody};
 use mime::Mime;
 
-#[cfg(feature = "std")]
-use self::utils::IntoAsyncRead;
 use bytestr::ByteStr;
 
 use bytes::Bytes;
-use futures_lite::{AsyncBufRead, AsyncBufReadExt};
 
 use alloc::{boxed::Box, vec::Vec};
 use core::fmt::Debug;
@@ -101,25 +102,32 @@ use core::mem::{replace, swap, take};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-// A boxed bufreader object.
-type BoxBufReader = Pin<Box<dyn AsyncBufRead + Send + Sync + 'static>>;
-
-type BoxHttpBody =
-    Pin<Box<dyn http_body::Body<Data = Bytes, Error = Error> + Send + Sync + 'static>>;
-
 pub use http_body::Body as HttpBody;
+
+/// A body whose sources are `Send + Sync`, so it may cross threads.
+pub type Body = GenericBody<Shared>;
+
+/// A body whose sources may be bound to one thread, such as an `Rc` or a
+/// socket that a thread-per-core runtime owns.
+pub type LocalBody = GenericBody<Local>;
 
 /// Flexible HTTP body that can represent data in various forms.
 ///
-/// `Body` is the core type for representing HTTP request and response bodies.
+/// `GenericBody` is the core type for representing HTTP request and response
+/// bodies, written through its two flavours: [`Body`] and [`LocalBody`].
 /// It can efficiently handle different data sources:
 ///
 /// - **In-memory data**: Bytes, strings, vectors
-/// - **Streaming data**: Files, network streams, async readers
+/// - **Streaming data**: network streams and any other source of [`BodyFrame`]s
+/// - **File regions** (with the `fs` feature): part of an owned file
 /// - **Structured data**: JSON, form data (with appropriate features)
 ///
 /// The body automatically manages the underlying representation and provides
 /// zero-copy conversions where possible.
+///
+/// As a [`Stream`] it yields [`BodyFrame`]s, file regions included; as an
+/// `http_body::Body` it yields data and trailers, with each file region read
+/// out into data frames.
 ///
 /// # Examples
 ///
@@ -137,12 +145,12 @@ pub use http_body::Body as HttpBody;
 ///     println!("Body is empty");
 /// }
 /// ```
-pub struct Body {
+pub struct GenericBody<F: Flavor> {
     mime: Option<Mime>,
-    inner: BodyInner,
+    inner: BodyInner<F>,
 }
 
-impl Debug for Body {
+impl<F: Flavor> Debug for GenericBody<F> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Body")
     }
@@ -153,23 +161,47 @@ impl_error!(
     "Body was frozen,it may have been consumed by `take()`"
 );
 
-enum BodyInner {
+enum BodyInner<F: Flavor> {
     Once(Bytes),
-    Reader {
-        reader: BoxBufReader,
-        length: Option<usize>,
-    },
-    HttpBody(BoxHttpBody),
+    /// A body that is one file region.
+    #[cfg(feature = "fs")]
+    File(FileRegion),
+    /// A one-region body being read out at the `http_body::Body` boundary.
+    #[cfg(feature = "fs")]
+    Reading(FileRegionStream),
+    Frames(Frames<F>),
+    HttpBody(Pin<Box<F::HttpBody>>),
     Freeze,
 }
 
-impl Default for BodyInner {
+/// A frame stream, with the region it yielded last when that region is being
+/// read out at the `http_body::Body` boundary.
+struct Frames<F: Flavor> {
+    stream: Pin<Box<F::Frames>>,
+    // Boxed so a frame-stream body is no larger than an in-memory one: every
+    // request and response carries a `Body`, and only a read-out region uses it.
+    #[cfg(feature = "fs")]
+    reading: Option<Box<FileRegionStream>>,
+}
+
+/// Converts an `http_body` frame, which is either data or trailers.
+fn from_http_frame(frame: Frame<Bytes>) -> BodyFrame {
+    match frame.into_data() {
+        Ok(data) => BodyFrame::Data(data),
+        Err(frame) => match frame.into_trailers() {
+            Ok(trailers) => BodyFrame::Trailers(trailers),
+            Err(_) => unreachable!("an http_body frame is either data or trailers"),
+        },
+    }
+}
+
+impl<F: Flavor> Default for BodyInner<F> {
     fn default() -> Self {
         Self::Once(Bytes::new())
     }
 }
 
-impl Body {
+impl<F: Flavor> GenericBody<F> {
     /// Creates a new empty body.
     ///
     /// This creates a body with zero bytes that can be used as a placeholder
@@ -212,13 +244,14 @@ impl Body {
     /// ```
     pub fn new<B>(body: B) -> Self
     where
-        B: Send + Sync + http_body::Body + 'static,
+        B: http_body::Body + 'static,
         B::Data: Into<Bytes>,
         B::Error: Into<Error>,
+        F: Holds<B>,
     {
         Self {
             mime: None,
-            inner: BodyInner::HttpBody(Box::pin(into_bytes::IntoBytes::new(body))),
+            inner: BodyInner::HttpBody(F::http_body(body)),
         }
     }
 
@@ -245,49 +278,82 @@ impl Body {
         }
     }
 
-    /// Creates a body from an async buffered reader.
+    /// Creates a body from an async stream of frames.
     ///
-    /// This method allows streaming data from any source that implements
-    /// `AsyncBufRead`, such as files, network connections, or in-memory buffers.
-    /// The optional length hint can improve performance for operations that
-    /// benefit from knowing the total size.
+    /// This is the general constructor: the stream may mix data, trailers and
+    /// (with the `fs` feature) file regions in any order. Its length is not
+    /// known up front, so [`len`](Self::len) returns `None`.
     ///
     /// You are responsible for setting the MIME type of the body.
     ///
-    /// # Arguments
+    /// # Examples
     ///
-    /// * `reader` - Any type implementing `AsyncBufRead + Send + 'static`
-    /// * `length` - Optional hint about the total number of bytes to read
+    /// ```rust
+    /// use http_kit::{Body, BodyFrame};
+    /// use http_kit::header::{HeaderMap, HeaderValue};
+    /// use bytes::Bytes;
+    /// use futures_lite::stream;
+    ///
+    /// let mut trailers = HeaderMap::new();
+    /// trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    /// let body = Body::from_frames(stream::iter([
+    ///     Ok::<_, std::io::Error>(BodyFrame::Data(Bytes::from_static(b"payload"))),
+    ///     Ok(BodyFrame::Trailers(trailers)),
+    /// ]));
+    /// ```
+    pub fn from_frames<E, S>(stream: S) -> Self
+    where
+        E: Into<Error> + 'static,
+        S: Stream<Item = Result<BodyFrame, E>> + 'static,
+        F: Holds<S>,
+    {
+        Self::from_mapped_frames(stream, |result| result)
+    }
+
+    fn from_mapped_frames<I: 'static, E: Into<Error> + 'static, S>(
+        stream: S,
+        map: fn(I) -> Result<BodyFrame, E>,
+    ) -> Self
+    where
+        S: Stream<Item = I> + 'static,
+        F: Holds<S>,
+    {
+        Self {
+            mime: None,
+            inner: BodyInner::Frames(Frames {
+                stream: F::frames(stream, map),
+                #[cfg(feature = "fs")]
+                reading: None,
+            }),
+        }
+    }
+
+    /// Creates a body that is one region of a file.
+    ///
+    /// The body's length is the region's, so a server can announce it as
+    /// `Content-Length` and send the region with sendfile or splice.
+    ///
+    /// You are responsible for setting the MIME type of the body.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # #[cfg(feature = "fs")]
-    /// # {
-    /// use http_kit::Body;
-    /// use async_fs::File;
-    /// use futures_lite::io::BufReader;
+    /// use http_kit::{Body, FileRegion};
     ///
-    /// # async fn example() -> Result<(), http_kit::BodyError> {
-    /// let file = File::open("data.txt").await?;
-    /// let metadata = file.metadata().await?;
-    /// let reader = BufReader::new(file);
-    ///
-    /// let body = Body::from_reader(reader, metadata.len() as usize);
+    /// # fn example() -> std::io::Result<()> {
+    /// let file = std::fs::File::open("video.mp4")?;
+    /// // Bytes 1024..2048 of the file, for a range request.
+    /// let body = Body::from_file_region(FileRegion::new(file, 1024, 1024));
+    /// assert_eq!(body.len(), Some(1024));
     /// # Ok(())
     /// # }
-    /// # }
     /// ```
-    pub fn from_reader(
-        reader: impl AsyncBufRead + Send + Sync + 'static,
-        length: impl Into<Option<usize>>,
-    ) -> Self {
+    #[cfg(feature = "fs")]
+    #[must_use]
+    pub const fn from_file_region(region: FileRegion) -> Self {
         Self {
             mime: None,
-            inner: BodyInner::Reader {
-                reader: Box::pin(reader),
-                length: length.into(),
-            },
+            inner: BodyInner::File(region),
         }
     }
 
@@ -322,18 +388,14 @@ impl Body {
     /// ```
     pub fn from_stream<T, E, S>(stream: S) -> Self
     where
-        T: Into<Bytes> + Send + 'static,
-        E: Into<Error>,
-        S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
+        T: Into<Bytes> + 'static,
+        E: Into<Error> + 'static,
+        S: Stream<Item = Result<T, E>> + 'static,
+        F: Holds<S>,
     {
-        Self {
-            mime: None,
-            inner: BodyInner::HttpBody(Box::pin(StreamBody::new(stream.map(|result| {
-                result
-                    .map(|data| Frame::data(data.into()))
-                    .map_err(|error| error.into())
-            })))),
-        }
+        Self::from_mapped_frames(stream, |result: Result<T, E>| {
+            result.map(|data| BodyFrame::Data(data.into()))
+        })
     }
     /// Creates a body from bytes or byte-like data.
     ///
@@ -392,11 +454,12 @@ impl Body {
         }
     }
 
-    /// Creates a body by streaming the contents of a file.
+    /// Creates a body that is the whole of a file.
     ///
-    /// This method opens a file and creates a streaming body that reads
-    /// the file contents on demand. The file size is determined automatically
-    /// and used as a length hint for optimization.
+    /// This method opens the file and builds a one-region body covering it
+    /// (see [`from_file_region`](Self::from_file_region)), with the MIME type
+    /// guessed from the extension. Opening the file and reading its metadata
+    /// run on the [`blocking`] thread pool, so this works on any executor.
     ///
     /// # Arguments
     ///
@@ -421,23 +484,23 @@ impl Body {
     /// # }
     /// # }
     /// ```
-    #[cfg(all(feature = "fs", feature = "std"))]
+    #[cfg(feature = "fs")]
     pub async fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
         let path = path.as_ref();
-        let file = async_fs::File::open(path).await?;
-        let len = file.metadata().await?.len() as usize;
-        let mime = if let Some(ext) = path.extension() {
-            if let Some(ext_str) = ext.to_str() {
-                Self::guess(ext_str.as_bytes()).and_then(|m| m.parse().ok())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let mime = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(|ext| mime_guess::from_ext(ext).first());
+        let owned = path.to_path_buf();
+        let (file, len) = blocking::unblock(move || {
+            let file = std::fs::File::open(owned)?;
+            let len = file.metadata()?.len();
+            Ok::<_, std::io::Error>((file, len))
+        })
+        .await?;
         Ok(Self {
             mime,
-            ..Self::from_reader(futures_lite::io::BufReader::new(file), len)
+            ..Self::from_file_region(FileRegion::new(file, 0, len))
         })
     }
 
@@ -486,12 +549,6 @@ impl Body {
             mime: Some(mime::APPLICATION_JSON),
             ..Self::from_bytes(serde_json::to_string(&value)?)
         })
-    }
-
-    #[cfg(feature = "fs")]
-    fn guess(extension: &[u8]) -> Option<&'static str> {
-        let s = core::str::from_utf8(extension).ok()?;
-        mime_guess::from_ext(s).first_raw()
     }
 
     /// Creates a body by serializing an object to URL-encoded form data.
@@ -568,16 +625,15 @@ impl Body {
     /// ```
     pub fn from_sse<S, E>(s: S) -> Self
     where
-        S: Stream<Item = Result<Event, E>> + Send + Sync + 'static,
-        E: Into<Error> + Send + Sync + 'static,
+        S: Stream<Item = Result<Event, E>> + 'static,
+        E: Into<Error> + 'static,
+        F: Holds<S>,
     {
         Self {
             mime: Some(mime::TEXT_EVENT_STREAM),
-            inner: BodyInner::HttpBody(Box::pin(
-                crate::sse::into_body(s)
-                    .map_frame(|result| result.map_data(|data| data))
-                    .map_err(|e| e.into()),
-            )),
+            ..Self::from_mapped_frames(s, |result: Result<Event, E>| {
+                result.map(|event| BodyFrame::Data(Bytes::from(event.encode().into_bytes())))
+            })
         }
     }
 
@@ -594,10 +650,9 @@ impl Body {
 
     /// Returns the length of the body in bytes, if known.
     ///
-    /// This method returns `Some(length)` for in-memory bodies where the size
-    /// is immediately available. For streaming bodies (files, readers, streams),
-    /// it returns `None` since the total size may not be known until the entire
-    /// body is consumed.
+    /// This method returns `Some(length)` for in-memory and file-region bodies,
+    /// whose size is known up front. For a frame stream it returns `None`,
+    /// since the total size may not be known until the entire body is consumed.
     ///
     /// The returned length is primarily used for optimizations like setting
     /// `Content-Length` headers, but should be considered a hint rather than
@@ -614,11 +669,15 @@ impl Body {
     /// let empty = Body::empty();
     /// assert_eq!(empty.len(), Some(0));
     /// ```
-    pub const fn len(&self) -> Option<usize> {
+    #[must_use]
+    pub fn len(&self) -> Option<usize> {
         match &self.inner {
             BodyInner::Once(bytes) => Some(bytes.len()),
-            BodyInner::Reader { length, .. } => *length,
-            _ => None,
+            #[cfg(feature = "fs")]
+            BodyInner::File(region) => usize::try_from(region.len()).ok(),
+            #[cfg(feature = "fs")]
+            BodyInner::Reading(stream) => usize::try_from(stream.remaining()).ok(),
+            BodyInner::Frames(_) | BodyInner::HttpBody(_) | BodyInner::Freeze => None,
         }
     }
 
@@ -639,23 +698,17 @@ impl Body {
     /// let body = Body::from_bytes("data");
     /// assert_eq!(body.is_empty(), Some(false));
     /// ```
-    pub const fn is_empty(&self) -> Option<bool> {
-        if let Some(len) = self.len() {
-            if len == 0 {
-                Some(true)
-            } else {
-                Some(false)
-            }
-        } else {
-            None
-        }
+    #[must_use]
+    pub fn is_empty(&self) -> Option<bool> {
+        self.len().map(|len| len == 0)
     }
 
     /// Consumes the body and returns all its data as `Bytes`.
     ///
     /// This method reads the entire body into memory and returns it as a
     /// `Bytes` object. For large bodies or streams, this may consume significant
-    /// memory. For streaming bodies, all data will be read and concatenated.
+    /// memory. For streaming bodies, all data will be read and concatenated,
+    /// file regions included; trailers carry no data and are dropped.
     ///
     /// # Errors
     ///
@@ -677,47 +730,27 @@ impl Body {
     /// # }
     /// ```
     pub async fn into_bytes(self) -> Result<Bytes, Error> {
-        match self.inner {
-            BodyInner::Once(bytes) => Ok(bytes),
-            BodyInner::Reader { mut reader, length } => {
-                let mut vec = Vec::with_capacity(length.unwrap_or_default());
-                loop {
-                    let data = reader.fill_buf().await?;
-                    if data.is_empty() {
-                        break;
-                    } else {
-                        let len = data.len();
-                        vec.extend_from_slice(data);
-                        reader.as_mut().consume(len);
-                    }
-                }
-                Ok(vec.into())
-            }
-
-            BodyInner::HttpBody(body) => {
-                let mut body = body.into_data_stream();
-
-                let first = body.try_next().await?.unwrap_or_default();
-                let second = body.try_next().await?;
-                if let Some(second) = second {
-                    let remain_size_hint = body.size_hint();
-                    let mut vec = Vec::with_capacity(
-                        first.len()
-                            + second.len()
-                            + remain_size_hint.1.unwrap_or(remain_size_hint.0),
-                    );
-                    vec.extend_from_slice(&first);
-                    vec.extend_from_slice(&second);
-                    while let Some(data) = body.try_next().await? {
-                        vec.extend_from_slice(&data);
-                    }
-                    Ok(vec.into())
-                } else {
-                    Ok(first)
-                }
-            }
-            BodyInner::Freeze => Err(Error::BodyFrozen),
+        if let BodyInner::Once(bytes) = self.inner {
+            return Ok(bytes);
         }
+        let mut data = self.into_data_stream();
+
+        // A body of one chunk is returned as that chunk, without a copy.
+        let first = data.try_next().await?.unwrap_or_default();
+        let Some(second) = data.try_next().await? else {
+            return Ok(first);
+        };
+        let remaining = http_body::Body::size_hint(&data.body);
+        let remaining = remaining.upper().unwrap_or(remaining.lower());
+        let mut vec = Vec::with_capacity(
+            first.len() + second.len() + usize::try_from(remaining).unwrap_or_default(),
+        );
+        vec.extend_from_slice(&first);
+        vec.extend_from_slice(&second);
+        while let Some(chunk) = data.try_next().await? {
+            vec.extend_from_slice(&chunk);
+        }
+        Ok(vec.into())
     }
 
     /// Consumes the body and returns its data as a UTF-8 string.
@@ -749,37 +782,37 @@ impl Body {
         Ok(ByteStr::from_utf8(self.into_bytes().await?)?)
     }
 
-    /// Converts the body into an async buffered reader.
+    /// Converts the body into a stream of its data.
     ///
-    /// This method wraps the body in a type that implements `AsyncBufRead`,
-    /// allowing it to be used anywhere that expects an async reader. This is
-    /// useful for streaming the body data to other async I/O operations.
+    /// This is the explicit way for a consumer that needs bytes — a
+    /// compressor, a hash, a parser — to read a body: data frames pass through,
+    /// file regions are read through [`FileRegion::into_stream`], and trailers,
+    /// which carry no data, are dropped.
     ///
     /// # Examples
     ///
     /// ```rust
     /// use http_kit::Body;
-    /// use futures_lite::AsyncBufReadExt;
+    /// use futures_lite::StreamExt;
     ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let body = Body::from_bytes("line1\nline2\nline3");
-    /// let mut reader = body.into_reader();
-    /// let mut line = String::new();
-    /// reader.read_line(&mut line).await?;
-    /// assert_eq!(line, "line1\n");
+    /// # async fn example() -> Result<(), http_kit::BodyError> {
+    /// let mut data = Body::from_bytes("Hello, world!").into_data_stream();
+    /// while let Some(chunk) = data.try_next().await? {
+    ///     assert_eq!(chunk, "Hello, world!");
+    /// }
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "std")]
-    pub fn into_reader(self) -> impl AsyncBufRead + Send {
-        IntoAsyncRead::new(self)
+    #[must_use]
+    pub const fn into_data_stream(self) -> DataStream<F> {
+        DataStream { body: self }
     }
 
     /// Converts the body into a Server-Sent Events (SSE) stream.
     ///
     /// This method transforms the body into a stream of SSE events, which can be used
     /// to handle eventsource responses in HTTP servers or clients.
-    pub fn into_sse(self) -> SseStream {
+    pub fn into_sse(self) -> SseStream<F> {
         SseStream::new(self)
     }
 
@@ -962,7 +995,7 @@ impl Body {
     /// // `body` now contains "replacement"
     /// // `old_body` contains "original"
     /// ```
-    pub fn replace(&mut self, body: Body) -> Body {
+    pub fn replace(&mut self, body: Self) -> Self {
         replace(self, body)
     }
 
@@ -989,7 +1022,7 @@ impl Body {
     /// // Now body1 contains "second" and body2 contains "first"
     /// # Ok::<(), http_kit::BodyError>(())
     /// ```
-    pub fn swap(&mut self, body: &mut Body) -> Result<(), BodyFrozen> {
+    pub fn swap(&mut self, body: &mut Self) -> Result<(), BodyFrozen> {
         if self.is_frozen() {
             Err(BodyFrozen::new())
         } else {
@@ -1077,7 +1110,7 @@ impl Body {
     /// Returns a copy of the body when its bytes are held in memory.
     ///
     /// A body built from bytes or text can be sent any number of times, so
-    /// it is cloned (sharing the underlying `Bytes`). A reader, stream or
+    /// it is cloned (sharing the underlying `Bytes`). A file region, stream or
     /// frozen body can be read only once and returns `None`: a middleware that
     /// replays a request, such as a retry, must not send it a second time.
     ///
@@ -1099,19 +1132,124 @@ impl Body {
                 mime: self.mime.clone(),
                 inner: BodyInner::Once(bytes.clone()),
             }),
-            BodyInner::Reader { .. } | BodyInner::HttpBody(_) | BodyInner::Freeze => None,
+            _ => None,
+        }
+    }
+
+    /// Starts reading `region` out as data, for a consumer that needs bytes.
+    #[cfg(feature = "fs")]
+    fn read_out(&mut self, region: FileRegion) {
+        let stream = region.into_stream();
+        match &mut self.inner {
+            BodyInner::Frames(frames) => frames.reading = Some(Box::new(stream)),
+            // A one-region body has already yielded its region and is empty.
+            _ => self.inner = BodyInner::Reading(stream),
+        }
+    }
+
+    /// Polls the next frame with every file region read out as data: the
+    /// shape of `http_body::Body`, which has no frame for a file.
+    fn poll_read_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        #[cfg(feature = "fs")]
+        loop {
+            match ready!(Pin::new(&mut *self).poll_next(cx)) {
+                Some(Ok(BodyFrame::File(region))) => self.read_out(region),
+                frame => return Poll::Ready(frame.map(|frame| frame.map(into_http_frame))),
+            }
+        }
+        #[cfg(not(feature = "fs"))]
+        Pin::new(self)
+            .poll_next(cx)
+            .map(|frame| frame.map(|frame| frame.map(into_http_frame)))
+    }
+}
+
+/// Converts a data or trailers frame; file regions are read out before this.
+fn into_http_frame(frame: BodyFrame) -> Frame<Bytes> {
+    match frame {
+        BodyFrame::Data(data) => Frame::data(data),
+        BodyFrame::Trailers(trailers) => Frame::trailers(trailers),
+        #[cfg(feature = "fs")]
+        BodyFrame::File(_) => unreachable!("file regions are read out before conversion"),
+    }
+}
+
+/// The data of a [`Body`], with file regions read out and trailers dropped.
+///
+/// Created by [`GenericBody::into_data_stream`].
+#[derive(Debug)]
+pub struct DataStream<F: Flavor = Shared> {
+    body: GenericBody<F>,
+}
+
+impl<F: Flavor> DataStream<F> {
+    /// Returns the body the data is read from.
+    #[must_use]
+    pub fn into_inner(self) -> GenericBody<F> {
+        self.body
+    }
+}
+
+impl<F: Flavor> Stream for DataStream<F> {
+    type Item = Result<Bytes, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            let Some(frame) = ready!(self.body.poll_read_frame(cx)) else {
+                return Poll::Ready(None);
+            };
+            if let Ok(data) = frame?.into_data() {
+                return Poll::Ready(Some(Ok(data)));
+            }
         }
     }
 }
 
-impl Default for Body {
+impl<F: Flavor> Default for GenericBody<F> {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl Stream for Body {
-    type Item = Result<Bytes, Error>;
+/// Drops the `Send + Sync` guarantee; the sources are kept as they are.
+impl From<Body> for LocalBody {
+    fn from(body: Body) -> Self {
+        let inner = match body.inner {
+            BodyInner::Once(bytes) => BodyInner::Once(bytes),
+            #[cfg(feature = "fs")]
+            BodyInner::File(region) => BodyInner::File(region),
+            #[cfg(feature = "fs")]
+            BodyInner::Reading(stream) => BodyInner::Reading(stream),
+            BodyInner::Frames(frames) => {
+                let stream: Pin<Box<<Local as Flavor>::Frames>> = frames.stream;
+                BodyInner::Frames(Frames {
+                    stream,
+                    #[cfg(feature = "fs")]
+                    reading: frames.reading,
+                })
+            }
+            BodyInner::HttpBody(body) => {
+                let body: Pin<Box<<Local as Flavor>::HttpBody>> = body;
+                BodyInner::HttpBody(body)
+            }
+            BodyInner::Freeze => BodyInner::Freeze,
+        };
+        Self {
+            mime: body.mime,
+            inner,
+        }
+    }
+}
+
+/// The body's frames, file regions included as [`BodyFrame::File`].
+///
+/// A region that the `http_body::Body` side has started to read out continues
+/// here as data frames, so the two views never skip or repeat bytes.
+impl<F: Flavor> Stream for GenericBody<F> {
+    type Item = Result<BodyFrame, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match &mut self.inner {
@@ -1119,86 +1257,118 @@ impl Stream for Body {
                 if bytes.is_empty() {
                     Poll::Ready(None)
                 } else {
-                    Poll::Ready(Some(Ok(take(bytes))))
+                    Poll::Ready(Some(Ok(BodyFrame::Data(take(bytes)))))
                 }
             }
-            BodyInner::Reader { reader, length } => {
-                let data = ready!(reader.as_mut().poll_fill_buf(cx))?;
-                if data.is_empty() {
-                    return Poll::Ready(None);
-                }
-                let data = Bytes::copy_from_slice(data);
-                reader.as_mut().consume(data.len());
-                if let Some(known_length) = length {
-                    *known_length = known_length.saturating_sub(data.len());
-                }
-                Poll::Ready(Some(Ok(data)))
-            }
-            // A stream of data chunks has no place for trailers; skip them.
-            BodyInner::HttpBody(stream) => loop {
-                let Some(frame) = ready!(stream.as_mut().poll_frame(cx)) else {
-                    return Poll::Ready(None);
+            #[cfg(feature = "fs")]
+            BodyInner::File(_) => {
+                let BodyInner::File(region) = take(&mut self.inner) else {
+                    unreachable!("matched a file body above")
                 };
-                if let Ok(data) = frame?.into_data() {
-                    return Poll::Ready(Some(Ok(data)));
+                Poll::Ready(Some(Ok(BodyFrame::File(region))))
+            }
+            #[cfg(feature = "fs")]
+            BodyInner::Reading(stream) => match ready!(Pin::new(stream).poll_next(cx)) {
+                Some(chunk) => Poll::Ready(Some(chunk.map(BodyFrame::Data).map_err(Error::from))),
+                None => {
+                    self.inner = BodyInner::default();
+                    Poll::Ready(None)
                 }
             },
+            BodyInner::Frames(frames) => {
+                #[cfg(feature = "fs")]
+                if let Some(reading) = &mut frames.reading {
+                    match ready!(Pin::new(reading).poll_next(cx)) {
+                        Some(chunk) => {
+                            return Poll::Ready(Some(
+                                chunk.map(BodyFrame::Data).map_err(Error::from),
+                            ))
+                        }
+                        None => frames.reading = None,
+                    }
+                }
+                frames.stream.as_mut().poll_next(cx)
+            }
+            BodyInner::HttpBody(body) => body
+                .as_mut()
+                .poll_frame(cx)
+                .map(|frame| frame.map(|frame| frame.map(from_http_frame))),
             BodyInner::Freeze => Poll::Ready(Some(Err(Error::BodyFrozen))),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.inner {
-            BodyInner::Once(bytes) => (bytes.len(), Some(bytes.len())),
-            BodyInner::Reader { length, .. } => (0, *length),
-            BodyInner::HttpBody(body) => {
-                let hint = body.size_hint();
-                (hint.lower() as usize, hint.upper().map(|u| u as usize))
+            BodyInner::Once(bytes) => {
+                let frames = usize::from(!bytes.is_empty());
+                (frames, Some(frames))
             }
-            BodyInner::Freeze => (0, None),
+            #[cfg(feature = "fs")]
+            BodyInner::File(_) => (1, Some(1)),
+            #[cfg(feature = "fs")]
+            BodyInner::Reading(stream) => stream.size_hint(),
+            BodyInner::Frames(frames) => {
+                let (lower, upper) = frames.stream.size_hint();
+                #[cfg(feature = "fs")]
+                if let Some(reading) = &frames.reading {
+                    let (chunks, _) = reading.size_hint();
+                    return (
+                        lower.saturating_add(chunks),
+                        upper.and_then(|upper| upper.checked_add(chunks)),
+                    );
+                }
+                (lower, upper)
+            }
+            BodyInner::HttpBody(_) | BodyInner::Freeze => (0, None),
         }
     }
 }
 
-impl http_body::Body for Body {
+/// Data and trailers, with each file region read out into data frames
+/// through [`FileRegion::into_stream`].
+impl<F: Flavor> http_body::Body for GenericBody<F> {
     type Data = Bytes;
 
     type Error = Error;
 
     fn poll_frame(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        // A wrapped body's frames pass through unchanged, trailers included.
-        if let BodyInner::HttpBody(body) = &mut self.inner {
-            return body.as_mut().poll_frame(cx);
-        }
-        self.poll_next(cx)
-            .map(|opt| opt.map(|result| result.map(http_body::Frame::data)))
-            .map_err(Error::from)
+        self.get_mut().poll_read_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {
         match &self.inner {
             BodyInner::Once(bytes) => bytes.is_empty(),
-            BodyInner::Reader { length, .. } => *length == Some(0),
+            #[cfg(feature = "fs")]
+            BodyInner::File(region) => region.is_empty(),
+            #[cfg(feature = "fs")]
+            BodyInner::Reading(stream) => stream.remaining() == 0,
             BodyInner::HttpBody(body) => body.is_end_stream(),
             // Polling a frozen body yields `BodyFrozen`; it must not look finished.
-            BodyInner::Freeze => false,
+            BodyInner::Frames(_) | BodyInner::Freeze => false,
         }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
         match &self.inner {
             BodyInner::Once(bytes) => http_body::SizeHint::with_exact(bytes.len() as u64),
-            BodyInner::Reader {
-                length: Some(length),
+            #[cfg(feature = "fs")]
+            BodyInner::File(region) => http_body::SizeHint::with_exact(region.len()),
+            #[cfg(feature = "fs")]
+            BodyInner::Reading(stream) => http_body::SizeHint::with_exact(stream.remaining()),
+            #[cfg(feature = "fs")]
+            BodyInner::Frames(Frames {
+                reading: Some(reading),
                 ..
-            } => http_body::SizeHint::with_exact(*length as u64),
-            BodyInner::Reader { length: None, .. } | BodyInner::Freeze => {
-                http_body::SizeHint::default()
+            }) => {
+                let mut hint = http_body::SizeHint::default();
+                hint.set_lower(reading.remaining());
+                hint
             }
             BodyInner::HttpBody(body) => body.size_hint(),
+            BodyInner::Frames(_) | BodyInner::Freeze => http_body::SizeHint::default(),
         }
     }
 }
@@ -1209,6 +1379,7 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
     use futures_lite::{stream, StreamExt};
+    use http_body_util::{BodyExt, StreamBody};
 
     #[tokio::test]
     async fn basic_body_operations() {
@@ -1240,16 +1411,23 @@ mod tests {
         assert!(bytes.is_end_stream());
         assert_eq!(http_body::Body::size_hint(&bytes).exact(), Some(0));
 
-        let mut sized = Body::from_reader(futures_lite::io::Cursor::new(b"abc".to_vec()), 3);
-        assert!(!sized.is_end_stream());
-        assert_eq!(http_body::Body::size_hint(&sized).exact(), Some(3));
-        while sized.frame().await.transpose().unwrap().is_some() {}
-        assert!(sized.is_end_stream());
+        #[cfg(feature = "fs")]
+        {
+            let file = TempFile::new("size-hint", b"abcdef");
+            let mut region = Body::from_file_region(FileRegion::new(file.open(), 1, 3));
+            assert!(!region.is_end_stream());
+            assert_eq!(http_body::Body::size_hint(&region).exact(), Some(3));
+            let data = region.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(data.as_ref(), b"bcd");
+            assert!(region.frame().await.is_none());
+            assert!(region.is_end_stream());
+        }
 
-        let unsized_reader =
-            Body::from_reader(futures_lite::io::Cursor::new(b"abc".to_vec()), None);
-        assert!(!unsized_reader.is_end_stream());
-        assert_eq!(http_body::Body::size_hint(&unsized_reader).exact(), None);
+        let unsized_stream = Body::from_stream(stream::iter([Ok::<_, core::convert::Infallible>(
+            Bytes::from_static(b"abc"),
+        )]));
+        assert!(!unsized_stream.is_end_stream());
+        assert_eq!(http_body::Body::size_hint(&unsized_stream).exact(), None);
 
         let wrapped = Body::new(http_body_util::Full::new(Bytes::from_static(b"wrapped")));
         assert!(!wrapped.is_end_stream());
@@ -1287,20 +1465,137 @@ mod tests {
         assert_eq!(trailers["grpc-status"], "0");
         assert!(body.frame().await.is_none());
 
-        let chunks: Vec<Bytes> = with_trailers().try_collect().await.unwrap();
-        assert_eq!(chunks, [Bytes::from_static(b"data")]);
+        let frames: Vec<BodyFrame> = with_trailers().try_collect().await.unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].as_data().unwrap().as_ref(), b"data");
+        assert_eq!(frames[1].as_trailers().unwrap()["grpc-status"], "0");
 
-        #[cfg(feature = "std")]
-        {
-            use futures_lite::AsyncReadExt;
-            let mut read = Vec::new();
-            with_trailers()
-                .into_reader()
-                .read_to_end(&mut read)
-                .await
-                .unwrap();
-            assert_eq!(read, b"data");
+        let chunks: Vec<Bytes> = with_trailers()
+            .into_data_stream()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(chunks, [Bytes::from_static(b"data")]);
+    }
+
+    /// A file under the temporary directory, removed on drop.
+    #[cfg(feature = "fs")]
+    struct TempFile(std::path::PathBuf);
+
+    #[cfg(feature = "fs")]
+    impl TempFile {
+        fn new(name: &str, contents: &[u8]) -> Self {
+            let path = std::env::temp_dir()
+                .join(alloc::format!("http-kit-{}-{name}.txt", std::process::id()));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
         }
+
+        fn open(&self) -> std::fs::File {
+            std::fs::File::open(&self.0).unwrap()
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // Real multi-byte text: Chinese, Japanese and Korean.
+    #[cfg(feature = "fs")]
+    const CJK_TEXT: &str =
+        "静态文件直接交给内核。静的ファイルはカーネルに直接渡す。정적 파일은 커널에 바로 넘긴다.";
+
+    #[cfg(feature = "fs")]
+    fn mixed_body(file: &TempFile) -> (Body, http::HeaderMap) {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("abc123"));
+        let body = Body::from_frames(stream::iter([
+            Ok::<_, Error>(BodyFrame::Data(Bytes::from_static(b"head:"))),
+            Ok(BodyFrame::File(FileRegion::new(file.open(), 3, 30))),
+            Ok(BodyFrame::Data(Bytes::from_static(b":tail"))),
+            Ok(BodyFrame::Trailers(trailers.clone())),
+        ]));
+        (body, trailers)
+    }
+
+    #[cfg(feature = "fs")]
+    #[tokio::test]
+    async fn mixed_frames_survive_the_stream() {
+        let file = TempFile::new("mixed-stream", CJK_TEXT.as_bytes());
+        let (body, trailers) = mixed_body(&file);
+        let frames: Vec<BodyFrame> = body.try_collect().await.unwrap();
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[0].as_data().unwrap().as_ref(), b"head:");
+        let region = frames[1].as_file().expect("the region stays a region");
+        assert_eq!((region.offset(), region.len()), (3, 30));
+        assert_eq!(frames[2].as_data().unwrap().as_ref(), b":tail");
+        assert_eq!(frames[3].as_trailers(), Some(&trailers));
+
+        let BodyFrame::File(region) = frames.into_iter().nth(1).unwrap() else {
+            unreachable!()
+        };
+        let read: Vec<Bytes> = region.into_stream().try_collect().await.unwrap();
+        assert_eq!(read.concat(), &CJK_TEXT.as_bytes()[3..33]);
+    }
+
+    #[cfg(feature = "fs")]
+    #[tokio::test]
+    async fn mixed_frames_survive_http_body() {
+        let file = TempFile::new("mixed-http-body", CJK_TEXT.as_bytes());
+        let (mut body, trailers) = mixed_body(&file);
+        let mut data = Vec::new();
+        let mut received_trailers = None;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.unwrap();
+            assert!(received_trailers.is_none(), "trailers come last");
+            match frame.into_data() {
+                Ok(chunk) => data.extend_from_slice(&chunk),
+                Err(frame) => received_trailers = Some(frame.into_trailers().unwrap()),
+            }
+        }
+        let mut expected = b"head:".to_vec();
+        expected.extend_from_slice(&CJK_TEXT.as_bytes()[3..33]);
+        expected.extend_from_slice(b":tail");
+        assert_eq!(data, expected);
+        assert_eq!(received_trailers, Some(trailers));
+
+        let (body, _) = mixed_body(&file);
+        assert_eq!(body.into_bytes().await.unwrap(), expected);
+    }
+
+    #[cfg(feature = "fs")]
+    #[tokio::test]
+    async fn file_region_reads_in_chunks_and_resumes_as_frames() {
+        // Larger than one read chunk, so the region takes several reads.
+        let contents = CJK_TEXT.repeat(2048);
+        let file = TempFile::new("chunks", contents.as_bytes());
+        let len = contents.len() as u64 - 7;
+        let mut body = Body::from_file_region(FileRegion::new(file.open(), 7, len));
+        assert_eq!(body.len(), Some(len as usize));
+
+        // Read one chunk at the http_body boundary, then the rest as frames.
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(body.len(), Some(len as usize - first.len()));
+        let mut read = first.to_vec();
+        while let Some(frame) = body.try_next().await.unwrap() {
+            read.extend_from_slice(frame.as_data().expect("a region being read yields data"));
+        }
+        assert_eq!(read, &contents.as_bytes()[7..]);
+    }
+
+    #[cfg(feature = "fs")]
+    #[tokio::test]
+    async fn file_shorter_than_its_region_fails() {
+        let file = TempFile::new("short", b"0123456789");
+        let body = Body::from_file_region(FileRegion::new(file.open(), 4, 10));
+        let error = body.into_bytes().await.unwrap_err();
+        let Error::Io(error) = error else {
+            panic!("expected an I/O error, got {error:?}")
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]
@@ -1311,8 +1606,12 @@ mod tests {
         assert_eq!(copy.into_bytes().await.unwrap().as_ref(), b"replayable");
         assert_eq!(body.into_bytes().await.unwrap().as_ref(), b"replayable");
 
-        let reader = Body::from_reader(futures_lite::io::Cursor::new(b"once".to_vec()), 4);
-        assert!(reader.try_clone().is_none());
+        #[cfg(feature = "fs")]
+        {
+            let file = TempFile::new("try-clone", b"once");
+            let region = Body::from_file_region(FileRegion::new(file.open(), 0, 4));
+            assert!(region.try_clone().is_none());
+        }
 
         let stream = Body::from_stream(stream::iter(vec![Ok::<_, std::io::Error>(
             Bytes::from_static(b"once"),
@@ -1362,13 +1661,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_stream_yields_bytes() {
-        let body = Body::from_bytes("streaming test data");
+    async fn body_stream_yields_data_frames() {
+        let mut body = Body::from_bytes("streaming test data");
         let mut chunks = Vec::new();
 
-        let mut stream = body;
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.unwrap();
+        while let Some(frame) = body.next().await {
+            let BodyFrame::Data(chunk) = frame.unwrap() else {
+                panic!("an in-memory body yields only data")
+            };
             chunks.push(chunk);
         }
 
@@ -1428,20 +1728,6 @@ mod tests {
         let mut body = Body::from_form(&data).unwrap();
         let parsed: FormData = body.into_form().await.unwrap();
         assert_eq!(parsed, data);
-    }
-
-    #[tokio::test]
-    async fn reader_does_not_hang() {
-        use futures_lite::io::{BufReader, Cursor};
-
-        let data = "This test ensures the reader doesn't create infinite loops";
-        let cursor = Cursor::new(data.as_bytes().to_vec());
-        let reader = BufReader::new(cursor);
-
-        let body = Body::from_reader(reader, data.len());
-
-        let result = body.into_bytes().await.unwrap();
-        assert_eq!(result.as_ref(), data.as_bytes());
     }
 
     #[tokio::test]
@@ -1550,19 +1836,17 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "fs", feature = "std"))]
+    #[cfg(feature = "fs")]
     #[tokio::test]
     async fn file_body_with_mime() {
-        use std::io::Write;
-
         let dir = std::env::temp_dir();
-        let file_path = dir.join("test_mime.html");
-        let mut file = std::fs::File::create(&file_path).unwrap();
-        file.write_all(b"<html></html>").unwrap();
+        let file_path = dir.join(alloc::format!("http-kit-{}-mime.html", std::process::id()));
+        std::fs::write(&file_path, b"<html></html>").unwrap();
 
         let body = Body::from_file(&file_path).await.unwrap();
-
         assert_eq!(body.mime().unwrap().as_ref(), "text/html");
+        assert_eq!(body.len(), Some(13));
+        assert_eq!(body.into_bytes().await.unwrap().as_ref(), b"<html></html>");
 
         let _ = std::fs::remove_file(file_path);
     }

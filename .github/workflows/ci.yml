@@ -5,10 +5,9 @@ permissions:
   id-token: write
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
     branches: ["**"]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -18,8 +17,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  tier:
+    # A pull request into `main` runs the full set; every other run
+    # (dev PRs, manual dispatches) runs the Linux set. release-plz bump
+    # pull requests (`release-plz-*` heads) run nothing at all, so this
+    # job skips itself and every other job skips through `needs: tier`.
+    name: Tier
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.tier.outputs.os }}
+    steps:
+      - id: tier
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.base_ref }}" = "main" ]; then
+            echo 'os=["ubuntu-latest","windows-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
   lint:
     name: Lint
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,10 +49,11 @@ jobs:
         with:
           shared-key: ci-ubuntu
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   wasm:
     name: WASM
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +67,7 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,18 +85,9 @@ jobs:
           use_oidc: true
           fail_ci_if_error: true
 
-  typos:
-    name: Typos
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
-      - uses: crate-ci/typos@master
-
   audit:
       name: Security Audit
+      needs: tier
       runs-on: ubuntu-latest
       steps:
         - uses: actions/checkout@v4
@@ -90,6 +102,7 @@ jobs:
 
   unused-deps:
     name: Unused Dependencies
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,6 +115,7 @@ jobs:
 
   feature-checks:
     name: Features
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -110,9 +124,31 @@ jobs:
         with:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack check --each-feature --no-dev-deps
-      - run: cargo hack check --feature-powerset --no-dev-deps
+      - run: cargo hack check --workspace --each-feature --no-dev-deps
+      - run: cargo hack check --workspace --feature-powerset --no-dev-deps
 
   test:
     name: Test
+    needs: tier
     uses: ./.github/workflows/test.yml
+    with:
+      os: ${{ needs.tier.outputs.os }}
+
+  result:
+    # The single check the `main` ruleset requires: it passes when every
+    # job passed or was skipped (release-plz bump pull requests skip all).
+    name: CI result
+    if: always()
+    needs: [tier, lint, wasm, coverage, audit, unused-deps, feature-checks, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ', ') }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "job results: $RESULTS"
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::one or more jobs failed or were cancelled"
+            exit 1
+          fi
