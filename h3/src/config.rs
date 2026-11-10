@@ -46,6 +46,7 @@ impl CongestionControl {
 
 /// QUIC transport settings, shared by servers and clients.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct TransportConfig {
     /// The congestion controller.
     pub congestion_control: CongestionControl,
@@ -276,6 +277,7 @@ pub enum Trust {
 
 /// Settings for a server endpoint.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ServerConfig {
     /// The QUIC transport.
     pub transport: TransportConfig,
@@ -355,6 +357,7 @@ impl ServerConfig {
 
 /// Settings for a client.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// The QUIC transport.
     pub transport: TransportConfig,
