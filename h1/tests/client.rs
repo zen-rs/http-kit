@@ -276,7 +276,7 @@ fn a_final_coding_other_than_chunked_is_read_until_close() {
         let ends = connection();
         let (mut server_in, mut server_out) = ends.server;
         let (client_in, client_out) = ends.client;
-        let (send, conn) = handshake(client_in, client_out, ClientConfig::default());
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
         let peer = async {
             server_in.until(b"\r\n\r\n").await;
             server_out.send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n");
@@ -308,7 +308,7 @@ fn absolute_form_targets_are_sent_when_asked_for() {
             request_target: RequestTarget::Absolute,
             ..ClientConfig::default()
         };
-        let (send, conn) = handshake(client_in, client_out, config);
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, config);
         let peer = async {
             let head = server_in.until(b"\r\n\r\n").await;
             assert_eq!(
