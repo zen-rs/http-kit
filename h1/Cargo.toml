@@ -17,7 +17,7 @@ categories = ["network-programming", "web-programming::http-server", "web-progra
 fs = ["http-kit/fs"]
 
 [dependencies]
-http-kit = { version = "0.4.4", path = "..", default-features = false, features = ["std"] }
+http-kit = { version = "0.5.0", path = "..", default-features = false, features = ["std"] }
 http-kit-io = { version = "0.1.0", path = "../io" }
 http = { version = "1.5.0", default-features = false, features = ["std"] }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
