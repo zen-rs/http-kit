@@ -9,7 +9,15 @@
 //! The handle is `Clone` and `Send`, so a connection pool can hold it while
 //! the connection itself, like every future here, stays on one thread.
 
-use std::{collections::VecDeque, fmt, net::SocketAddr, pin::pin, task::Poll, time::Instant};
+use std::{
+    collections::VecDeque,
+    fmt,
+    net::SocketAddr,
+    pin::pin,
+    sync::{Arc, OnceLock},
+    task::Poll,
+    time::Instant,
+};
 
 use async_channel::{Receiver, Sender};
 use futures_lite::Stream as _;
@@ -57,8 +65,9 @@ impl Client {
     }
 
     /// Starts a connection to `peer` over `socket`, verifying the server's
-    /// certificate for `server_name` (also sent as SNI). Its QUIC timers are
-    /// driven by `timer`.
+    /// certificate for `server_name` (also sent as SNI, and the name a
+    /// [`Verifier`](crate::Verifier) is given). Its QUIC timers are driven by
+    /// `timer`.
     ///
     /// # Errors
     ///
@@ -84,8 +93,12 @@ impl Client {
         )?);
         let (send, exchanges) = async_channel::bounded(1);
         let (mailbox, inbox) = async_channel::unbounded();
+        let (ready, handshake) = Readiness::new();
         Ok((
-            SendRequest { exchanges: send },
+            SendRequest {
+                exchanges: send,
+                handshake,
+            },
             Connection {
                 socket,
                 timer,
@@ -94,6 +107,7 @@ impl Client {
                 exchanges,
                 mailbox,
                 inbox,
+                ready,
             },
         ))
     }
@@ -108,6 +122,7 @@ struct Exchange {
 #[derive(Clone)]
 pub struct SendRequest {
     exchanges: Sender<Exchange>,
+    handshake: Handshake,
 }
 
 impl fmt::Debug for SendRequest {
@@ -142,6 +157,28 @@ impl SendRequest {
         response.recv().await.map_err(|_| Error::ConnectionClosed)?
     }
 
+    /// Resolves when the connection's handshake completes: the server's
+    /// certificate was accepted and requests can be answered. Until then
+    /// they wait. It fails with the handshake's error (a refused chain
+    /// closes the connection with the TLS alert's code) or, if the
+    /// connection ends first, [`Error::ConnectionClosed`].
+    ///
+    /// The [`Connection`] must be driven for it to resolve. Every clone of
+    /// the handle may wait, and each gets the same answer, also after the
+    /// fact.
+    ///
+    /// # Errors
+    ///
+    /// As above.
+    pub async fn ready(&self) -> Result<(), Error> {
+        self.handshake.done.recv().await.ok();
+        self.handshake
+            .outcome
+            .get()
+            .cloned()
+            .expect("the connection reports before it closes the channel")
+    }
+
     /// Whether the connection has stopped taking requests: it closed, or
     /// the server sent GOAWAY.
     #[must_use]
@@ -160,6 +197,7 @@ pub struct Connection<S, T> {
     exchanges: Receiver<Exchange>,
     mailbox: Sender<Command>,
     inbox: Receiver<Command>,
+    ready: Readiness,
 }
 
 impl<S, T> fmt::Debug for Connection<S, T> {
@@ -242,6 +280,7 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
             exchanges,
             mailbox,
             inbox,
+            ready,
         } = self;
         let recv = pin!(socket.recv_from(Vec::with_capacity(MAX_COALESCED_BYTES)));
         let sleep = pin!(timer.sleep_until(Instant::now()));
@@ -289,7 +328,11 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
                     Err(error) if peer_error(&error) => {
                         tracing::debug!(%error, "receive reported the server's error");
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        let error = Error::from(error);
+                        ready.report(Err(error.clone()));
+                        return Err(error);
+                    }
                 }
                 sources.rearm_recv(socket.recv_from(buf));
             }
@@ -298,6 +341,9 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
             }
 
             conn.on_timer(Instant::now());
+            if conn.quic.is_established() {
+                ready.report(Ok(()));
+            }
             if conn.h3.is_none() && conn.quic.is_established() {
                 match h3::Connection::with_transport(&mut conn.quic, &settings.build()) {
                     Ok(h3) => conn.h3 = Some(h3),
@@ -330,6 +376,7 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
             if conn.quic.is_closed() {
                 let outcome = conn.outcome();
                 let error = outcome.clone().err().unwrap_or(Error::ConnectionClosed);
+                ready.report(Err(error.clone()));
                 conn.fail_all(&error);
                 for queued in waiting.drain(..) {
                     queued.respond.try_send(Err(error.clone())).ok();
@@ -477,4 +524,50 @@ fn headers(
         return;
     }
     conn.settle(id);
+}
+
+/// The handshake's outcome, shared between a connection and the handles to
+/// it: set once, then the channel closes to wake whoever waits.
+#[derive(Clone)]
+struct Handshake {
+    outcome: Arc<OnceLock<Result<(), Error>>>,
+    done: Receiver<()>,
+}
+
+/// The connection's end of a [`Handshake`]. A connection dropped before it
+/// reported fails it as closed.
+struct Readiness {
+    outcome: Arc<OnceLock<Result<(), Error>>>,
+    done: Sender<()>,
+}
+
+impl Readiness {
+    fn new() -> (Self, Handshake) {
+        let outcome = Arc::new(OnceLock::new());
+        let (done, waiting) = async_channel::bounded(1);
+        (
+            Self {
+                outcome: outcome.clone(),
+                done,
+            },
+            Handshake {
+                outcome,
+                done: waiting,
+            },
+        )
+    }
+
+    /// Records the outcome unless one was recorded already: the first is the
+    /// handshake's.
+    fn report(&self, outcome: Result<(), Error>) {
+        if self.outcome.set(outcome).is_ok() {
+            self.done.close();
+        }
+    }
+}
+
+impl Drop for Readiness {
+    fn drop(&mut self) {
+        self.report(Err(Error::ConnectionClosed));
+    }
 }

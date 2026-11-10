@@ -74,6 +74,10 @@ pub struct Pki {
     pub identity: Identity,
     /// The authority's certificate, PEM.
     pub root: Vec<u8>,
+    /// The server certificate, DER.
+    pub leaf: Vec<u8>,
+    /// The authority's certificate, DER.
+    pub ca: Vec<u8>,
 }
 
 pub fn pki() -> Pki {
@@ -120,6 +124,8 @@ pub fn pki() -> Pki {
     Pki {
         identity: Identity::from_pem(chain, leaf_key.private_key_to_pem_pkcs8().unwrap()),
         root: ca.to_pem().unwrap(),
+        leaf: leaf.to_der().unwrap(),
+        ca: ca.to_der().unwrap(),
     }
 }
 
