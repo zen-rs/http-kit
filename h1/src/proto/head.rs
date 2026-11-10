@@ -364,9 +364,9 @@ pub fn parse_response_head(
     let head = buf.split_to(raw.len).freeze();
     let headers = build_fields(&head, raw.fields, true)?;
 
-    let chunked = chunked(version, &headers)?;
+    let coding = transfer_coding(version, &headers)?;
     let length = content_length(&headers)?;
-    if chunked && length.is_some() {
+    if coding != TransferCoding::Absent && length.is_some() {
         return Err(ParseError::ContentLengthWithTransferEncoding);
     }
     let upgrade = status == StatusCode::SWITCHING_PROTOCOLS
@@ -378,13 +378,14 @@ pub fn parse_response_head(
         || method == Method::HEAD
     {
         BodyKind::Empty
-    } else if chunked {
-        BodyKind::Chunked
     } else {
-        match length {
-            Some(0) => BodyKind::Empty,
-            Some(len) => BodyKind::Length(len),
-            None => BodyKind::CloseDelimited,
+        match (coding, length) {
+            (TransferCoding::Chunked, _) => BodyKind::Chunked,
+            (TransferCoding::Unframed, _) | (TransferCoding::Absent, None) => {
+                BodyKind::CloseDelimited
+            }
+            (TransferCoding::Absent, Some(0)) => BodyKind::Empty,
+            (TransferCoding::Absent, Some(len)) => BodyKind::Length(len),
         }
     };
     let keep_alive =
@@ -413,12 +414,34 @@ fn list_elements<'a>(
         .filter(|element| !element.is_empty())
 }
 
-/// Whether `Transfer-Encoding` makes the body chunked. The only coding
-/// supported is a lone `chunked`, which must also be the last (RFC 9112 §6.3:
-/// a request whose final coding is not chunked cannot be framed).
+/// What `Transfer-Encoding` says about a message's framing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferCoding {
+    /// No `Transfer-Encoding`.
+    Absent,
+    /// A lone `chunked`.
+    Chunked,
+    /// The final coding is not `chunked`, so the length cannot be known from
+    /// the message itself.
+    Unframed,
+}
+
+/// Whether a request's `Transfer-Encoding` makes its body chunked. A request
+/// whose final coding is not `chunked` cannot be framed (RFC 9112 §6.3).
 fn chunked(version: Version, headers: &HeaderMap) -> Result<bool, ParseError> {
+    match transfer_coding(version, headers)? {
+        TransferCoding::Absent => Ok(false),
+        TransferCoding::Chunked => Ok(true),
+        TransferCoding::Unframed => Err(ParseError::ChunkedNotFinal),
+    }
+}
+
+/// Classifies `Transfer-Encoding`. The only coding supported is a lone
+/// `chunked`, which must also be the last; a response whose final coding is
+/// something else is framed by the connection closing (RFC 9112 §6.3).
+fn transfer_coding(version: Version, headers: &HeaderMap) -> Result<TransferCoding, ParseError> {
     if !headers.contains_key(TRANSFER_ENCODING) {
-        return Ok(false);
+        return Ok(TransferCoding::Absent);
     }
     if version == Version::HTTP_10 {
         return Err(ParseError::TransferEncodingInHttp10);
@@ -430,12 +453,13 @@ fn chunked(version: Version, headers: &HeaderMap) -> Result<bool, ParseError> {
             if rest.iter().any(is_chunked) {
                 Err(ParseError::ChunkedNotFinal)
             } else if rest.is_empty() {
-                Ok(true)
+                Ok(TransferCoding::Chunked)
             } else {
                 Err(ParseError::UnsupportedTransferCoding)
             }
         }
-        _ => Err(ParseError::ChunkedNotFinal),
+        Some(_) => Ok(TransferCoding::Unframed),
+        None => Err(ParseError::ChunkedNotFinal),
     }
 }
 

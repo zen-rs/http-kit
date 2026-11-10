@@ -10,7 +10,8 @@ use futures_lite::{StreamExt as _, future::block_on, future::zip, stream};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use http_kit::{Body, BodyFrame, Request, Response};
 use http_kit_h1::{
-    ClientConfig, ClientOutcome, Error, SendRequest, ServerConfig, ServerConnection, handshake,
+    ClientConfig, ClientOutcome, Error, RequestTarget, SendRequest, ServerConfig, ServerConnection,
+    handshake,
 };
 use support::{CJK, NeverTimer, connection, within_reads};
 
@@ -263,6 +264,78 @@ fn close_delimited_responses_are_zero_copy() {
                 data.extend_from_slice(&chunk);
             }
             assert_eq!(text(&data), body);
+        };
+        let ((), (ran, ())) = zip(peer, zip(conn.run(), client)).await;
+        assert!(matches!(ran.unwrap(), ClientOutcome::Closed));
+    });
+}
+
+#[test]
+fn a_final_coding_other_than_chunked_is_read_until_close() {
+    block_on(async {
+        let ends = connection();
+        let (mut server_in, mut server_out) = ends.server;
+        let (client_in, client_out) = ends.client;
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
+        let peer = async {
+            server_in.until(b"\r\n\r\n").await;
+            server_out.send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n");
+            // The bytes are the coding's, passed through untouched.
+            server_out.send(CJK.as_bytes());
+            server_out.close();
+        };
+        let client = async {
+            let response = send
+                .send(request(Method::GET, "http://example.com/", Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(response.headers()[header::TRANSFER_ENCODING], "gzip");
+            let body = response.into_body().into_bytes().await.unwrap();
+            assert_eq!(&body[..], CJK.as_bytes());
+        };
+        let ((), (ran, ())) = zip(peer, zip(conn.run(), client)).await;
+        assert!(matches!(ran.unwrap(), ClientOutcome::Closed));
+    });
+}
+
+#[test]
+fn absolute_form_targets_are_sent_when_asked_for() {
+    block_on(async {
+        let ends = connection();
+        let (mut server_in, server_out) = ends.server;
+        let (client_in, client_out) = ends.client;
+        let config = ClientConfig {
+            request_target: RequestTarget::Absolute,
+            ..ClientConfig::default()
+        };
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, config);
+        let peer = async {
+            let head = server_in.until(b"\r\n\r\n").await;
+            assert_eq!(
+                text(&head),
+                "GET http://example.com/a/b?q=1 HTTP/1.1\r\nhost: example.com\r\n\r\n"
+            );
+            server_out.send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            // A request with only a path cannot be written in absolute form,
+            // and nothing of it reaches the wire.
+            assert!(server_in.read_to_end().await.is_empty());
+        };
+        let client = async move {
+            let response = send
+                .send(request(
+                    Method::GET,
+                    "http://example.com/a/b?q=1",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().into_bytes().await.unwrap();
+            let error = send
+                .send(request(Method::GET, "/a/b", Body::empty()))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::AbsoluteTargetIncomplete));
         };
         let ((), (ran, ())) = zip(peer, zip(conn.run(), client)).await;
         assert!(matches!(ran.unwrap(), ClientOutcome::Closed));

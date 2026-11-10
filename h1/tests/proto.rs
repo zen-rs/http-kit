@@ -5,8 +5,8 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode, Version, header};
 use http_kit_h1::{
     Error, Limits, ParseError,
     proto::{
-        BodyDecoder, BodyEncoder, BodyKind, Decoded, Framing, RequestInfo, encode_request_head,
-        encode_response_head, parse_request_head, parse_response_head,
+        BodyDecoder, BodyEncoder, BodyKind, Decoded, Framing, RequestInfo, RequestTarget,
+        encode_request_head, encode_response_head, parse_request_head, parse_response_head,
     },
 };
 
@@ -730,7 +730,13 @@ fn request_head_encoding() {
         .unwrap();
     let (parts, ()) = request.into_parts();
     let mut head = BytesMut::new();
-    let plan = encode_request_head(&parts, Some(CJK.len() as u64), &mut head).unwrap();
+    let plan = encode_request_head(
+        &parts,
+        RequestTarget::Origin,
+        Some(CJK.len() as u64),
+        &mut head,
+    )
+    .unwrap();
     let expected = format!(
         "POST /submit?lang=ko HTTP/1.1\r\nhost: example.com:8080\r\nexpect: 100-continue\r\ncontent-length: {}\r\n\r\n",
         CJK.len()
@@ -746,7 +752,7 @@ fn request_head_encoding() {
         .into_parts()
         .0;
     let mut head = BytesMut::new();
-    let plan = encode_request_head(&connect, Some(0), &mut head).unwrap();
+    let plan = encode_request_head(&connect, RequestTarget::Origin, Some(0), &mut head).unwrap();
     assert_eq!(
         &head[..],
         b"CONNECT example.com:443 HTTP/1.1\r\nhost: example.com:443\r\n\r\n"
@@ -762,7 +768,7 @@ fn request_head_encoding() {
         .into_parts()
         .0;
     let mut head = BytesMut::new();
-    let plan = encode_request_head(&streaming, None, &mut head).unwrap();
+    let plan = encode_request_head(&streaming, RequestTarget::Origin, None, &mut head).unwrap();
     assert_eq!(plan.encoder.framing(), Framing::Chunked);
     assert_eq!(
         &head[..],
@@ -776,7 +782,103 @@ fn request_head_encoding() {
         .into_parts()
         .0;
     assert!(matches!(
-        encode_request_head(&no_host, Some(0), &mut BytesMut::new()),
+        encode_request_head(
+            &no_host,
+            RequestTarget::Origin,
+            Some(0),
+            &mut BytesMut::new()
+        ),
         Err(Error::MissingHost)
     ));
+}
+
+#[test]
+fn absolute_form_request_target() {
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri("http://user:secret@example.com:8080/a%20b?lang=ko")
+        .body(())
+        .unwrap();
+    let (parts, ()) = request.into_parts();
+    let mut head = BytesMut::new();
+    encode_request_head(&parts, RequestTarget::Absolute, Some(0), &mut head).unwrap();
+    // The target carries the whole URI without its userinfo.
+    assert_eq!(
+        &head[..],
+        b"GET http://example.com:8080/a%20b?lang=ko HTTP/1.1\r\nhost: example.com:8080\r\n\r\n"
+    );
+
+    let bare = http::Request::builder()
+        .uri("https://example.com")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    let mut head = BytesMut::new();
+    encode_request_head(&bare, RequestTarget::Absolute, Some(0), &mut head).unwrap();
+    assert!(head.starts_with(b"GET https://example.com/ HTTP/1.1\r\n"));
+
+    // CONNECT keeps its authority-form.
+    let connect = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri("example.com:443")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    let mut head = BytesMut::new();
+    encode_request_head(&connect, RequestTarget::Absolute, Some(0), &mut head).unwrap();
+    assert!(head.starts_with(b"CONNECT example.com:443 HTTP/1.1\r\n"));
+
+    // A URI without a scheme or authority cannot be written absolute.
+    for uri in ["/path", "example.com"] {
+        let parts = http::Request::builder()
+            .uri(uri)
+            .header("host", "example.com")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        assert!(
+            matches!(
+                encode_request_head(
+                    &parts,
+                    RequestTarget::Absolute,
+                    Some(0),
+                    &mut BytesMut::new()
+                ),
+                Err(Error::AbsoluteTargetIncomplete)
+            ),
+            "{uri}"
+        );
+    }
+}
+
+#[test]
+fn response_with_a_final_coding_other_than_chunked_is_close_delimited() {
+    for coding in ["gzip", "chunked, gzip", "GZIP"] {
+        let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: {coding}\r\n\r\n");
+        let head = response(raw.as_bytes(), &Method::GET);
+        assert_eq!(head.body, BodyKind::CloseDelimited, "{coding}");
+        assert!(!head.keep_alive, "{coding}");
+    }
+    // Still no body where the status or method says so.
+    let head = response(
+        b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: gzip\r\n\r\n",
+        &Method::GET,
+    );
+    assert_eq!(head.body, BodyKind::Empty);
+    let head = response(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+        &Method::HEAD,
+    );
+    assert_eq!(head.body, BodyKind::Empty);
+    // The smuggling rules hold: a length next to any coding is refused, and
+    // so is a coding that is applied before `chunked`.
+    for raw in [
+        &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 4\r\n\r\n"[..],
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+    ] {
+        assert!(parse_response_head(&mut BytesMut::from(raw), &limits(), &Method::GET).is_err());
+    }
 }

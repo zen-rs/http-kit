@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/zen-rs/http-kit/compare/http-kit-v0.4.4...http-kit-v0.5.0) - 2026-11-10
+
+### Added
+
+- *(h1)* absolute-form client targets and close-delimited coded responses
+- *(h1)* header-read, keep-alive idle, body-read and 100-continue timeouts
+- *(h1)* add http-kit-h1, a sans-IO HTTP/1.1 server and client
+- impl_send_endpoint! and impl_send_middleware!
+- [**breaking**] drop the mandatory Send/Sync bounds on Endpoint, Body and middleware
+- *(io)* add http-kit-io, runtime-neutral owned-buffer I/O
+- *(body)* [**breaking**] data, trailers and file-region frames
+
+### Fixed
+
+- *(h1)* an idle keep-alive deadline closes the connection normally
+- *(io)* drop a no-op drop of the borrowed msghdr
+
+### Other
+
+- *(h1)* pass a timer to the new client tests
+- Merge origin/dev into feat/40-h1-client-proxy
+- Merge origin/dev into feat/40-h1-client-proxy
+- Merge pull request #42 from zen-rs/feat/32-drop-send
+- Merge pull request #37 from zen-rs/feat/31-body-frames
+- run tests, lints and feature checks across the workspace
+- drop the typos check
+- run on pull requests only, tiered by target branch
+
 ## [0.4.4](https://github.com/zen-rs/http-kit/compare/v0.4.3...v0.4.4) - 2026-10-29
 
 ### Fixed

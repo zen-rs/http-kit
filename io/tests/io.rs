@@ -179,7 +179,8 @@ async fn udp_segments<I: Io>(io: I) {
 /// A file larger than a pipe, so a splice-based transfer takes several
 /// rounds, sent from an offset that is not page-aligned.
 async fn send_file<I: Io>(io: I, name: &str) {
-    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    // `name` comes from `module_path!`, and Windows forbids `:` in file names.
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name.replace("::", "-"));
     let contents = payload();
     std::fs::write(&path, &contents).expect("write the file to send");
     let file = Rc::new(File::open(&path).expect("open the file to send"));
