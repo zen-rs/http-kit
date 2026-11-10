@@ -97,7 +97,7 @@ fn provider(params: Params) -> Arc<CryptoProvider> {
     })
 }
 
-fn acceptor(identity: &Identity, params: Params, alpn: &[&[u8]]) -> TlsAcceptor {
+fn server_config(identity: &Identity, params: Params, alpn: &[&[u8]]) -> rustls::ServerConfig {
     let mut config = rustls::ServerConfig::builder_with_provider(provider(params))
         .with_protocol_versions(&[params.version])
         .expect("protocol versions")
@@ -105,6 +105,14 @@ fn acceptor(identity: &Identity, params: Params, alpn: &[&[u8]]) -> TlsAcceptor 
         .with_single_cert(identity.chain.clone(), identity.key.clone_key())
         .expect("server certificate");
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    config
+}
+
+fn acceptor(identity: &Identity, params: Params, alpn: &[&[u8]]) -> TlsAcceptor {
+    acceptor_for(server_config(identity, params, alpn))
+}
+
+fn acceptor_for(config: rustls::ServerConfig) -> TlsAcceptor {
     let acceptor = TlsAcceptor::new(Arc::new(config));
     #[cfg(feature = "kernel")]
     let acceptor = acceptor.with_kernel_tls(http_kit_tls::KernelTls::probe().expect("probe"));
@@ -562,9 +570,15 @@ where
     I::TcpStream: Transport,
 {
     let identity = Identity::new();
+    // No session tickets: a client that closes with tickets still unread in
+    // its receive buffer makes the kernel answer with a reset, so the server
+    // would see `ConnectionReset` from TCP rather than the missing
+    // `close_notify` this test is about.
+    let mut config = server_config(&identity, TLS13_AES_128, &[]);
+    config.send_tls13_tickets = 0;
     let (read, ()) = tls_pair(
         io,
-        acceptor(&identity, TLS13_AES_128, &[]),
+        acceptor_for(config),
         connector(&identity, TLS13_AES_128, &[]),
         |mut stream| async move {
             let mut buf = Vec::with_capacity(64);
