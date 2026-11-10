@@ -36,6 +36,12 @@ pub struct AsyncIo;
 pub type TcpStream = readiness::Stream<Async<std::net::TcpStream>>;
 /// A listening TCP socket.
 pub type TcpListener = readiness::Listener<Async<std::net::TcpListener>>;
+/// A connected Unix-domain stream socket.
+#[cfg(unix)]
+pub type UnixStream = readiness::Stream<Async<std::os::unix::net::UnixStream>>;
+/// A listening Unix-domain socket.
+#[cfg(unix)]
+pub type UnixListener = readiness::Listener<Async<std::os::unix::net::UnixListener>>;
 /// A UDP socket, with segmentation offload and receive coalescing on Linux.
 pub type UdpSocket = readiness::Datagram<Async<std::net::UdpSocket>>;
 
@@ -48,6 +54,10 @@ impl Timer for AsyncIo {
 impl Io for AsyncIo {
     type TcpStream = TcpStream;
     type TcpListener = TcpListener;
+    #[cfg(unix)]
+    type UnixStream = UnixStream;
+    #[cfg(unix)]
+    type UnixListener = UnixListener;
     type UdpSocket = UdpSocket;
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
@@ -57,6 +67,14 @@ impl Io for AsyncIo {
     }
 
     fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
+        Async::new(listener).map(readiness::Listener::new)
+    }
+
+    #[cfg(unix)]
+    fn unix_listener(
+        &self,
+        listener: std::os::unix::net::UnixListener,
+    ) -> io::Result<UnixListener> {
         Async::new(listener).map(readiness::Listener::new)
     }
 
@@ -88,8 +106,13 @@ where
     }
 }
 
+readiness::impl_tcp_family!(Async<std::net::TcpStream>);
+#[cfg(unix)]
+readiness::impl_unix_family!(Async<std::os::unix::net::UnixStream>);
+
 impl Listener for TcpListener {
     type Stream = TcpStream;
+    type Addr = SocketAddr;
 
     async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (stream, peer) = self.get_ref().accept().await?;
@@ -97,6 +120,21 @@ impl Listener for TcpListener {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.get_ref().get_ref().local_addr()
+    }
+}
+
+#[cfg(unix)]
+impl Listener for UnixListener {
+    type Stream = UnixStream;
+    type Addr = std::os::unix::net::SocketAddr;
+
+    async fn accept(&self) -> io::Result<(UnixStream, Self::Addr)> {
+        let (stream, peer) = self.get_ref().accept().await?;
+        Ok((readiness::Stream::new(stream), peer))
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
         self.get_ref().get_ref().local_addr()
     }
 }
@@ -109,22 +147,35 @@ impl IntoPoll for TcpStream {
     }
 }
 
+#[cfg(unix)]
+impl IntoPoll for UnixStream {
+    type Poll = PollStream<std::os::unix::net::UnixStream>;
+
+    fn into_poll(self) -> Self::Poll {
+        PollStream(self.into_inner())
+    }
+}
+
 /// async-io's stream behind `futures_io`'s traits, reading into the caller's
 /// buffer directly. Unlike [`Async`]'s own `poll_close`, which only flushes,
 /// closing shuts down the write direction, as every other implementation's
 /// poll-style stream does.
 #[derive(Debug)]
-pub struct PollStream(Async<std::net::TcpStream>);
+pub struct PollStream<T: 'static = std::net::TcpStream>(Async<T>);
 
-impl PollStream {
+impl<T: 'static> PollStream<T> {
     /// async-io's stream.
     #[must_use]
-    pub fn into_inner(self) -> Async<std::net::TcpStream> {
+    pub fn into_inner(self) -> Async<T> {
         self.0
     }
 }
 
-impl futures_io::AsyncRead for PollStream {
+impl<T> futures_io::AsyncRead for PollStream<T>
+where
+    T: 'static,
+    Async<T>: futures_io::AsyncRead,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -142,7 +193,11 @@ impl futures_io::AsyncRead for PollStream {
     }
 }
 
-impl futures_io::AsyncWrite for PollStream {
+impl<T> futures_io::AsyncWrite for PollStream<T>
+where
+    T: 'static,
+    Async<T>: futures_io::AsyncWrite + Ready,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -165,6 +220,6 @@ impl futures_io::AsyncWrite for PollStream {
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(Pin::new(&mut self.0).poll_flush(cx))?;
-        Poll::Ready(self.0.get_ref().shutdown(Shutdown::Write))
+        Poll::Ready(self.0.sock().shutdown(Shutdown::Write))
     }
 }

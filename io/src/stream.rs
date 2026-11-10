@@ -1,6 +1,6 @@
 //! Stream sockets.
 
-use std::{borrow::Borrow, fmt, fs::File, future::Future, io, net::SocketAddr, rc::Rc};
+use std::{borrow::Borrow, fmt, fs::File, future::Future, io, rc::Rc};
 
 use compio_buf::{BufResult, IntoInner, IoBuf, IoBufMut, IoVectoredBuf};
 
@@ -83,16 +83,19 @@ pub trait Split {
 pub trait Listener {
     /// The accepted stream.
     type Stream;
+    /// The address family's address type: [`std::net::SocketAddr`] for TCP,
+    /// `std::os::unix::net::SocketAddr` for a Unix-domain socket.
+    type Addr;
 
     /// Waits for the next connection and returns it with its peer address.
-    fn accept(&self) -> impl Future<Output = io::Result<(Self::Stream, SocketAddr)>>;
+    fn accept(&self) -> impl Future<Output = io::Result<(Self::Stream, Self::Addr)>>;
 
     /// The address this listener is bound to.
     ///
     /// # Errors
     ///
     /// Fails if the operating system cannot report it.
-    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn local_addr(&self) -> io::Result<Self::Addr>;
 }
 
 /// Sends a file region to a stream socket without passing it through user
