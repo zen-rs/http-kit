@@ -98,6 +98,23 @@ pub trait Listener {
     fn local_addr(&self) -> io::Result<Self::Addr>;
 }
 
+/// Writes bytes together with ancillary data, in one `sendmsg(2)`.
+///
+/// A protocol the kernel frames takes per-message metadata this way: kernel
+/// TLS, for one, sends a record of a type other than application data when
+/// the record type comes as a `TLS_SET_RECORD_TYPE` control message.
+#[cfg(unix)]
+pub trait WriteControl {
+    /// Writes some of `buf`'s initialized bytes with `control`, an encoded
+    /// control-message buffer (`cmsghdr`s, as `CMSG_SPACE` lays them out),
+    /// returning how many bytes of `buf` were written.
+    fn write_control<B: IoBuf, C: IoBuf>(
+        &mut self,
+        buf: B,
+        control: C,
+    ) -> impl Future<Output = BufResult<usize, (B, C)>>;
+}
+
 /// Sends a file region to a stream socket without passing it through user
 /// space, where the platform allows.
 ///
@@ -178,6 +195,12 @@ pub(crate) mod sealed {
             offset: u64,
             len: usize,
         ) -> impl Future<Output = BufResult<usize, F>>;
+        #[cfg(unix)]
+        fn write_control<B: IoBuf, C: IoBuf>(
+            &self,
+            buf: B,
+            control: C,
+        ) -> impl Future<Output = BufResult<usize, (B, C)>>;
     }
 }
 
@@ -232,6 +255,17 @@ macro_rules! impl_stream {
             }
         }
 
+        #[cfg(unix)]
+        impl<$($generics)*> $crate::stream::WriteControl for $ty {
+            fn write_control<B: ::compio_buf::IoBuf, C: ::compio_buf::IoBuf>(
+                &mut self,
+                buf: B,
+                control: C,
+            ) -> impl ::std::future::Future<Output = ::compio_buf::BufResult<usize, (B, C)>> {
+                $crate::stream::sealed::SharedStream::write_control(&*self, buf, control)
+            }
+        }
+
         impl<$($generics)*> $crate::stream::Split for $ty {
             type ReadHalf = $crate::stream::ReadHalf<$ty>;
             type WriteHalf = $crate::stream::WriteHalf<$ty>;
@@ -271,6 +305,20 @@ impl<S> WriteHalf<S> {
     #[must_use]
     pub fn get_ref(&self) -> &S {
         &self.0
+    }
+}
+
+#[cfg(unix)]
+impl<S: std::os::fd::AsFd> std::os::fd::AsFd for ReadHalf<S> {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[cfg(unix)]
+impl<S: std::os::fd::AsFd> std::os::fd::AsFd for WriteHalf<S> {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
     }
 }
 
@@ -321,6 +369,17 @@ impl<S: SharedStream> SendFile for WriteHalf<S> {
         len: usize,
     ) -> impl Future<Output = BufResult<usize, F>> {
         self.0.send_file(file, offset, len)
+    }
+}
+
+#[cfg(unix)]
+impl<S: SharedStream> WriteControl for WriteHalf<S> {
+    fn write_control<B: IoBuf, C: IoBuf>(
+        &mut self,
+        buf: B,
+        control: C,
+    ) -> impl Future<Output = BufResult<usize, (B, C)>> {
+        self.0.write_control(buf, control)
     }
 }
 

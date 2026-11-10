@@ -113,6 +113,13 @@ trait Socket: Clone + Fd + 'static {
     fn write_vectored<B: IoVectoredBuf>(&self, buf: B)
     -> impl Future<Output = BufResult<usize, B>>;
     fn shutdown(&self) -> impl Future<Output = io::Result<()>>;
+    /// `sendmsg(2)` of `buf` with the control messages in `control`.
+    #[cfg(unix)]
+    fn write_control<B: IoBuf, C: IoBuf>(
+        &self,
+        buf: B,
+        control: C,
+    ) -> impl Future<Output = BufResult<usize, (B, C)>>;
     /// `sendfile(2)` of a region once the socket is writable.
     #[cfg(target_vendor = "apple")]
     fn sendfile(
@@ -144,6 +151,21 @@ macro_rules! impl_socket {
             async fn shutdown(&self) -> io::Result<()> {
                 let mut stream = self;
                 AsyncWrite::shutdown(&mut stream).await
+            }
+
+            #[cfg(unix)]
+            async fn write_control<B: IoBuf, C: IoBuf>(
+                &self,
+                buf: B,
+                control: C,
+            ) -> BufResult<usize, (B, C)> {
+                use ::compio::driver::op::{SendFlags, SendMsg};
+                use compio_buf::IntoInner as _;
+
+                let op = SendMsg::new(self.clone(), [buf], control, None, SendFlags::empty());
+                let BufResult(res, op) = ::compio::runtime::submit(op).await;
+                let ([buf], control) = op.into_inner();
+                BufResult(res, (buf, control))
             }
 
             #[cfg(target_vendor = "apple")]
@@ -282,6 +304,15 @@ impl<S: Socket> SharedStream for Stream<S> {
 
     async fn shutdown(&self) -> io::Result<()> {
         self.inner.shutdown().await
+    }
+
+    #[cfg(unix)]
+    async fn write_control<B: IoBuf, C: IoBuf>(
+        &self,
+        buf: B,
+        control: C,
+    ) -> BufResult<usize, (B, C)> {
+        self.inner.write_control(buf, control).await
     }
 
     async fn send_file<F: Borrow<File> + 'static>(

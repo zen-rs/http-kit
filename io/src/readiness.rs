@@ -198,6 +198,25 @@ impl<T: Ready> SharedStream for Stream<T> {
         self.0.sock().shutdown(Shutdown::Write)
     }
 
+    #[cfg(unix)]
+    async fn write_control<B: IoBuf, C: IoBuf>(
+        &self,
+        buf: B,
+        control: C,
+    ) -> BufResult<usize, (B, C)> {
+        let res = self
+            .0
+            .write_io(|sock| {
+                let bufs = [IoSlice::new(buf.as_init())];
+                let msg = socket2::MsgHdr::new()
+                    .with_buffers(&bufs)
+                    .with_control(control.as_init());
+                sock.sendmsg(&msg, SEND_FLAGS)
+            })
+            .await;
+        BufResult(res, (buf, control))
+    }
+
     async fn send_file<F: Borrow<File> + 'static>(
         &self,
         file: F,
@@ -236,14 +255,20 @@ impl<T: Ready> SharedStream for Stream<T> {
 
 crate::stream::impl_stream!([T: Ready] Stream<T>);
 
-/// `send(2)`, without raising `SIGPIPE` where the platform takes a flag for
-/// that.
+/// The flags of every stream send: no `SIGPIPE` where the platform takes a
+/// flag for that.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const SEND_FLAGS: libc::c_int = 0;
+
+/// `send(2)` with [`SEND_FLAGS`].
 fn send(sock: SockRef<'_>, buf: &[u8]) -> io::Result<usize> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(unix)]
     {
-        sock.send_with_flags(buf, libc::MSG_NOSIGNAL)
+        sock.send_with_flags(buf, SEND_FLAGS)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(unix))]
     {
         sock.send(buf)
     }
