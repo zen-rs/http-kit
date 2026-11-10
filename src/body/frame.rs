@@ -76,14 +76,14 @@ pub use file::{FileRegion, FileRegionStream};
 mod file {
     extern crate std;
 
-    use alloc::vec::Vec;
     use bytes::Bytes;
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{ready, Context, Poll};
     use futures_lite::Stream;
     use std::fs::File;
-    use std::io::{self, Read, Seek, SeekFrom};
+    use std::io;
+    use std::sync::Arc;
 
     /// The largest chunk [`FileRegionStream`] reads in one blocking call.
     ///
@@ -91,14 +91,16 @@ mod file {
     /// amortise that hop and small enough not to hold a big buffer per stream.
     const READ_CHUNK: u64 = 64 * 1024;
 
-    /// `length` bytes of an owned file, starting at `offset`.
+    /// `length` bytes of a shared file, starting at `offset`.
     ///
-    /// The file's cursor is not part of the region: a sender uses the offset
+    /// The file is an [`Arc<File>`], so any number of regions, and a cache that
+    /// keeps the file open, share one descriptor. The file's cursor is not
+    /// part of the region and is never moved: a sender uses the offset
     /// (sendfile, splice, `pread`), and [`into_stream`](Self::into_stream)
-    /// seeks to it before reading.
-    #[derive(Debug)]
+    /// reads by offset.
+    #[derive(Debug, Clone)]
     pub struct FileRegion {
-        file: File,
+        file: Arc<File>,
         offset: u64,
         len: u64,
     }
@@ -106,17 +108,24 @@ mod file {
     impl FileRegion {
         /// Creates a region of `len` bytes of `file`, starting at `offset`.
         ///
+        /// `file` is a [`File`], which the region then owns, or an existing
+        /// [`Arc<File>`], which it shares without duplicating the descriptor.
+        ///
         /// The region is not checked against the file's size; a reader that
         /// reaches the end of the file before `len` bytes fails with
         /// [`io::ErrorKind::UnexpectedEof`].
         #[must_use]
-        pub const fn new(file: File, offset: u64, len: u64) -> Self {
-            Self { file, offset, len }
+        pub fn new(file: impl Into<Arc<File>>, offset: u64, len: u64) -> Self {
+            Self {
+                file: file.into(),
+                offset,
+                len,
+            }
         }
 
         /// Returns the file the region belongs to.
         #[must_use]
-        pub const fn file(&self) -> &File {
+        pub fn file(&self) -> &File {
             &self.file
         }
 
@@ -140,7 +149,7 @@ mod file {
 
         /// Splits the region into its file, offset and length.
         #[must_use]
-        pub fn into_parts(self) -> (File, u64, u64) {
+        pub fn into_parts(self) -> (Arc<File>, u64, u64) {
             (self.file, self.offset, self.len)
         }
 
@@ -153,10 +162,8 @@ mod file {
         #[must_use]
         pub fn into_stream(self) -> FileRegionStream {
             FileRegionStream {
-                state: State::Idle {
-                    file: self.file,
-                    seek_to: Some(self.offset),
-                },
+                state: State::Idle { file: self.file },
+                position: self.offset,
                 remaining: self.len,
             }
         }
@@ -170,13 +177,15 @@ mod file {
     #[derive(Debug)]
     pub struct FileRegionStream {
         state: State,
+        /// The file offset of the next byte to read; the stream's own cursor.
+        position: u64,
         remaining: u64,
     }
 
     #[derive(Debug)]
     enum State {
-        Idle { file: File, seek_to: Option<u64> },
-        Reading(blocking::Task<(File, io::Result<Bytes>)>),
+        Idle { file: Arc<File> },
+        Reading(blocking::Task<(Arc<File>, io::Result<Bytes>)>),
         Done,
     }
 
@@ -188,18 +197,43 @@ mod file {
         }
     }
 
-    fn read_chunk(mut file: &File, seek_to: Option<u64>, len: u64) -> io::Result<Bytes> {
-        if let Some(offset) = seek_to {
-            file.seek(SeekFrom::Start(offset))?;
-        }
+    /// Reads into `buf` from `offset` without touching the file's cursor.
+    #[cfg(unix)]
+    fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(file, buf, offset)
+    }
+
+    /// Reads into `buf` from `offset`. Windows moves the cursor here, which
+    /// nothing reads: every access to a region's file is by offset.
+    #[cfg(windows)]
+    fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+    }
+
+    #[cfg(target_os = "wasi")]
+    fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::wasi::fs::FileExt::read_at(file, buf, offset)
+    }
+
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
+    compile_error!("the `fs` feature needs positioned file reads, which this target lacks");
+
+    fn read_chunk(file: &File, offset: u64, len: u64) -> io::Result<Bytes> {
         // A chunk is at most `READ_CHUNK`, so it fits in `usize` everywhere.
-        let mut buf = Vec::with_capacity(len as usize);
-        file.take(len).read_to_end(&mut buf)?;
-        if buf.len() as u64 != len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "file ended before the end of its region",
-            ));
+        let mut buf = alloc::vec![0; len as usize];
+        let mut filled = 0;
+        while filled < buf.len() {
+            match read_at(file, &mut buf[filled..], offset + filled as u64) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "file ended before the end of its region",
+                    ));
+                }
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(Bytes::from(buf))
     }
@@ -218,14 +252,14 @@ mod file {
                         return Poll::Ready(None);
                     }
                     State::Idle { .. } => {
-                        let State::Idle { file, seek_to } =
-                            core::mem::replace(&mut this.state, State::Done)
+                        let State::Idle { file } = core::mem::replace(&mut this.state, State::Done)
                         else {
                             unreachable!("matched the idle state above")
                         };
                         let len = this.remaining.min(READ_CHUNK);
+                        let offset = this.position;
                         this.state = State::Reading(blocking::unblock(move || {
-                            let chunk = read_chunk(&file, seek_to, len);
+                            let chunk = read_chunk(&file, offset, len);
                             (file, chunk)
                         }));
                     }
@@ -234,10 +268,8 @@ mod file {
                         return Poll::Ready(Some(match chunk {
                             Ok(chunk) => {
                                 this.remaining -= chunk.len() as u64;
-                                this.state = State::Idle {
-                                    file,
-                                    seek_to: None,
-                                };
+                                this.position += chunk.len() as u64;
+                                this.state = State::Idle { file };
                                 Ok(chunk)
                             }
                             Err(error) => {
