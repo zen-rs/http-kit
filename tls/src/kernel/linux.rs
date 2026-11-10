@@ -25,12 +25,15 @@ use std::{
     cell::RefCell,
     fs::File,
     io, mem,
+    net::{TcpListener, TcpStream},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     rc::Rc,
 };
 
 use http_kit_io::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, Write, WriteControl};
+use ktls_sys::bindings as uapi;
 use rustls::{ConnectionTrafficSecrets, ContentType, ProtocolVersion, kernel::KernelConnection};
+use zeroize::Zeroize;
 
 use super::KernelTls;
 use crate::{
@@ -55,7 +58,7 @@ pub(crate) enum Switched<D: Side> {
     User(Engine<D>),
     /// The kernel has both directions, and these bytes were decrypted
     /// before it took over.
-    Kernel(Shared<D>, Vec<u8>),
+    Kernel(Box<Shared<D>>, Vec<u8>),
 }
 
 /// Moves a connection that finished its handshake to kernel TLS, when the
@@ -87,14 +90,9 @@ pub(crate) async fn switch<D: Side, R: Read, W: Write + AsFd>(
     if engine.peer_closed {
         return Ok(Switched::User(engine));
     }
-    match ktls_core::setup_ulp(&writer.as_fd()) {
+    match setup_ulp(writer.as_fd()) {
         Ok(()) => {}
-        Err(ktls_core::Error::Ulp(error))
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::ENOENT | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
-            ) =>
-        {
+        Err(error) if ulp_unsupported(&error) => {
             // No `tls` module, or a socket that is not TCP. The ULP alone
             // changes nothing about the socket.
             tracing::debug!(%error, "the socket cannot take kernel TLS");
@@ -133,12 +131,12 @@ pub(crate) async fn switch<D: Side, R: Read, W: Write + AsFd>(
         "kernel TLS installed"
     );
     Ok(Switched::Kernel(
-        Shared {
+        Box::new(Shared {
             conn,
             version,
             cipher,
             tx_update_owed: false,
-        },
+        }),
         carried,
     ))
 }
@@ -149,8 +147,242 @@ enum Direction {
     Rx,
 }
 
-fn kernel_error(what: &str, error: &ktls_core::Error) -> io::Error {
-    io::Error::other(format!("kernel TLS: {what}: {error}"))
+fn kernel_error(what: &str, error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("kernel TLS: {what}: {error}"))
+}
+
+/// `TCP_ULP` from `linux/tcp.h`, which neither `libc` nor `ktls-sys`
+/// carries.
+const TCP_ULP: libc::c_int = 31;
+
+/// Attaches the `tls` upper layer protocol to a connected TCP socket.
+fn setup_ulp(fd: BorrowedFd<'_>) -> io::Result<()> {
+    const NAME: &[u8] = b"tls";
+    // SAFETY: `NAME` is `NAME.len()` readable bytes, live across the call.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_ULP,
+            NAME.as_ptr().cast(),
+            NAME.len() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether the ULP was refused because the kernel or the socket cannot do
+/// kernel TLS at all, which leaves the connection in user space.
+fn ulp_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+    )
+}
+
+/// The `tls12_crypto_info_*` structs the kernel takes, by cipher.
+enum CryptoInfo {
+    Aes128Gcm(uapi::tls12_crypto_info_aes_gcm_128),
+    Aes256Gcm(uapi::tls12_crypto_info_aes_gcm_256),
+    Chacha20Poly1305(uapi::tls12_crypto_info_chacha20_poly1305),
+}
+
+impl CryptoInfo {
+    /// The kernel's form of rustls's traffic secrets.
+    fn from_secrets(
+        version: ProtocolVersion,
+        seq: u64,
+        secrets: &ConnectionTrafficSecrets,
+    ) -> io::Result<Self> {
+        let (cipher, key, iv) = match secrets {
+            ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {
+                (Cipher::Aes128Gcm, key.as_ref(), iv.as_ref())
+            }
+            ConnectionTrafficSecrets::Aes256Gcm { key, iv } => {
+                (Cipher::Aes256Gcm, key.as_ref(), iv.as_ref())
+            }
+            ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => {
+                (Cipher::Chacha20Poly1305, key.as_ref(), iv.as_ref())
+            }
+            _ => return Err(io::Error::other("the negotiated keys have no kernel form")),
+        };
+        Self::new(version, seq, cipher, key, iv)
+    }
+
+    /// A direction's key, 12-byte nonce IV and sequence number.
+    ///
+    /// For AES-GCM the kernel wants the nonce IV split into a 4-byte salt and
+    /// the 8-byte explicit IV; ChaCha20-Poly1305 takes it whole.
+    fn new(
+        version: ProtocolVersion,
+        seq: u64,
+        cipher: Cipher,
+        key: &[u8],
+        iv: &[u8],
+    ) -> io::Result<Self> {
+        let version = match version {
+            ProtocolVersion::TLSv1_2 => {
+                (uapi::TLS_1_2_VERSION_MAJOR << 8 | uapi::TLS_1_2_VERSION_MINOR) as u16
+            }
+            ProtocolVersion::TLSv1_3 => {
+                (uapi::TLS_1_3_VERSION_MAJOR << 8 | uapi::TLS_1_3_VERSION_MINOR) as u16
+            }
+            version => {
+                return Err(io::Error::other(format!(
+                    "kernel TLS cannot take {version:?}"
+                )));
+            }
+        };
+        let header = |cipher_type: u32| uapi::tls_crypto_info {
+            version,
+            cipher_type: cipher_type as u16,
+        };
+        let rec_seq = seq.to_be_bytes();
+        Ok(match cipher {
+            Cipher::Aes128Gcm => {
+                let mut info = uapi::tls12_crypto_info_aes_gcm_128 {
+                    info: header(uapi::TLS_CIPHER_AES_GCM_128),
+                    iv: [0; 8],
+                    key: [0; 16],
+                    salt: [0; 4],
+                    rec_seq,
+                };
+                info.salt.copy_from_slice(&iv[..4]);
+                info.iv.copy_from_slice(&iv[4..]);
+                info.key.copy_from_slice(key);
+                Self::Aes128Gcm(info)
+            }
+            Cipher::Aes256Gcm => {
+                let mut info = uapi::tls12_crypto_info_aes_gcm_256 {
+                    info: header(uapi::TLS_CIPHER_AES_GCM_256),
+                    iv: [0; 8],
+                    key: [0; 32],
+                    salt: [0; 4],
+                    rec_seq,
+                };
+                info.salt.copy_from_slice(&iv[..4]);
+                info.iv.copy_from_slice(&iv[4..]);
+                info.key.copy_from_slice(key);
+                Self::Aes256Gcm(info)
+            }
+            Cipher::Chacha20Poly1305 => {
+                let mut info = uapi::tls12_crypto_info_chacha20_poly1305 {
+                    info: header(uapi::TLS_CIPHER_CHACHA20_POLY1305),
+                    iv: [0; 12],
+                    key: [0; 32],
+                    salt: uapi::__IncompleteArrayField::new(),
+                    rec_seq,
+                };
+                info.iv.copy_from_slice(iv);
+                info.key.copy_from_slice(key);
+                Self::Chacha20Poly1305(info)
+            }
+        })
+    }
+
+    /// The struct's bytes, as `setsockopt` takes them.
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        fn bytes<T>(info: &mut T) -> &mut [u8] {
+            // SAFETY: the kernel structs are `repr(C)` and made only of byte
+            // arrays and `u16`s with no padding, so every byte of them is
+            // initialized.
+            unsafe { std::slice::from_raw_parts_mut((info as *mut T).cast(), mem::size_of::<T>()) }
+        }
+        match self {
+            Self::Aes128Gcm(info) => bytes(info),
+            Self::Aes256Gcm(info) => bytes(info),
+            Self::Chacha20Poly1305(info) => bytes(info),
+        }
+    }
+
+    /// Hands the key to the kernel under `option` (`TLS_TX` or `TLS_RX`).
+    fn set(&mut self, fd: BorrowedFd<'_>, option: u32) -> io::Result<()> {
+        let bytes = self.bytes_mut();
+        // SAFETY: `bytes` is `bytes.len()` readable bytes, live across the
+        // call.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_TLS,
+                option as libc::c_int,
+                bytes.as_ptr().cast(),
+                bytes.len() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CryptoInfo {
+    fn drop(&mut self) {
+        // The kernel holds its own copy; ours must not outlive the call.
+        self.bytes_mut().zeroize();
+    }
+}
+
+/// What the kernel takes for one TLS version.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Suites {
+    pub(crate) aes_128_gcm: bool,
+    pub(crate) aes_256_gcm: bool,
+    pub(crate) chacha20_poly1305: bool,
+}
+
+impl Suites {
+    const fn any(self) -> bool {
+        self.aes_128_gcm || self.aes_256_gcm || self.chacha20_poly1305
+    }
+}
+
+/// What the kernel takes, per TLS version.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Ciphers {
+    pub(crate) tls12: Suites,
+    pub(crate) tls13: Suites,
+}
+
+/// Asks the kernel which suites it takes a key for, on loopback sockets.
+/// `None` when it has no TLS offload at all.
+pub(crate) fn probe() -> io::Result<Option<Ciphers>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let mut ciphers = Ciphers {
+        tls12: Suites::default(),
+        tls13: Suites::default(),
+    };
+    for (version, suites) in [
+        (ProtocolVersion::TLSv1_2, &mut ciphers.tls12),
+        (ProtocolVersion::TLSv1_3, &mut ciphers.tls13),
+    ] {
+        for (cipher, key_len, flag) in [
+            (Cipher::Aes128Gcm, 16, &mut suites.aes_128_gcm),
+            (Cipher::Aes256Gcm, 32, &mut suites.aes_256_gcm),
+            (Cipher::Chacha20Poly1305, 32, &mut suites.chacha20_poly1305),
+        ] {
+            // Each try gets a socket of its own, as a ULP attaches once.
+            let stream = TcpStream::connect(addr)?;
+            match setup_ulp(stream.as_fd()) {
+                Ok(()) => {}
+                Err(error) if ulp_unsupported(&error) => return Ok(None),
+                Err(error) => {
+                    return Err(kernel_error("could not probe TCP_ULP \"tls\"", &error));
+                }
+            }
+            let mut info = CryptoInfo::new(version, 0, cipher, &[0; 32][..key_len], &[0; 12])?;
+            *flag = info.set(stream.as_fd(), uapi::TLS_TX).is_ok();
+        }
+    }
+    if !ciphers.tls12.any() && !ciphers.tls13.any() {
+        tracing::debug!("the kernel has TLS offload but takes no suite");
+        return Ok(None);
+    }
+    Ok(Some(ciphers))
 }
 
 /// Installs a direction's key and sequence number on the socket.
@@ -160,15 +392,14 @@ fn install(
     version: ProtocolVersion,
     (seq, secrets): (u64, ConnectionTrafficSecrets),
 ) -> io::Result<()> {
-    let secrets = ktls_core::ConnectionTrafficSecrets::try_from(secrets)
-        .map_err(|error| kernel_error("the negotiated keys have no kernel form", &error))?;
-    let installed = match direction {
-        Direction::Tx => ktls_core::TlsCryptoInfoTx::new(version.into(), secrets, seq)
-            .and_then(|info| info.set(&fd)),
-        Direction::Rx => ktls_core::TlsCryptoInfoRx::new(version.into(), secrets, seq)
-            .and_then(|info| info.set(&fd)),
+    let option = match direction {
+        Direction::Tx => uapi::TLS_TX,
+        Direction::Rx => uapi::TLS_RX,
     };
-    installed
+    // `secrets` zeroizes its key on drop (rustls's `AeadKey`), and the
+    // kernel's form of it zeroizes itself.
+    CryptoInfo::from_secrets(version, seq, &secrets)
+        .and_then(|mut info| info.set(fd, option))
         .map_err(|error| kernel_error(&format!("could not install the {direction:?} key"), &error))
 }
 
@@ -183,11 +414,11 @@ fn rekey_error(error: io::Error) -> io::Error {
 }
 
 pub(crate) fn split<R, W, D: Side>(
-    shared: Shared<D>,
+    shared: Box<Shared<D>>,
     carried: Vec<u8>,
     io: (R, W),
 ) -> (Reader<R, D>, Writer<W, D>) {
-    let shared = Rc::new(RefCell::new(shared));
+    let shared = Rc::new(RefCell::new(*shared));
     (
         Reader {
             io: io.0,
@@ -409,7 +640,7 @@ impl<W: Write + SendFile + WriteControl + AsFd, D: Side> Writer<W, D> {
     /// asked for it or they could take the key past its record limit.
     async fn prepare(&mut self, len: usize) -> io::Result<()> {
         let (owed, version, limit) = {
-            let shared = self.shared.borrow();
+            let shared = RefCell::borrow(&self.shared);
             (
                 shared.tx_update_owed,
                 shared.version,

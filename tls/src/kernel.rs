@@ -15,7 +15,7 @@ use std::io;
 #[derive(Debug, Clone, Copy)]
 pub struct KernelTls {
     #[cfg(target_os = "linux")]
-    ciphers: Option<ktls_core::Compatibilities>,
+    ciphers: Option<linux::Ciphers>,
 }
 
 impl KernelTls {
@@ -32,7 +32,7 @@ impl KernelTls {
     pub fn probe() -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            let ciphers = ktls_core::Compatibilities::probe()?;
+            let ciphers = linux::probe()?;
             if ciphers.is_none() {
                 tracing::debug!("the kernel has no TLS offload; is the `tls` module loaded?");
             }
@@ -75,9 +75,9 @@ impl KernelTls {
             _ => return false,
         };
         match cipher {
-            Cipher::Aes128Gcm => suites.aes_128_gcm(),
-            Cipher::Aes256Gcm => suites.aes_256_gcm(),
-            Cipher::Chacha20Poly1305 => suites.chacha20_poly1305(),
+            Cipher::Aes128Gcm => suites.aes_128_gcm,
+            Cipher::Aes256Gcm => suites.aes_256_gcm,
+            Cipher::Chacha20Poly1305 => suites.chacha20_poly1305,
         }
     }
 }
