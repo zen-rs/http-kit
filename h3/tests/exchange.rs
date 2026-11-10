@@ -332,3 +332,23 @@ fn goaway_drains_on_compio() {
 fn goaway_drains_on_tokio() {
     on_tokio(goaway_drains);
 }
+
+/// The drain again, on threads with a quarter of the default test stack.
+/// The drivers' futures are boxed, so the futures wrapping them, and every
+/// unoptimized frame that moves one, stay small; with the driver state
+/// inline, this needed more than the default 2 MiB. An overflow aborts the
+/// test binary.
+#[test]
+fn goaway_drains_on_a_small_stack() {
+    const STACK: usize = 512 * 1024;
+    let on_small_stack = |test: fn()| {
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    };
+    on_small_stack(|| on_compio(goaway_drains));
+    on_small_stack(|| on_tokio(goaway_drains));
+}

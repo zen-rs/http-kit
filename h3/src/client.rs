@@ -75,7 +75,13 @@ impl Client {
         let mut id = vec![0; quiche::MAX_CONN_ID_LEN];
         boring::rand::rand_bytes(&mut id).expect("BoringSSL's random generator does not fail");
         let scid = quiche::ConnectionId::from_vec(id);
-        let quic = quiche::connect(Some(server_name), &scid, local, peer, &mut self.quic)?;
+        let quic = Box::new(quiche::connect(
+            Some(server_name),
+            &scid,
+            local,
+            peer,
+            &mut self.quic,
+        )?);
         let (send, exchanges) = async_channel::bounded(1);
         let (mailbox, inbox) = async_channel::unbounded();
         Ok((
@@ -215,11 +221,19 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
     /// An error is delivered to each request it affected, as the result of
     /// [`SendRequest::send`] or through its response body.
     ///
+    /// The returned future is a pointer to the driver's state, which lives
+    /// on the heap as long as the connection runs, so a caller that wraps it
+    /// in futures of its own does not carry that state inline in each.
+    ///
     /// # Errors
     ///
     /// The socket failed, the handshake failed, or either side closed the
     /// connection with an error.
-    pub async fn run(self) -> Result<(), Error> {
+    pub fn run(self) -> impl Future<Output = Result<(), Error>> {
+        Box::pin(self.drive())
+    }
+
+    async fn drive(self) -> Result<(), Error> {
         let Self {
             socket,
             timer,

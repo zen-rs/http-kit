@@ -170,8 +170,8 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
     ///
     /// The socket failed. Errors on one connection or stream end only that
     /// connection or stream, and are logged.
-    pub async fn serve<Svc: Service>(self, service: &Svc) -> Result<(), Error> {
-        self.serve_until(service, pending()).await
+    pub fn serve<Svc: Service>(self, service: &Svc) -> impl Future<Output = Result<(), Error>> {
+        self.serve_until(service, pending())
     }
 
     /// Serves like [`serve`](Self::serve) until `shutdown` completes, then
@@ -181,10 +181,22 @@ impl<S: DatagramSocket, T: Timer> Server<S, T> {
     /// refused meanwhile. Returns once every connection has closed; drop the
     /// future to stop at once instead.
     ///
+    /// The returned future is a pointer to the driver's state, which lives
+    /// on the heap as long as the server runs, so a caller that wraps it in
+    /// futures of its own does not carry that state inline in each.
+    ///
     /// # Errors
     ///
     /// As [`serve`](Self::serve).
-    pub async fn serve_until<Svc: Service, F: Future<Output = ()>>(
+    pub fn serve_until<Svc: Service, F: Future<Output = ()>>(
+        self,
+        service: &Svc,
+        shutdown: F,
+    ) -> impl Future<Output = Result<(), Error>> {
+        Box::pin(self.drive(service, shutdown))
+    }
+
+    async fn drive<Svc: Service, F: Future<Output = ()>>(
         mut self,
         service: &Svc,
         shutdown: F,
@@ -492,7 +504,7 @@ impl Endpoint<'_> {
             Admission::Unvalidated => (random_cid(), None),
         };
         let quic = match quiche::accept(&scid, odcid.as_ref(), self.local, from, self.quic) {
-            Ok(quic) => quic,
+            Ok(quic) => Box::new(quic),
             Err(error) => {
                 tracing::debug!(%error, %from, "connection refused");
                 return None;
