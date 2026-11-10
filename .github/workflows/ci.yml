@@ -79,6 +79,11 @@ jobs:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
+      # http-kit-h3's interop test needs a curl built with HTTP/3; Ubuntu's is not.
+      - name: Install an HTTP/3 curl
+        run: |
+          /home/linuxbrew/.linuxbrew/bin/brew install curl
+          echo "HTTP_KIT_H3_CURL=$(/home/linuxbrew/.linuxbrew/bin/brew --prefix curl)/bin/curl" >> "$GITHUB_ENV"
       - run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v4
         with:
