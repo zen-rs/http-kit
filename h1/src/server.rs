@@ -88,7 +88,15 @@ pub struct ServerConnection<R, W, T> {
     timer: T,
     config: ServerConfig,
     date: DateCache,
+    /// Queued writes, kept so each message reuses the allocation.
+    outbox: Outbox,
+    /// Where response heads are encoded; each is split off as `Bytes`, and
+    /// the space comes back once those are written and dropped.
+    head_buf: BytesMut,
 }
+
+/// Room reserved for a response head.
+const RESPONSE_HEAD_CAPACITY: usize = 256;
 
 impl<R, W, T> std::fmt::Debug for ServerConnection<R, W, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -114,6 +122,8 @@ where
             timer,
             config,
             date: DateCache::default(),
+            outbox: Outbox::default(),
+            head_buf: BytesMut::with_capacity(RESPONSE_HEAD_CAPACITY),
         }
     }
 
@@ -274,8 +284,8 @@ where
         let demanded = Cell::new(false);
         // The pump asks for `100 Continue` here, and waits until it was sent
         // or a final response made it moot (the channel closes).
-        let (want_continue, continue_wanted) = async_channel::bounded::<()>(1);
-        let (continued_tx, continued) = async_channel::bounded::<()>(1);
+        // Only a request that asked for it gets the channels.
+        let handshake = expect_continue.then(ContinueHandshake::new);
 
         let recv = &mut self.recv;
         let pump = async {
@@ -284,11 +294,11 @@ where
             };
             let first_read = async {
                 demanded.set(true);
-                if expect_continue {
+                if let Some(handshake) = &handshake {
                     // The responder may already have committed to a final
                     // response and closed both channels; either way, read.
-                    if want_continue.send(()).await.is_ok() {
-                        continued.recv().await.ok();
+                    if handshake.want_continue.send(()).await.is_ok() {
+                        handshake.continued.recv().await.ok();
                     }
                 }
             };
@@ -305,14 +315,15 @@ where
         };
 
         let writer = &mut self.writer;
+        let outbox = &mut self.outbox;
+        let head_buf = &mut self.head_buf;
         let date = self.config.date_header.then(|| self.date.get()).cloned();
         let respond = async {
             let mut call = pin!(service.call(request));
-            let mut outbox = Outbox::default();
-            let response = if expect_continue {
+            let response = if let Some(handshake) = &handshake {
                 let answered = async { Some(call.as_mut().await) };
                 let wants = async {
-                    match continue_wanted.recv().await {
+                    match handshake.continue_wanted.recv().await {
                         Ok(()) => None,
                         Err(_) => pending().await,
                     }
@@ -322,7 +333,7 @@ where
                     None => {
                         outbox.push(Bytes::from_static(b"HTTP/1.1 100 Continue\r\n\r\n"));
                         outbox.flush(writer).await?;
-                        continued_tx.close();
+                        handshake.continued_tx.close();
                         call.await
                     }
                 }
@@ -330,27 +341,32 @@ where
                 call.await
             };
             // From here no `100 Continue` is sent; the pump reads without it.
-            continue_wanted.close();
-            continued_tx.close();
+            if let Some(handshake) = &handshake {
+                handshake.continue_wanted.close();
+                handshake.continued_tx.close();
+            }
 
             let (parts, body) = response.into_parts();
             // A body nobody asked for is unread: the connection cannot be
             // reused, since the client may or may not still send it.
             let unread = has_body && !demanded.get();
-            let mut head = BytesMut::with_capacity(256);
+            // The previous head's bytes are gone by now, so this reclaims
+            // the connection's allocation instead of making a new one.
+            head_buf.clear();
+            head_buf.reserve(RESPONSE_HEAD_CAPACITY);
             let mut plan = encode_response_head(
                 &info,
                 &parts,
                 body.len().map(|len| len as u64),
                 stopping || unread,
                 date.as_ref(),
-                &mut head,
+                head_buf,
             )?;
             if plan.upgrade && has_body && !demanded.get() {
                 return Err(Error::UpgradeBeforeBodyRead);
             }
-            outbox.push(head.freeze());
-            send_message(writer, &mut outbox, Some(body), &mut plan.encoder).await?;
+            outbox.push(head_buf.split().freeze());
+            send_message(writer, outbox, Some(body), &mut plan.encoder).await?;
             Ok::<_, Error>((plan, parts))
         };
 
@@ -385,9 +401,8 @@ where
     /// Sends an empty response with `status` that closes the connection,
     /// and shuts the write side down.
     async fn send_status(&mut self, status: StatusCode) {
-        let mut outbox = Outbox::default();
-        outbox.push(rejection(status));
-        if let Err(error) = outbox.flush(&mut self.writer).await {
+        self.outbox.push(rejection(status));
+        if let Err(error) = self.outbox.flush(&mut self.writer).await {
             tracing::debug!(%error, "could not send the rejection");
         }
         if let Err(error) = self.writer.shutdown().await {
@@ -462,5 +477,30 @@ impl DateCache {
             );
         }
         self.value.as_ref().expect("set above")
+    }
+}
+
+/// The channels of one `Expect: 100-continue` exchange.
+struct ContinueHandshake {
+    /// The pump asks for `100 Continue` here...
+    want_continue: async_channel::Sender<()>,
+    /// ...and the responder hears it here.
+    continue_wanted: async_channel::Receiver<()>,
+    /// The responder closes this once the interim response was sent...
+    continued_tx: async_channel::Sender<()>,
+    /// ...which releases the pump waiting on it.
+    continued: async_channel::Receiver<()>,
+}
+
+impl ContinueHandshake {
+    fn new() -> Self {
+        let (want_continue, continue_wanted) = async_channel::bounded(1);
+        let (continued_tx, continued) = async_channel::bounded(1);
+        Self {
+            want_continue,
+            continue_wanted,
+            continued_tx,
+            continued,
+        }
     }
 }

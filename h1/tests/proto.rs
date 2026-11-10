@@ -354,6 +354,32 @@ fn bounds_head_size_and_field_count() {
 }
 
 #[test]
+fn parses_more_fields_than_the_stack_holds() {
+    let limits = Limits {
+        max_headers: 300,
+        ..Limits::default()
+    };
+    let mut raw = String::from("GET / HTTP/1.1\r\nHost: a\r\n");
+    for i in 0..200 {
+        raw.push_str(&format!("X-{i}: v{i}\r\n"));
+    }
+    raw.push_str("\r\n");
+    let head = parse_request_head(&mut BytesMut::from(raw.as_bytes()), &limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.parts.headers.len(), 201);
+    assert_eq!(head.parts.headers["x-199"], "v199");
+    let over = Limits {
+        max_headers: 150,
+        ..Limits::default()
+    };
+    assert_eq!(
+        parse_request_head(&mut BytesMut::from(raw.as_bytes()), &over).map(|_| ()),
+        Err(ParseError::TooManyHeaders { limit: 150 })
+    );
+}
+
+#[test]
 fn bounds_trailer_sections() {
     let limits = Limits {
         max_headers: 1,

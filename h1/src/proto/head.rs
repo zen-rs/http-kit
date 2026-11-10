@@ -92,6 +92,35 @@ impl ResponseHead {
     }
 }
 
+/// How many header slots a parse keeps on the stack.
+const STACK_SLOTS: usize = 128;
+
+/// Header slots for one parse. Up to [`STACK_SLOTS`] of them live on the
+/// stack, uninitialised and so free to create; a larger `max_headers` falls
+/// back to the heap.
+struct Slots<'a> {
+    stack: [MaybeUninit<httparse::Header<'a>>; STACK_SLOTS],
+    heap: Vec<MaybeUninit<httparse::Header<'a>>>,
+}
+
+impl<'a> Slots<'a> {
+    fn new() -> Self {
+        Self {
+            stack: [const { MaybeUninit::uninit() }; STACK_SLOTS],
+            heap: Vec::new(),
+        }
+    }
+
+    fn get(&mut self, len: usize) -> &mut [MaybeUninit<httparse::Header<'a>>] {
+        if len <= STACK_SLOTS {
+            &mut self.stack[..len]
+        } else {
+            self.heap.resize(len, MaybeUninit::uninit());
+            &mut self.heap
+        }
+    }
+}
+
 /// Fields located in a head that is about to be split off the buffer.
 struct RawFields {
     len: usize,
@@ -176,10 +205,11 @@ pub fn parse_request_head(
     limits: &Limits,
 ) -> Result<Option<RequestHead>, ParseError> {
     let (raw, method, target) = {
-        let mut slots = vec![MaybeUninit::<httparse::Header<'_>>::uninit(); limits.max_headers];
+        let mut storage = Slots::new();
+        let slots = storage.get(limits.max_headers);
         let mut request = httparse::Request::new(&mut []);
         let status = httparse::ParserConfig::default()
-            .parse_request_with_uninit_headers(&mut request, buf, &mut slots)
+            .parse_request_with_uninit_headers(&mut request, buf, slots)
             .map_err(|error| head_error(error, limits))?;
         let len = match status {
             httparse::Status::Partial => {
@@ -322,14 +352,15 @@ pub fn parse_response_head(
     method: &Method,
 ) -> Result<Option<ResponseHead>, ParseError> {
     let (raw, code) = {
-        let mut slots = vec![MaybeUninit::<httparse::Header<'_>>::uninit(); limits.max_headers];
+        let mut storage = Slots::new();
+        let slots = storage.get(limits.max_headers);
         let mut response = httparse::Response::new(&mut []);
         // RFC 9112 §5.1 and §5.2 let a client accept, and repair, two
         // obsolete forms in responses that a server must reject in requests.
         let status = httparse::ParserConfig::default()
             .allow_obsolete_multiline_headers_in_responses(true)
             .allow_spaces_after_header_name_in_responses(true)
-            .parse_response_with_uninit_headers(&mut response, buf, &mut slots)
+            .parse_response_with_uninit_headers(&mut response, buf, slots)
             .map_err(|error| head_error(error, limits))?;
         let len = match status {
             httparse::Status::Partial => {
