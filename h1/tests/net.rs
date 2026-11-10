@@ -92,7 +92,8 @@ impl<W: SendFile> SendFile for Counting<W> {
 /// A file larger than a socket buffer, so the region takes several sends.
 #[cfg(feature = "fs")]
 fn payload_file(name: &str) -> (PathBuf, Vec<u8>) {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    // `name` comes from `module_path!`, and Windows forbids `:` in file names.
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name.replace("::", "-"));
     let mut contents = include_bytes!("net.rs").repeat(48);
     contents.extend(CJK.as_bytes());
     std::fs::write(&path, &contents).expect("write the file to serve");
