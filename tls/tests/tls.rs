@@ -441,6 +441,10 @@ where
     let (offset, len) = (7, contents.len() - 7 - 3);
     let echo = cjk_body(30_000);
     let sent = Rc::new(Cell::new(Sent::default()));
+    // The counts when the file request reaches the server: every earlier
+    // response has been written by then. A client-side reading would race the
+    // server's write completions, which may land after the peer has the bytes.
+    let before_file = Rc::new(Cell::new(None::<Sent>));
 
     let listener = io.bind_tcp(loopback()).expect("bind");
     let addr = listener.local_addr().expect("local address");
@@ -448,8 +452,11 @@ where
     let connector = connector(&identity, TLS13_AES_128, &[b"http/1.1"]);
     let service = |request: Request| {
         let path = path.clone();
+        let sent = sent.clone();
+        let before_file = before_file.clone();
         async move {
             if request.uri().path() == "/file" {
+                before_file.set(Some(sent.get()));
                 let file = File::open(&path).expect("open the file to serve");
                 return Response::new(Body::from_file_region(http_kit::FileRegion::new(
                     file,
@@ -488,7 +495,6 @@ where
             .await
             .expect("client handshake");
         let (send, conn) = handshake_stream(stream, io.clone(), ClientConfig::default());
-        let sent = sent.clone();
         let requests = async move {
             for round in 0..2 {
                 let body = Body::from_frames(futures_lite::stream::iter(
@@ -504,7 +510,6 @@ where
                 assert_bytes(&body, &echo);
                 assert!(!send.is_closed(), "round {round} kept the connection");
             }
-            let before = sent.get();
             let response = send
                 .send(request(Method::GET, "/file", Body::empty()))
                 .await
@@ -513,15 +518,18 @@ where
                 response.headers()["content-length"],
                 len.to_string().as_str()
             );
-            let body = response.into_body().into_bytes().await.expect("file body");
-            let after = sent.get();
-            (body, before, after)
+            response.into_body().into_bytes().await.expect("file body")
         };
         let (ran, out) = zip(conn.run(), requests).await;
         ran.expect("client connection");
         out
     };
-    let ((), (body, before, after)) = zip(server, client).await;
+    let ((), body) = zip(server, client).await;
+    // The server has returned, so all its write completions are counted.
+    let after = sent.get();
+    let before = before_file
+        .get()
+        .expect("the file request reached the server");
     std::fs::remove_file(&path).expect("remove the served file");
     assert_bytes(&body, &contents[offset..offset + len]);
     let from_file = after.sent_from_file - before.sent_from_file;
