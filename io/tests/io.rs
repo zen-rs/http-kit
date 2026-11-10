@@ -336,6 +336,145 @@ async fn poll_echo<I: Io>(io: I) {
     assert_bytes(&echoed, &data);
 }
 
+/// A directory of its own for a Unix socket, short enough for `sun_path`
+/// (104 bytes on Apple platforms), and the socket's path inside it.
+#[cfg(unix)]
+fn unix_socket_dir(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "hk-{}-{}",
+        std::process::id(),
+        name.replace("::", "-")
+    ));
+    std::fs::create_dir_all(&dir).expect("create the socket directory");
+    let path = dir.join("s");
+    (dir, path)
+}
+
+/// A client on its own threads, since the driver has no Unix `connect`: it
+/// sends `data` and shuts down its write direction while reading whatever
+/// the server sends until the server shuts down too.
+#[cfg(unix)]
+fn unix_client(path: std::path::PathBuf, data: Vec<u8>) -> std::thread::JoinHandle<Vec<u8>> {
+    use std::{io::Write as _, net::Shutdown, os::unix::net::UnixStream};
+
+    std::thread::spawn(move || {
+        let stream = UnixStream::connect(&path).expect("connect");
+        let mut writer = stream.try_clone().expect("clone the stream");
+        let sending = std::thread::spawn(move || {
+            writer.write_all(&data).expect("client write");
+            writer.shutdown(Shutdown::Write).expect("client shutdown");
+        });
+        let mut received = Vec::new();
+        std::io::Read::read_to_end(&mut &stream, &mut received).expect("client read");
+        sending.join().expect("client writer");
+        received
+    })
+}
+
+#[cfg(unix)]
+async fn unix_echo<I: Io>(io: I, name: &str) {
+    let (dir, path) = unix_socket_dir(name);
+    let listener = io
+        .unix_listener(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
+        .expect("adopt the listener");
+    let bound = listener.local_addr().expect("local address");
+    assert_eq!(bound.as_pathname(), Some(path.as_path()));
+    let data = payload();
+    let client = unix_client(path, data.clone());
+
+    let (mut stream, peer) = listener.accept().await.expect("accept");
+    assert!(peer.is_unnamed(), "the client never bound an address");
+    let mut buf = Vec::with_capacity(8192);
+    loop {
+        let BufResult(res, filled) = stream.read(buf).await;
+        if res.expect("server read") == 0 {
+            break;
+        }
+        let BufResult(res, filled) = stream.write_all(filled).await;
+        res.expect("server write");
+        buf = filled;
+    }
+    stream.shutdown().await.expect("server shutdown");
+    let echoed = client.join().expect("client");
+    std::fs::remove_dir_all(dir).expect("remove the socket directory");
+    assert_bytes(&echoed, &data);
+}
+
+/// Both halves of a split stream at once: the server reads the whole request
+/// while it writes the whole reply.
+#[cfg(unix)]
+async fn unix_split<I: Io>(io: I, name: &str) {
+    let (dir, path) = unix_socket_dir(name);
+    let listener = io
+        .unix_listener(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
+        .expect("adopt the listener");
+    let data = payload();
+    let mut reply = data.clone();
+    reply.reverse();
+    let client = unix_client(path, data.clone());
+
+    let (stream, _) = listener.accept().await.expect("accept");
+    let (mut reader, mut writer) = stream.split();
+    let (received, ()) = zip(read_to_end(&mut reader), async {
+        let BufResult(res, _) = writer.write_all(reply.clone()).await;
+        res.expect("server write");
+        writer.shutdown().await.expect("server shutdown");
+    })
+    .await;
+    let answered = client.join().expect("client");
+    std::fs::remove_dir_all(dir).expect("remove the socket directory");
+    assert_bytes(&received, &data);
+    assert_bytes(&answered, &reply);
+}
+
+#[cfg(unix)]
+async fn unix_send_file<I: Io>(io: I, name: &str) {
+    let (dir, path) = unix_socket_dir(name);
+    let contents = payload();
+    let file_path = dir.join("f");
+    std::fs::write(&file_path, &contents).expect("write the file to send");
+    let file = Rc::new(File::open(&file_path).expect("open the file to send"));
+    let (offset, len) = (7, contents.len() - 7 - 3);
+
+    let listener = io
+        .unix_listener(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
+        .expect("adopt the listener");
+    let client = unix_client(path, Vec::new());
+
+    let (mut stream, _) = listener.accept().await.expect("accept");
+    let BufResult(res, file) = stream.send_file_all(file.clone(), offset, len).await;
+    res.expect("send file region");
+    let BufResult(res, _) = stream.send_file(file, contents.len() as u64, 16).await;
+    assert_eq!(res.expect("send past the end"), 0);
+    stream.shutdown().await.expect("shutdown");
+    let received = client.join().expect("client");
+    std::fs::remove_dir_all(dir).expect("remove the socket directory");
+    assert_bytes(&received, &contents[offset as usize..offset as usize + len]);
+}
+
+#[cfg(unix)]
+async fn unix_poll_echo<I: Io>(io: I, name: &str) {
+    let (dir, path) = unix_socket_dir(name);
+    let listener = io
+        .unix_listener(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
+        .expect("adopt the listener");
+    let data = payload();
+    let client = unix_client(path, data.clone());
+
+    let (stream, _) = listener.accept().await.expect("accept");
+    let mut stream = stream.into_poll();
+    let mut received = Vec::new();
+    stream
+        .read_to_end(&mut received)
+        .await
+        .expect("server read");
+    stream.write_all(&received).await.expect("server write");
+    stream.close().await.expect("server close");
+    let echoed = client.join().expect("client");
+    std::fs::remove_dir_all(dir).expect("remove the socket directory");
+    assert_bytes(&echoed, &data);
+}
+
 async fn timer<I: Io>(io: I) {
     let start = Instant::now();
     io.sleep(Duration::from_millis(20)).await;
@@ -391,6 +530,30 @@ macro_rules! suite {
         #[test]
         fn poll_echo() {
             $run(super::poll_echo($io));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unix_echo() {
+            $run(super::unix_echo($io, concat!(module_path!(), "-echo")));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unix_split() {
+            $run(super::unix_split($io, concat!(module_path!(), "-split")));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unix_send_file() {
+            $run(super::unix_send_file($io, concat!(module_path!(), "-file")));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unix_poll_echo() {
+            $run(super::unix_poll_echo($io, concat!(module_path!(), "-poll")));
         }
 
         #[test]
