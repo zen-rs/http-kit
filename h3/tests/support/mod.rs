@@ -78,6 +78,10 @@ pub struct Pki {
     pub leaf: Vec<u8>,
     /// The authority's certificate, DER.
     pub ca: Vec<u8>,
+    /// The server's chain, PEM, for a hand-written QUIC peer.
+    pub chain_pem: Vec<u8>,
+    /// The server's private key, PEM.
+    pub key_pem: Vec<u8>,
 }
 
 pub fn pki() -> Pki {
@@ -121,8 +125,11 @@ pub fn pki() -> Pki {
 
     let mut chain = leaf.to_pem().unwrap();
     chain.extend(ca.to_pem().unwrap());
+    let key_pem = leaf_key.private_key_to_pem_pkcs8().unwrap();
     Pki {
-        identity: Identity::from_pem(chain, leaf_key.private_key_to_pem_pkcs8().unwrap()),
+        identity: Identity::from_pem(chain.clone(), key_pem.clone()),
+        chain_pem: chain,
+        key_pem,
         root: ca.to_pem().unwrap(),
         leaf: leaf.to_der().unwrap(),
         ca: ca.to_der().unwrap(),
