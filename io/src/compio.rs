@@ -366,6 +366,16 @@ impl Listener for TcpListener {
     }
 }
 
+/// A datagram operation's result with its error in the code every other
+/// implementation reports: on Windows, compio completes through a completion
+/// port, which reports an ICMP error as its Win32 code.
+fn completed<T>(res: io::Result<T>) -> io::Result<T> {
+    #[cfg(windows)]
+    return res.map_err(crate::sys::iocp::socket_error);
+    #[cfg(not(windows))]
+    res
+}
+
 /// A UDP socket, with segmentation offload and receive coalescing on Linux.
 #[derive(Debug)]
 pub struct UdpSocket {
@@ -409,7 +419,7 @@ impl UdpSocket {
         target: SocketAddr,
         source: Option<IpAddr>,
     ) -> BufResult<usize, B> {
-        match (segment, source) {
+        let BufResult(res, buf) = match (segment, source) {
             (None, None) => self.inner.send_to(buf, target).await,
             #[cfg(any(
                 target_os = "linux",
@@ -442,7 +452,8 @@ impl UdpSocket {
                 windows
             )))]
             (Some(_), _) => unreachable!("segmented sends need segmentation offload"),
-        }
+        };
+        BufResult(completed(res), buf)
     }
 }
 
@@ -515,7 +526,7 @@ impl DatagramSocket for UdpSocket {
                 let segment = received.segment.unwrap_or(n);
                 Ok(RecvMeta::new(n, segment, from).with_destination(received.destination))
             });
-            BufResult(res, buf)
+            BufResult(completed(res), buf)
         }
         #[cfg(not(any(
             target_os = "linux",

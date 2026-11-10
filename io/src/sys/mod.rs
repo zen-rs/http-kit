@@ -25,3 +25,6 @@ pub(crate) mod control;
 
 #[cfg(all(windows, any(feature = "tokio", feature = "async-io")))]
 pub(crate) mod winsock;
+
+#[cfg(all(windows, feature = "compio"))]
+pub(crate) mod iocp;
