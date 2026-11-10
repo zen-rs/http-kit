@@ -151,10 +151,6 @@ fn kernel_error(what: &str, error: &io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("kernel TLS: {what}: {error}"))
 }
 
-/// `TCP_ULP` from `linux/tcp.h`, which neither `libc` nor `ktls-sys`
-/// carries.
-const TCP_ULP: libc::c_int = 31;
-
 /// Attaches the `tls` upper layer protocol to a connected TCP socket.
 fn setup_ulp(fd: BorrowedFd<'_>) -> io::Result<()> {
     const NAME: &[u8] = b"tls";
@@ -163,7 +159,7 @@ fn setup_ulp(fd: BorrowedFd<'_>) -> io::Result<()> {
         libc::setsockopt(
             fd.as_raw_fd(),
             libc::IPPROTO_TCP,
-            TCP_ULP,
+            libc::TCP_ULP,
             NAME.as_ptr().cast(),
             NAME.len() as libc::socklen_t,
         )
