@@ -225,6 +225,9 @@ impl<T: std::os::fd::AsFd> std::os::fd::AsFd for Listener<T> {
 pub struct Datagram<T> {
     inner: T,
     max_segments: usize,
+    /// Winsock has no `recvmsg` to call; this is its `WSARecvMsg`.
+    #[cfg(windows)]
+    recv_msg: crate::sys::winsock::RecvMsg,
 }
 
 impl<T: Ready> Datagram<T> {
@@ -239,6 +242,15 @@ impl<T: Ready> Datagram<T> {
             let local = socket_addr(sock.local_addr()?)?;
             crate::sys::control::enable_pktinfo(sock.as_fd(), local)?;
         }
+        #[cfg(windows)]
+        let recv_msg = {
+            use std::os::windows::io::AsSocket;
+
+            let sock = inner.sock();
+            let local = socket_addr(sock.local_addr()?)?;
+            crate::sys::control::enable_pktinfo(sock.as_socket(), local)?;
+            crate::sys::winsock::RecvMsg::load(sock.as_socket())?
+        };
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let max_segments = {
             use std::os::fd::AsFd;
@@ -252,6 +264,8 @@ impl<T: Ready> Datagram<T> {
         Ok(Self {
             inner,
             max_segments,
+            #[cfg(windows)]
+            recv_msg,
         })
     }
 }
@@ -292,7 +306,12 @@ impl<T: Ready> Datagram<T> {
             .inner
             .write_io(|sock| match (segment, source) {
                 (None, None) => sock.send_to(buf.as_init(), &target),
-                #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_vendor = "apple",
+                    windows
+                ))]
                 (segment, source) => {
                     let control = crate::sys::control::ControlBuf::send(segment, source);
                     let bufs = [IoSlice::new(buf.as_init())];
@@ -305,7 +324,8 @@ impl<T: Ready> Datagram<T> {
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "android",
-                    target_vendor = "apple"
+                    target_vendor = "apple",
+                    windows
                 )))]
                 (None, Some(_)) => Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -314,7 +334,8 @@ impl<T: Ready> Datagram<T> {
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "android",
-                    target_vendor = "apple"
+                    target_vendor = "apple",
+                    windows
                 )))]
                 (Some(_), _) => unreachable!("segmented sends need segmentation offload"),
             })
@@ -390,7 +411,31 @@ impl<T: Ready> DatagramSocket for Datagram<T> {
                 })
                 .await
         };
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        #[cfg(windows)]
+        let res = {
+            use std::os::windows::io::AsSocket;
+
+            let mut control = crate::sys::control::ControlBuf::new();
+            self.inner
+                .read_io(|sock| {
+                    let (n, control_len, from) = self.recv_msg.recv(
+                        sock.as_socket(),
+                        buf.as_uninit(),
+                        control.as_uninit(),
+                    )?;
+                    let received = control.parse(control_len);
+                    let segment = received.segment.unwrap_or(n);
+                    Ok(RecvMeta::new(n, segment, socket_addr(from)?)
+                        .with_destination(received.destination))
+                })
+                .await
+        };
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            windows
+        )))]
         let res = self
             .inner
             .read_io(|sock| {
