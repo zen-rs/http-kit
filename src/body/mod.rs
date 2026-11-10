@@ -1602,7 +1602,6 @@ mod tests {
     #[tokio::test]
     async fn regions_of_one_shared_file_stream_their_own_bytes() {
         use futures_lite::StreamExt;
-        use std::io::Read;
 
         let file = TempFile::new("shared-regions", CJK_TEXT.as_bytes());
         let shared = std::sync::Arc::new(file.open());
@@ -1630,6 +1629,8 @@ mod tests {
         // moves it, which nothing depends on: every access is by offset.
         #[cfg(not(windows))]
         {
+            use std::io::Read;
+
             let mut all = Vec::new();
             (&*shared).read_to_end(&mut all).unwrap();
             assert_eq!(all, bytes);
