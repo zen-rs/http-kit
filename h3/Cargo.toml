@@ -1,0 +1,58 @@
+[package]
+name = "http-kit-h3"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Lexo Liu <me@lexo.cool>"]
+license = "MIT"
+description = "HTTP/3 server and client on quiche, driven over owned-buffer datagram I/O"
+documentation = "https://docs.rs/http-kit-h3"
+repository = "https://github.com/lexoooooo/http-kit"
+homepage = "https://github.com/lexoooooo/http-kit"
+keywords = ["http", "http3", "quic", "quiche", "server"]
+categories = ["network-programming", "web-programming::http-server", "web-programming::http-client"]
+
+[features]
+## The HTTP/3 server and client. quiche builds BoringSSL from source with
+## cmake, so nothing is compiled without this feature.
+quiche = [
+    "dep:quiche",
+    "dep:boring",
+    "dep:http-kit",
+    "dep:http-kit-io",
+    "dep:http",
+    "dep:bytes",
+    "dep:async-channel",
+    "dep:futures-lite",
+    "dep:futures-util",
+    "dep:thiserror",
+    "dep:tracing",
+]
+## File-region body frames, read out through `FileRegion::into_stream`.
+fs = ["quiche", "http-kit/fs"]
+
+[dependencies]
+quiche = { version = "0.30.0", default-features = false, features = ["boringssl-boring-crate"], optional = true }
+boring = { version = "5.4.0", default-features = false, optional = true }
+http-kit = { version = "0.4.4", path = "..", default-features = false, features = ["std"], optional = true }
+http-kit-io = { version = "0.1.0", path = "../io", optional = true }
+http = { version = "1.5.0", default-features = false, features = ["std"], optional = true }
+bytes = { version = "1.12.1", default-features = false, features = ["std"], optional = true }
+async-channel = { version = "2.5.0", default-features = false, features = ["std"], optional = true }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"], optional = true }
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"], optional = true }
+thiserror = { version = "2.0.21", default-features = false, optional = true }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+http-kit-io = { version = "0.1.0", path = "../io", features = ["tokio", "compio"] }
+compio = { version = "0.19.2", default-features = false, features = ["runtime"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[package.metadata.docs.rs]
+all-features = true
