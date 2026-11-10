@@ -12,7 +12,7 @@ use std::{
     fs::File,
     future::Future,
     io::{self, IoSlice},
-    net::{Shutdown, SocketAddr},
+    net::{IpAddr, Shutdown, SocketAddr},
     num::NonZeroU16,
 };
 
@@ -231,6 +231,14 @@ impl<T: Ready> Datagram<T> {
     /// Wraps a registered socket, enabling segmentation offload and receive
     /// coalescing where the kernel has them.
     pub(crate) fn new(inner: T) -> io::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            use std::os::fd::AsFd;
+
+            let sock = inner.sock();
+            let local = socket_addr(sock.local_addr()?)?;
+            crate::sys::control::enable_pktinfo(sock.as_fd(), local)?;
+        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let max_segments = {
             use std::os::fd::AsFd;
@@ -278,14 +286,15 @@ impl<T: Ready> Datagram<T> {
         buf: B,
         segment: Option<NonZeroU16>,
         target: SockAddr,
+        source: Option<IpAddr>,
     ) -> BufResult<usize, B> {
         let res = self
             .inner
-            .write_io(|sock| match segment {
-                None => sock.send_to(buf.as_init(), &target),
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                Some(size) => {
-                    let control = crate::sys::linux::ControlBuf::segment(size);
+            .write_io(|sock| match (segment, source) {
+                (None, None) => sock.send_to(buf.as_init(), &target),
+                #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+                (segment, source) => {
+                    let control = crate::sys::control::ControlBuf::send(segment, source);
                     let bufs = [IoSlice::new(buf.as_init())];
                     let msg = socket2::MsgHdr::new()
                         .with_addr(&target)
@@ -293,8 +302,21 @@ impl<T: Ready> Datagram<T> {
                         .with_control(control.as_init());
                     sock.sendmsg(&msg, 0)
                 }
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                Some(_) => unreachable!("segmented sends need segmentation offload"),
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_vendor = "apple"
+                )))]
+                (None, Some(_)) => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "choosing a datagram's source address is not supported on this platform",
+                )),
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_vendor = "apple"
+                )))]
+                (Some(_), _) => unreachable!("segmented sends need segmentation offload"),
             })
             .await;
         BufResult(res, buf)
@@ -310,32 +332,34 @@ impl<T: Ready> DatagramSocket for Datagram<T> {
         self.max_segments
     }
 
-    fn send_to<B: IoBuf>(
+    fn send_from<B: IoBuf>(
         &self,
         buf: B,
         target: SocketAddr,
+        source: Option<IpAddr>,
     ) -> impl Future<Output = BufResult<usize, B>> {
-        self.send_one(buf, None, SockAddr::from(target))
+        self.send_one(buf, None, SockAddr::from(target), source)
     }
 
-    fn send_segments<B: IoBuf>(
+    fn send_segments_from<B: IoBuf>(
         &self,
         buf: B,
         segment_size: NonZeroU16,
         target: SocketAddr,
+        source: Option<IpAddr>,
     ) -> impl Future<Output = BufResult<usize, B>> {
         let target = SockAddr::from(target);
         send_batched(buf, segment_size, self.max_segments, move |slice, gso| {
-            self.send_one(slice, gso, target.clone())
+            self.send_one(slice, gso, target.clone(), source)
         })
     }
 
     async fn recv_from<B: IoBufMut>(&self, mut buf: B) -> BufResult<RecvMeta, B> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         let res = {
             use socket2::{MaybeUninitSlice, SockAddrStorage};
 
-            let mut control = crate::sys::linux::ControlBuf::new();
+            let mut control = crate::sys::control::ControlBuf::new();
             self.inner
                 .read_io(|sock| {
                     // SAFETY: a zeroed storage of its full size is a valid
@@ -353,15 +377,20 @@ impl<T: Ready> DatagramSocket for Datagram<T> {
                         .with_control(control.as_uninit());
                     let n = sock.recvmsg(&mut msg, 0)?;
                     let (truncated, control_len) = (msg.flags().is_truncated(), msg.control_len());
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     if truncated {
                         return Err(crate::datagram::truncated_coalesced());
                     }
-                    let segment = control.gro_segment(control_len).unwrap_or(n);
-                    Ok(RecvMeta::new(n, segment, socket_addr(from)?))
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    let _ = truncated;
+                    let received = control.parse(control_len);
+                    let segment = received.segment.unwrap_or(n);
+                    Ok(RecvMeta::new(n, segment, socket_addr(from)?)
+                        .with_destination(received.destination))
                 })
                 .await
         };
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
         let res = self
             .inner
             .read_io(|sock| {
