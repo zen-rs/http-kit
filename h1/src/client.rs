@@ -23,9 +23,118 @@ use crate::{
     proto::{BodyDecoder, BodyKind, ResponseHead, encode_request_head, parse_response_head},
 };
 
+/// A request on its way to the connection.
+///
+/// One that is dropped before the connection took it (the connection ended
+/// while it waited in the queue) hands its request back to the caller that
+/// sent it: nothing of it was written.
 struct Exchange {
-    request: Request,
-    respond: Sender<Result<Response, Error>>,
+    request: Option<Request>,
+    respond: Sender<Result<Response, TrySendError>>,
+}
+
+impl Exchange {
+    fn new(request: Request, respond: Sender<Result<Response, TrySendError>>) -> Self {
+        Self {
+            request: Some(request),
+            respond,
+        }
+    }
+
+    /// The request and where its answer goes; the connection has taken it.
+    fn take(mut self) -> (Request, Sender<Result<Response, TrySendError>>) {
+        let request = self
+            .request
+            .take()
+            .expect("an exchange holds its request until taken");
+        (request, self.respond.clone())
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            self.respond
+                .try_send(Err(TrySendError::unsent(Error::ConnectionClosed, request)))
+                .ok();
+        }
+    }
+}
+
+/// A request that failed, and the request itself if nothing of it was
+/// written.
+///
+/// Like hyper's `TrySendError`: when the connection had stopped taking
+/// requests, or ended before it took this one, [`take_request`](Self::take_request)
+/// returns the request as it was handed in, and it can be sent on another
+/// connection whatever its method or body. Once the connection took the
+/// request, a failure leaves nothing to give back.
+pub struct TrySendError {
+    error: Error,
+    /// Boxed: a request is large, and an error is returned by value.
+    request: Option<Box<Request>>,
+}
+
+impl TrySendError {
+    fn unsent(error: Error, request: Request) -> Self {
+        Self {
+            error,
+            request: Some(Box::new(request)),
+        }
+    }
+
+    /// Why the request failed.
+    #[must_use]
+    pub const fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// Why the request failed, dropping the request.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        self.error
+    }
+
+    /// The request, if none of it was written. It is returned once.
+    pub fn take_request(&mut self) -> Option<Request> {
+        self.request.take().map(|request| *request)
+    }
+}
+
+impl From<Error> for TrySendError {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            request: None,
+        }
+    }
+}
+
+impl From<TrySendError> for Error {
+    fn from(error: TrySendError) -> Self {
+        error.error
+    }
+}
+
+impl fmt::Debug for TrySendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrySendError")
+            .field("error", &self.error)
+            .field("unsent", &self.request.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Display for TrySendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for TrySendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 /// Sends requests on a connection.
@@ -57,12 +166,32 @@ impl SendRequest {
     /// The request cannot be sent as given, or the connection failed or
     /// closed before the response head arrived.
     pub async fn send(&self, request: Request) -> Result<Response, Error> {
+        self.try_send(request).await.map_err(Error::from)
+    }
+
+    /// As [`send`](Self::send), but a failure that left the request unwritten
+    /// gives it back: the connection had stopped taking requests, or ended
+    /// while this one waited for its turn. A pool can send it again on
+    /// another connection, whatever its method or body.
+    ///
+    /// # Errors
+    ///
+    /// As [`send`](Self::send), with the request in the [`TrySendError`]
+    /// when it can be recovered.
+    pub async fn try_send(&self, request: Request) -> Result<Response, TrySendError> {
         let (respond, response) = async_channel::bounded(1);
-        self.exchanges
-            .send(Exchange { request, respond })
+        if let Err(refused) = self.exchanges.send(Exchange::new(request, respond)).await {
+            let mut exchange = refused.into_inner();
+            let request = exchange
+                .request
+                .take()
+                .expect("a refused exchange holds its request");
+            return Err(TrySendError::unsent(Error::ConnectionClosed, request));
+        }
+        response
+            .recv()
             .await
-            .map_err(|_| Error::ConnectionClosed)?;
-        response.recv().await.map_err(|_| Error::ConnectionClosed)?
+            .map_err(|_| TrySendError::from(Error::ConnectionClosed))?
     }
 
     /// Whether the connection has stopped taking requests.
@@ -90,13 +219,36 @@ impl<R, W> fmt::Debug for ClientOutcome<R, W> {
     }
 }
 
+/// The requests waiting for the connection. Whatever is still queued when
+/// the connection is dropped, by whatever path it ended, goes back to the
+/// callers, unwritten: a queue that outlived its receiver (the handles hold
+/// the channel) would keep them waiting forever.
+struct Queue(Receiver<Exchange>);
+
+impl Queue {
+    async fn recv(&self) -> Result<Exchange, async_channel::RecvError> {
+        self.0.recv().await
+    }
+
+    fn close(&self) {
+        self.0.close();
+    }
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        self.0.close();
+        while self.0.try_recv().is_ok() {}
+    }
+}
+
 /// The socket side of a client connection: drive it with
 /// [`run`](Self::run).
 pub struct Connection<R, W, T> {
     recv: Recv<R>,
     writer: W,
     timer: T,
-    exchanges: Receiver<Exchange>,
+    exchanges: Queue,
     config: ClientConfig,
 }
 
@@ -129,7 +281,7 @@ where
             recv: Recv::new(reader, config.read_buffer_size),
             writer,
             timer,
-            exchanges,
+            exchanges: Queue(exchanges),
             config,
         },
     )
@@ -194,7 +346,7 @@ where
     }
 
     async fn exchange(&mut self, exchange: Exchange) -> Result<Next, Error> {
-        let Exchange { request, respond } = exchange;
+        let (request, respond) = exchange.take();
         let (parts, body) = request.into_parts();
         let mut head = BytesMut::with_capacity(256);
         let encoded = encode_request_head(
@@ -207,7 +359,7 @@ where
             Ok(plan) => plan,
             Err(error) => {
                 // Nothing was written: the connection is still usable.
-                respond.send(Err(error)).await.ok();
+                respond.send(Err(error.into())).await.ok();
                 return Ok(Next::KeepAlive);
             }
         };
@@ -294,7 +446,7 @@ where
             Ok(received) => received,
             Err(error) => {
                 if !delivered.get() {
-                    respond.send(Err(error.clone())).await.ok();
+                    respond.send(Err(error.clone().into())).await.ok();
                 }
                 return Err(error);
             }
