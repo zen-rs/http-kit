@@ -67,6 +67,13 @@ impl Io for Tokio {
             .map(readiness::Stream::new)
     }
 
+    #[cfg(unix)]
+    async fn connect_unix(&self, path: &std::path::Path) -> io::Result<UnixStream> {
+        ::tokio::net::UnixStream::connect(path)
+            .await
+            .map(readiness::Stream::new)
+    }
+
     fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
         listener.set_nonblocking(true)?;
         ::tokio::net::TcpListener::from_std(listener).map(readiness::Listener::new)

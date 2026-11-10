@@ -35,7 +35,7 @@ use crate::{
     Io,
     datagram::{DatagramSocket, RecvMeta, send_batched},
     poll::{CopyingPoll, IntoPoll},
-    stream::{Listener, impl_stream, sealed::SharedStream},
+    stream::{Listener, TcpOptions, impl_stream, sealed::SharedStream},
     time::Timer,
 };
 
@@ -61,6 +61,11 @@ impl Io for Compio {
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         net::TcpStream::connect(addr).await.map(TcpStream::new)
+    }
+
+    #[cfg(unix)]
+    async fn connect_unix(&self, path: &std::path::Path) -> io::Result<UnixStream> {
+        net::UnixStream::connect(path).await.map(UnixStream::new)
     }
 
     fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
@@ -268,6 +273,16 @@ impl Stream<net::TcpStream> {
     /// Fails if the socket is not connected.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.inner.peer_addr()
+    }
+}
+
+impl TcpOptions for Stream<net::TcpStream> {
+    fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.inner.set_nodelay(nodelay)
+    }
+
+    fn nodelay(&self) -> io::Result<bool> {
+        self.inner.nodelay()
     }
 }
 
