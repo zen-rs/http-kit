@@ -23,7 +23,9 @@
 use std::{
     borrow::Borrow,
     cell::RefCell,
+    fmt,
     fs::File,
+    future::Future,
     io, mem,
     net::{TcpListener, TcpStream},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
@@ -40,6 +42,7 @@ use crate::{
     engine::{Engine, copy_into, tls_error},
     record::{self, Boundary, CLOSE_NOTIFY, Cipher, Control, KEY_UPDATE, MAX_FRAGMENT, Message},
     side::Side,
+    stream::{KernelRead, KernelWrite},
 };
 
 /// What the halves share: rustls's key schedule, which both directions
@@ -441,7 +444,7 @@ pub(crate) fn split<R, W, D: Side>(
 
 /// The reading half: plain reads of the socket, and the records the kernel
 /// hands back.
-pub(crate) struct Reader<R, D: Side> {
+pub struct Reader<R, D: Side> {
     io: R,
     shared: Rc<RefCell<Shared<D>>>,
     /// Plaintext rustls decrypted before the switch, read first.
@@ -625,7 +628,7 @@ async fn send_record<W: WriteControl>(
 }
 
 /// The writing half: plain writes and file transfers, sealed by the kernel.
-pub(crate) struct Writer<W, D: Side> {
+pub struct Writer<W, D: Side> {
     io: W,
     shared: Rc<RefCell<Shared<D>>>,
     /// The most records sealed under the current key.
@@ -716,5 +719,61 @@ impl<W: Write + SendFile + WriteControl + AsFd, D: Side> Writer<W, D> {
         let res = self.io.send_file(file, offset, len).await;
         self.count(&res.0);
         res
+    }
+}
+
+impl<R: Read + AsFd, D: Side> KernelRead<R, D> for Reader<R, D> {
+    fn get_ref(&self) -> &R {
+        Self::get_ref(self)
+    }
+
+    fn read<B: IoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
+        Self::read(self, buf)
+    }
+}
+
+impl<W: Write + SendFile + WriteControl + AsFd, D: Side> KernelWrite<W, D> for Writer<W, D> {
+    fn get_ref(&self) -> &W {
+        Self::get_ref(self)
+    }
+
+    fn write<B: IoBuf>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
+        Self::write(self, buf)
+    }
+
+    fn write_vectored<B: IoVectoredBuf>(
+        &mut self,
+        buf: B,
+    ) -> impl Future<Output = BufResult<usize, B>> {
+        Self::write_vectored(self, buf)
+    }
+
+    fn flush(&mut self) -> impl Future<Output = io::Result<()>> {
+        Self::flush(self)
+    }
+
+    fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> {
+        Self::shutdown(self)
+    }
+
+    fn send_file<F: Borrow<File> + 'static>(
+        &mut self,
+        file: F,
+        offset: u64,
+        len: usize,
+    ) -> impl Future<Output = BufResult<usize, F>> {
+        Self::send_file(self, file, offset, len)
+    }
+}
+
+impl<R, D: Side> fmt::Debug for Reader<R, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reader").finish_non_exhaustive()
+    }
+}
+
+impl<W, D: Side> fmt::Debug for Writer<W, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Writer").finish_non_exhaustive()
     }
 }
