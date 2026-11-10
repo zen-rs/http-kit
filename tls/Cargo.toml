@@ -1,0 +1,48 @@
+[package]
+name = "http-kit-tls"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Lexo Liu <me@lexo.cool>"]
+license = "MIT"
+description = "TLS over owned-buffer streams with rustls's unbuffered API, handing the record layer to kernel TLS on Linux"
+documentation = "https://docs.rs/http-kit-tls"
+repository = "https://github.com/lexoooooo/http-kit"
+homepage = "https://github.com/lexoooooo/http-kit"
+keywords = ["tls", "rustls", "ktls", "io-uring", "async"]
+categories = ["network-programming", "cryptography", "asynchronous"]
+
+[features]
+## Kernel TLS on Linux: after the handshake the socket's records are sealed
+## and opened by the kernel, so file regions go out through
+## `sendfile`/`splice`. Nothing changes on other platforms.
+kernel = ["dep:ktls-sys", "dep:libc", "dep:zeroize"]
+
+[dependencies]
+http-kit-io = { version = "0.3.1", path = "../io" }
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ktls-sys = { version = "1.0.2", default-features = false, optional = true }
+zeroize = { version = "1.9.1", default-features = false, optional = true }
+libc = { version = "0.2.191", default-features = false, optional = true }
+
+[dev-dependencies]
+http-kit = { version = "0.5.1", path = "..", default-features = false, features = ["std", "fs"] }
+http-kit-io = { version = "0.3.1", path = "../io", features = ["compio", "tokio"] }
+http-kit-h1 = { version = "0.2.1", path = "../h1", features = ["fs"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+http = { version = "1.5.0", default-features = false, features = ["std"] }
+compio = { version = "0.19.2", default-features = false, features = ["runtime"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[package.metadata.docs.rs]
+all-features = true

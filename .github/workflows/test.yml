@@ -33,5 +33,9 @@ jobs:
         run: |
           /home/linuxbrew/.linuxbrew/bin/brew install curl
           echo "HTTP_KIT_H3_CURL=$(/home/linuxbrew/.linuxbrew/bin/brew --prefix curl)/bin/curl" >> "$GITHUB_ENV"
+      # http-kit-tls asserts that its connections move to kernel TLS.
+      - name: Load the kernel TLS module
+        if: runner.os == 'Linux'
+        run: sudo modprobe tls
       - run: cargo nextest run --workspace --all-features
       - run: cargo test --doc --workspace --all-features

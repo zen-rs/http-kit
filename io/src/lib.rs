@@ -13,6 +13,8 @@
 //! - [`Read`], [`Write`], [`Split`] and [`Listener`]: stream sockets.
 //! - [`SendFile`]: file-to-socket transfer, through `sendfile`/`splice` where
 //!   the platform has them.
+//! - `WriteControl` (Unix): a write carrying control messages, for
+//!   protocols the kernel frames (kernel TLS record types).
 //! - [`DatagramSocket`]: datagram sockets with segmentation offload (GSO) on
 //!   send and receive coalescing (GRO).
 //! - [`Timer`] for deadlines.
@@ -63,6 +65,9 @@ pub use crate::{
     stream::{Listener, Read, ReadHalf, SendFile, Split, Write, WriteHalf},
     time::Timer,
 };
+
+#[cfg(unix)]
+pub use crate::stream::WriteControl;
 
 /// One I/O implementation: its stream and datagram sockets and its timer.
 ///
