@@ -98,6 +98,13 @@ pub(crate) async fn switch<D: Side, R: Read, W: Write + AsFd>(
             tracing::debug!(%error, "the socket cannot take kernel TLS");
             return Ok(Switched::User(engine));
         }
+        Err(error) if error.raw_os_error() == Some(libc::ENOTCONN) => {
+            // The ULP attaches only to an established connection, and the
+            // peer has already closed this one. Nothing has changed on the
+            // socket; rustls serves what is left and reports how it ended.
+            tracing::debug!("the peer closed before kernel TLS could take over");
+            return Ok(Switched::User(engine));
+        }
         Err(error) => return Err(kernel_error("could not set TCP_ULP \"tls\"", &error)),
     }
     loop {

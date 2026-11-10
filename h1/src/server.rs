@@ -411,7 +411,13 @@ where
     }
 
     async fn close(mut self) -> Result<ServerOutcome<R, W>, Error> {
-        self.writer.shutdown().await?;
+        match self.writer.shutdown().await {
+            // The peer reset the connection first: it is already closed.
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {
+                tracing::debug!("the peer closed the connection before its shutdown");
+            }
+            result => result?,
+        }
         Ok(ServerOutcome::Closed)
     }
 }
