@@ -45,6 +45,7 @@ thiserror = { version = "2.0.21", default-features = false, optional = true }
 tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
+socket2 = { version = "0.6.5", default-features = false }
 http-kit-io = { version = "0.1.0", path = "../io", features = ["tokio", "compio"] }
 compio = { version = "0.19.2", default-features = false, features = ["runtime"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt"] }

@@ -46,7 +46,10 @@ impl ConnectionInfo {
         self.peer
     }
 
-    /// The server socket's address.
+    /// The server address the client reached: the datagram destination the
+    /// socket reported with the socket's port, which for a wildcard-bound
+    /// socket is the specific local address, or the socket's bound address
+    /// on a platform that reports none.
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.local
@@ -54,6 +57,10 @@ impl ConnectionInfo {
 
     pub(crate) const fn set_peer(&mut self, peer: SocketAddr) {
         self.peer = peer;
+    }
+
+    pub(crate) const fn set_local(&mut self, local: SocketAddr) {
+        self.local = local;
     }
 }
 
@@ -150,6 +157,7 @@ pub(crate) struct Stream {
 /// A packet quiche paced into the future, held until its release time.
 pub(crate) struct Held {
     pub(crate) to: SocketAddr,
+    pub(crate) from: SocketAddr,
     pub(crate) at: Instant,
     pub(crate) len: usize,
 }
