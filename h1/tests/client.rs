@@ -450,3 +450,129 @@ fn an_unsendable_request_leaves_the_connection_usable() {
         ran.unwrap();
     });
 }
+
+/// The request as a pool would hold it: a `POST`, which no retry policy
+/// based on the method would resend, with a body in three languages.
+fn order() -> Request {
+    let mut request = request(
+        Method::POST,
+        "http://example.com/orders?item=1",
+        Body::from_frames(stream::iter([
+            Ok::<_, std::io::Error>(BodyFrame::Data(Bytes::from_static("你好".as_bytes()))),
+            Ok(BodyFrame::Data(Bytes::from_static("こんにちは".as_bytes()))),
+            Ok(BodyFrame::Data(Bytes::from_static("안녕하세요".as_bytes()))),
+        ])),
+    );
+    request
+        .headers_mut()
+        .insert("x-order", HeaderValue::from_static("1"));
+    request
+}
+
+/// Checks that a recovered request is the one that was sent, and sends it on
+/// a new connection to a server that echoes the body.
+async fn resend_on_a_new_connection(mut returned: http_kit_h1::TrySendError) {
+    assert!(matches!(returned.error(), Error::ConnectionClosed));
+    let recovered = returned.take_request().expect("nothing was written");
+    assert!(returned.take_request().is_none(), "it is returned once");
+    assert_eq!(recovered.method(), Method::POST);
+    assert_eq!(recovered.uri(), "http://example.com/orders?item=1");
+    assert_eq!(recovered.headers()["x-order"], "1");
+
+    let ends = connection();
+    let (server_in, server_out) = ends.server;
+    let (client_in, client_out) = ends.client;
+    let service = |request: Request| async move {
+        let echoed = request.into_body().into_bytes().await.unwrap();
+        Response::new(Body::from_bytes(echoed))
+    };
+    let server = ServerConnection::new(server_in, server_out, NeverTimer, ServerConfig::default())
+        .serve(&service);
+    let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
+    let client = async move {
+        let response = send.send(recovered).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().into_bytes().await.unwrap();
+        assert_eq!(text(&body), "你好こんにちは안녕하세요");
+    };
+    let ((served, ran), ()) = zip(zip(server, conn.run()), client).await;
+    served.unwrap();
+    assert!(matches!(ran.unwrap(), ClientOutcome::Closed));
+}
+
+/// A request waiting for its turn on a connection the server then closes
+/// was never written: it comes back intact, and goes out on a new one.
+#[test]
+fn a_request_queued_behind_a_closing_connection_comes_back() {
+    block_on(async {
+        let ends = connection();
+        let (mut server_in, server_out) = ends.server;
+        let (client_in, client_out) = ends.client;
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
+        let peer = async move {
+            server_in.until(b"\r\n\r\n").await;
+            // Long enough for the second request to be queued behind the
+            // first.
+            for _ in 0..8 {
+                futures_lite::future::yield_now().await;
+            }
+            server_out.send(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+            server_in.read_to_end().await;
+        };
+        let first = async {
+            let response = send
+                .send(request(
+                    Method::GET,
+                    "http://example.com/first",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        };
+        let second = async {
+            futures_lite::future::yield_now().await;
+            send.try_send(order()).await.unwrap_err()
+        };
+        let ((), (ran, ((), returned))) = zip(peer, zip(conn.run(), zip(first, second))).await;
+        assert!(matches!(ran.unwrap(), ClientOutcome::Closed));
+        resend_on_a_new_connection(returned).await;
+    });
+}
+
+/// A handle whose connection has ended hands the request back without
+/// queueing it.
+#[test]
+fn a_request_sent_after_the_connection_ended_comes_back() {
+    block_on(async {
+        let ends = connection();
+        let (mut server_in, server_out) = ends.server;
+        let (client_in, client_out) = ends.client;
+        let (send, conn) = handshake(client_in, client_out, NeverTimer, ClientConfig::default());
+        let peer = async move {
+            server_in.until(b"\r\n\r\n").await;
+            server_out.send(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+            server_in.read_to_end().await;
+        };
+        let first = async {
+            send.send(request(
+                Method::GET,
+                "http://example.com/first",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        };
+        let ((), (ran, ())) = zip(peer, zip(conn.run(), first)).await;
+        assert!(matches!(ran.unwrap(), ClientOutcome::Closed));
+        assert!(send.is_closed());
+
+        let returned = send.try_send(order()).await.unwrap_err();
+        resend_on_a_new_connection(returned).await;
+        // `send` reports the same failure, without the request.
+        assert!(matches!(
+            send.send(order()).await,
+            Err(Error::ConnectionClosed)
+        ));
+    });
+}

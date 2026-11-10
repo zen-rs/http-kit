@@ -102,7 +102,7 @@ use std::fmt;
 use bytes::Bytes;
 
 pub use crate::{
-    client::{ClientOutcome, Connection, SendRequest, handshake, handshake_stream},
+    client::{ClientOutcome, Connection, SendRequest, TrySendError, handshake, handshake_stream},
     config::{ClientConfig, Limits, ServerConfig},
     error::{Error, ParseError, Timeout},
     proto::RequestTarget,
