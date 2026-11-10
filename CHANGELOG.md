@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/zen-rs/http-kit/compare/v0.5.1...v0.5.2) - 2026-11-10
+
+### Added
+
+- *(tls)* rustls over owned-buffer streams, with kernel TLS on Linux
+
+### Fixed
+
+- *(release)* tag http-kit-h3 h3/v<version>
+- *(tls,h1)* a peer that closes first is not an error
+- *(tls)* build kernel TLS on ktls-sys, and compile on Linux
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/79-tls
+- *(tls)* send no session tickets in the truncation test
+- *(tls)* take TCP_ULP from libc
+- load the kernel TLS module on Linux
+
 ## [0.5.1](https://github.com/zen-rs/http-kit/compare/v0.5.0...v0.5.1) - 2026-11-10
 
 ### Added
