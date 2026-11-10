@@ -198,6 +198,16 @@ impl<S> Stream<S> {
     }
 }
 
+/// Adopts a connected compio stream: one a runtime of this thread registered,
+/// such as a socket accepted elsewhere and handed over as a std stream (on
+/// Windows a socket joins one completion port only, so a thread-per-core
+/// server accepts where no port is involved and each thread adopts its share).
+impl From<net::TcpStream> for TcpStream {
+    fn from(stream: net::TcpStream) -> Self {
+        Self::new(stream)
+    }
+}
+
 #[cfg(unix)]
 impl Stream<net::UnixStream> {
     /// The local address.
