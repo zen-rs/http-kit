@@ -9,7 +9,7 @@
 //! read lands in a buffer of its own and is joined to it afterwards, so the
 //! writing half can ask rustls to encrypt while a read is in flight.
 
-use std::{io, mem, mem::MaybeUninit};
+use std::{fmt, io, mem, mem::MaybeUninit};
 
 use http_kit_io::{BufResult, IntoInner as _, IoBuf as _, Read, Write};
 use rustls::unbuffered::{
@@ -39,7 +39,7 @@ pub(crate) fn copy_into(dest: &mut [MaybeUninit<u8>], src: &[u8]) -> usize {
 }
 
 /// A connection's rustls state and the bytes around it.
-pub(crate) struct Engine<D: Side> {
+pub struct Engine<D: Side> {
     pub(crate) conn: D::Connection,
     /// Ciphertext rustls has not yet had discarded.
     pub(crate) incoming: Vec<u8>,
@@ -430,5 +430,11 @@ impl Records {
         self.buf = slice.into_inner();
         self.len = 0;
         res
+    }
+}
+
+impl<D: Side> fmt::Debug for Engine<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Engine").finish_non_exhaustive()
     }
 }

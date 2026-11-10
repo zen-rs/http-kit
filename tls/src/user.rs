@@ -6,7 +6,7 @@
 //! while it is in flight; a write sends records the reading half produced
 //! (a key update's answer) ahead of its own.
 
-use std::{borrow::Borrow, cell::RefCell, fs::File, io, mem, rc::Rc};
+use std::{borrow::Borrow, cell::RefCell, fmt, fs::File, io, mem, rc::Rc};
 
 use http_kit_io::{BufResult, IntoInner as _, IoBuf, IoBufMut, IoVectoredBuf, Read, Write};
 
@@ -23,7 +23,7 @@ const MAX_WRITE: usize = 4 << 14;
 const GATHER_BELOW: usize = 1024;
 
 /// The reading half.
-pub(crate) struct Reader<R, D: Side> {
+pub struct Reader<R, D: Side> {
     io: R,
     engine: Rc<RefCell<Engine<D>>>,
     /// Where socket reads land: a copy of the unprocessed tail of
@@ -32,7 +32,7 @@ pub(crate) struct Reader<R, D: Side> {
 }
 
 /// The writing half.
-pub(crate) struct Writer<W, D: Side> {
+pub struct Writer<W, D: Side> {
     io: W,
     engine: Rc<RefCell<Engine<D>>>,
     out: Records,
@@ -216,5 +216,17 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     #[cfg(windows)]
     {
         std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+    }
+}
+
+impl<R, D: Side> fmt::Debug for Reader<R, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reader").finish_non_exhaustive()
+    }
+}
+
+impl<W, D: Side> fmt::Debug for Writer<W, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Writer").finish_non_exhaustive()
     }
 }
