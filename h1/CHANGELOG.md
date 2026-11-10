@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/zen-rs/http-kit/compare/h1/v0.2.2...h1/v0.2.3) - 2026-11-10
+
+### Fixed
+
+- *(tls,h1)* a peer that closes first is not an error
+
 ## [0.2.2](https://github.com/zen-rs/http-kit/compare/h1/v0.2.1...h1/v0.2.2) - 2026-11-10
 
 ### Other
