@@ -9,7 +9,7 @@
 //! The handle is `Clone` and `Send`, so a connection pool can hold it while
 //! the connection itself, like every future here, stays on one thread.
 
-use std::{cell::Cell, fmt};
+use std::{cell::Cell, fmt, time::Duration};
 
 use async_channel::{Receiver, Sender};
 use bytes::BytesMut;
@@ -18,7 +18,7 @@ use http_kit::{Body, Request, Response};
 use http_kit_io::{Read, SendFile, Split, Timer, Write};
 
 use crate::{
-    ClientConfig, Error, ParseError, Upgraded, body,
+    ClientConfig, Error, ParseError, Timeout, Upgraded, body,
     conn::{Outbox, Pumped, Recv, deadline_after, pump_body, send_message, until, while_driving},
     proto::{BodyDecoder, BodyKind, ResponseHead, encode_request_head, parse_response_head},
 };
@@ -368,6 +368,7 @@ where
         let requested_upgrade = plan.upgrade;
         let limits = &self.config.limits;
         let continue_timeout = self.config.expect_continue_timeout;
+        let read_timeout = self.config.read_timeout;
         let timer = &self.timer;
 
         // A message once the server answered `100 Continue`; closed once a
@@ -400,7 +401,7 @@ where
         let recv = &mut self.recv;
         let receive = async {
             let head = loop {
-                let head = read_head(recv, limits, &method).await?;
+                let head = read_head(recv, limits, &method, timer, read_timeout).await?;
                 if !head.is_interim() {
                     break head;
                 }
@@ -433,7 +434,7 @@ where
             let pumped = match pump {
                 None => Pumped::Complete,
                 Some((sender, decoder)) => {
-                    pump_body(recv, decoder, limits, sender, timer, None, async {}).await?
+                    pump_body(recv, decoder, limits, sender, timer, read_timeout, async {}).await?
                 }
             };
             Ok(Received::Response {
@@ -487,17 +488,23 @@ enum Received {
     Upgrade,
 }
 
-async fn read_head<R: Read>(
+/// Reads one response head, each wait for bytes bounded by `read_timeout`.
+async fn read_head<R: Read, T: Timer>(
     recv: &mut Recv<R>,
     limits: &crate::Limits,
     method: &Method,
+    timer: &T,
+    read_timeout: Option<Duration>,
 ) -> Result<ResponseHead, Error> {
     loop {
         if let Some(head) = parse_response_head(&mut recv.buf, limits, method)? {
             tracing::trace!(status = %head.parts.status, "response");
             return Ok(head);
         }
-        if recv.fill().await? == 0 {
+        let read = until(timer, deadline_after(read_timeout), recv.fill())
+            .await
+            .ok_or(Error::Timeout(Timeout::HeadRead))??;
+        if read == 0 {
             return Err(if recv.buf.is_empty() {
                 Error::ConnectionClosed
             } else {

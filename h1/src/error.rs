@@ -182,19 +182,24 @@ pub enum Error {
     Timeout(Timeout),
 }
 
-/// Which deadline of a [`ServerConfig`](crate::ServerConfig) passed.
+/// Which deadline of a [`ServerConfig`](crate::ServerConfig) or
+/// [`ClientConfig`](crate::ClientConfig) passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Timeout {
-    /// A request head did not arrive in full within
-    /// [`header_read_timeout`](crate::ServerConfig::header_read_timeout). A
+    /// On a server, a request head did not arrive in full within
+    /// [`header_read_timeout`](crate::ServerConfig::header_read_timeout); a
     /// server that had received part of the head answered `408 Request
-    /// Timeout` before closing (RFC 9110 §15.5.9).
-    #[error("request head not received in time")]
+    /// Timeout` before closing (RFC 9110 §15.5.9). On a client, a wait for
+    /// the response head (interim responses included) delivered nothing
+    /// within [`read_timeout`](crate::ClientConfig::read_timeout).
+    #[error("message head not received in time")]
     HeadRead,
-    /// A read of the request body delivered nothing within
-    /// [`body_read_timeout`](crate::ServerConfig::body_read_timeout).
-    #[error("request body stalled")]
+    /// A read of a message body delivered nothing within
+    /// [`body_read_timeout`](crate::ServerConfig::body_read_timeout) on a
+    /// server, or [`read_timeout`](crate::ClientConfig::read_timeout) on a
+    /// client.
+    #[error("message body stalled")]
     BodyRead,
 }
 
