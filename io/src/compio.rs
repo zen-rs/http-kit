@@ -94,9 +94,20 @@ pub type TcpStream = Stream<net::TcpStream>;
 #[cfg(unix)]
 pub type UnixStream = Stream<net::UnixStream>;
 
+/// A socket's file descriptor, which the Unix paths (`splice`, `sendfile`)
+/// hand to the kernel; Windows sockets need none.
+#[cfg(unix)]
+trait Fd: std::os::fd::AsFd {}
+#[cfg(unix)]
+impl<T: std::os::fd::AsFd> Fd for T {}
+#[cfg(not(unix))]
+trait Fd {}
+#[cfg(not(unix))]
+impl<T> Fd for T {}
+
 /// A stream socket of compio's, which the operations below drive through a
 /// shared reference.
-trait Socket: Clone + 'static {
+trait Socket: Clone + Fd + 'static {
     fn read<B: IoBufMut>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
     fn write<B: IoBuf>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
     fn write_vectored<B: IoVectoredBuf>(&self, buf: B)
