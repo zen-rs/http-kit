@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/http-kit/compare/h1/v0.3.0...h1/v0.4.0) - 2026-11-10
+
+### Added
+
+- *(h1)* [**breaking**] make the connection settings non-exhaustive
+- *(h1)* [**breaking**] add a client read timeout
+
 ## [0.3.0](https://github.com/zen-rs/http-kit/compare/h1/v0.2.3...h1/v0.3.0) - 2026-11-10
 
 ### Added
