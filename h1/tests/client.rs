@@ -304,10 +304,8 @@ fn absolute_form_targets_are_sent_when_asked_for() {
         let ends = connection();
         let (mut server_in, server_out) = ends.server;
         let (client_in, client_out) = ends.client;
-        let config = ClientConfig {
-            request_target: RequestTarget::Absolute,
-            ..ClientConfig::default()
-        };
+        let mut config = ClientConfig::default();
+        config.request_target = RequestTarget::Absolute;
         let (send, conn) = handshake(client_in, client_out, NeverTimer, config);
         let peer = async {
             let head = server_in.until(b"\r\n\r\n").await;

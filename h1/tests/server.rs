@@ -13,10 +13,9 @@ use http_kit_io::{BufResult, Read as _, Write as _};
 use support::{CJK, NeverTimer, PipeReader, PipeWriter, connection, within_reads};
 
 fn config() -> ServerConfig {
-    ServerConfig {
-        date_header: false,
-        ..ServerConfig::default()
-    }
+    let mut config = ServerConfig::default();
+    config.date_header = false;
+    config
 }
 
 fn text(response: &[u8]) -> String {
@@ -303,10 +302,8 @@ fn received_bodies_are_not_copied() {
             }
         };
         // Small reads, so the body arrives across many of them.
-        let config = ServerConfig {
-            read_buffer_size: 100,
-            ..config()
-        };
+        let mut config = config();
+        config.read_buffer_size = 100;
         let mut request = format!(
             "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n",
             body.len()
