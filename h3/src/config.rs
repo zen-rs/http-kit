@@ -13,7 +13,10 @@ use boring::{
     x509::X509,
 };
 
-use crate::Error;
+use crate::{
+    Error,
+    retry::{RetryConfig, TokenKey},
+};
 
 /// The congestion controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -162,6 +165,15 @@ pub struct ServerConfig {
     pub qpack_blocked_streams: u64,
     /// The most bytes one read of a request body hands up.
     pub read_size: usize,
+    /// Address validation with a stateless Retry; `None` opens a connection
+    /// for every Initial without one.
+    ///
+    /// The default retries every new connection under a key generated for
+    /// this configuration: no tuning makes a flood of spoofed Initials
+    /// allocate connection state, at the cost of one round trip per
+    /// handshake. Servers sharing one address need one shared
+    /// [`TokenKey`](crate::TokenKey).
+    pub retry: Option<RetryConfig>,
 }
 
 impl ServerConfig {
@@ -177,6 +189,7 @@ impl ServerConfig {
             qpack_max_table_capacity: 0,
             qpack_blocked_streams: 0,
             read_size: 64 * 1024,
+            retry: Some(RetryConfig::new(TokenKey::generate())),
         }
     }
 

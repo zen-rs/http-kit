@@ -157,7 +157,10 @@ pub(crate) struct Held {
 /// One connection.
 pub(crate) struct Conn {
     pub(crate) key: ConnKey,
-    pub(crate) quic: quiche::Connection,
+    /// Boxed: quiche's connection is about 8 KiB, which every move of a
+    /// `Conn` (a client's [`Connection`](crate::Connection) handed to its
+    /// caller, a server's map growing) would otherwise copy.
+    pub(crate) quic: Box<quiche::Connection>,
     pub(crate) h3: Option<h3::Connection>,
     pub(crate) streams: HashMap<u64, Stream>,
     pub(crate) info: ConnectionInfo,
@@ -178,7 +181,7 @@ pub(crate) struct Conn {
 impl Conn {
     pub(crate) fn new(
         key: ConnKey,
-        quic: quiche::Connection,
+        quic: Box<quiche::Connection>,
         local: SocketAddr,
         peer: SocketAddr,
         read_size: usize,
