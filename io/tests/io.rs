@@ -4,7 +4,7 @@
 
 use std::{
     fs::File,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU16,
     rc::Rc,
     time::{Duration, Instant},
@@ -176,6 +176,83 @@ async fn udp_segments<I: Io>(io: I) {
     assert_bytes(&datagrams.concat(), &data);
 }
 
+/// A socket bound to `wildcard` receives datagrams sent to each of
+/// `destinations`, reports each one's destination, and a reply sent from that
+/// address reaches the client from it.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+async fn udp_destination<I: Io>(io: &I, wildcard: SocketAddr, destinations: &[IpAddr]) {
+    let server = io.bind_udp(wildcard).expect("bind wildcard server");
+    let port = server.local_addr().expect("server address").port();
+    let question = include_bytes!("io.rs")[..300].to_vec();
+
+    for &destination in destinations {
+        let client = io
+            .bind_udp(SocketAddr::new(loopback_for(destination), 0))
+            .expect("bind client");
+        let target = SocketAddr::new(destination, port);
+
+        let serve = async {
+            let BufResult(res, buf) = server
+                .recv_from(Vec::with_capacity(MAX_COALESCED_BYTES))
+                .await;
+            let meta = res.expect("server receive");
+            assert_eq!(
+                meta.destination(),
+                Some(destination),
+                "datagram to {target}"
+            );
+            let BufResult(res, _) = server.send_from(buf, meta.from(), meta.destination()).await;
+            assert_eq!(res.expect("reply from the destination"), meta.len());
+        };
+        let ask = async {
+            let BufResult(res, _) = client.send_to(question.clone(), target).await;
+            assert_eq!(res.expect("client send"), question.len());
+            let BufResult(res, buf) = client
+                .recv_from(Vec::with_capacity(MAX_COALESCED_BYTES))
+                .await;
+            let meta = res.expect("client receive");
+            assert_eq!(meta.from(), target, "the reply comes from {destination}");
+            buf
+        };
+        let ((), reply) = zip(serve, ask).await;
+        assert_bytes(&reply, &question);
+    }
+}
+
+/// The loopback address of the family of `ip`.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn loopback_for(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
+        IpAddr::V6(_) => Ipv6Addr::LOCALHOST.into(),
+    }
+}
+
+/// An IPv6 wildcard socket is dual-stack: it sees both families.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+async fn udp_destination_dual_stack<I: Io>(io: I) {
+    udp_destination(
+        &io,
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        &[Ipv6Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()],
+    )
+    .await;
+}
+
+/// Linux answers for all of 127/8; other platforms have only 127.0.0.1.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn udp_destination_v4<I: Io>(io: I) {
+    udp_destination(
+        &io,
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        &[
+            Ipv4Addr::LOCALHOST.into(),
+            Ipv4Addr::new(127, 0, 0, 2).into(),
+        ],
+    )
+    .await;
+}
+
 /// A file larger than a pipe, so a splice-based transfer takes several
 /// rounds, sent from an offset that is not page-aligned.
 async fn send_file<I: Io>(io: I, name: &str) {
@@ -261,6 +338,18 @@ macro_rules! suite {
         #[test]
         fn udp_segments() {
             $run(super::udp_segments($io));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[test]
+        fn udp_destination_dual_stack() {
+            $run(super::udp_destination_dual_stack($io));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[test]
+        fn udp_destination_v4() {
+            $run(super::udp_destination_v4($io));
         }
 
         #[test]
