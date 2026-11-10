@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/http-kit/compare/h1/v0.2.3...h1/v0.3.0) - 2026-11-10
+
+### Added
+
+- *(h1)* hand back a request the connection never wrote
+
+### Other
+
+- Merge pull request #98 from zen-rs/fix/93-h1-try-send
+- *(body)* [**breaking**] share a file region's file through an Arc
+
 ## [0.2.3](https://github.com/zen-rs/http-kit/compare/h1/v0.2.2...h1/v0.2.3) - 2026-11-10
 
 ### Fixed

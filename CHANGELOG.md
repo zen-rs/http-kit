@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/http-kit/compare/v0.5.2...v0.6.0) - 2026-11-10
+
+### Other
+
+- Merge pull request #96 from zen-rs/fix/91-tls-nested
+- Merge pull request #95 from zen-rs/fix/90-io-unix-nodelay
+- Merge pull request #98 from zen-rs/fix/93-h1-try-send
+- Merge pull request #97 from zen-rs/fix/92-h3-verify-ready
+- *(tls)* require the counting wrapper to be a transport where it is used
+- Merge remote-tracking branch 'origin/dev' into fix/91-tls-nested
+- *(body)* import Read only where the cursor check runs
+- *(body)* check the shared file's cursor only where positioned reads keep it
+- *(body)* [**breaking**] share a file region's file through an Arc
+
 ## [0.5.2](https://github.com/zen-rs/http-kit/compare/v0.5.1...v0.5.2) - 2026-11-10
 
 ### Added
