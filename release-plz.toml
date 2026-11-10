@@ -23,3 +23,15 @@ name = "http-kit-h1"
 git_tag_name = "h1/v{{ version }}"
 git_release_name = "h1/v{{ version }}"
 git_release_latest = false
+
+[[package]]
+name = "http-kit-h3"
+git_tag_name = "h3/v{{ version }}"
+git_release_name = "h3/v{{ version }}"
+git_release_latest = false
+
+[[package]]
+name = "http-kit-tls"
+git_tag_name = "tls/v{{ version }}"
+git_release_name = "tls/v{{ version }}"
+git_release_latest = false
