@@ -435,6 +435,9 @@ fn request(method: Method, path: &str, body: Body) -> Request {
 async fn http1_over_tls<I: Io>(io: I, name: &str)
 where
     I::TcpStream: Transport,
+    // The counting wrapper is a socket only where its halves are: kernel TLS
+    // needs the descriptor, which `Transport` alone no longer implies.
+    Counted<I::TcpStream>: Transport,
 {
     let identity = Identity::new();
     let (path, contents) = payload_file(name);
