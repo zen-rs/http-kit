@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/zen-rs/http-kit/compare/tls/v0.1.0...tls/v0.2.0) - 2026-11-10
+
+### Added
+
+- *(tls)* run a TLS session over another TLS stream
+
+### Other
+
+- *(tls)* require the counting wrapper to be a transport where it is used
+
 ## [0.1.0](https://github.com/zen-rs/http-kit/compare/tls/v0.0.0...tls/v0.1.0) - 2026-11-10
 
 ### Added

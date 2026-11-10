@@ -1598,6 +1598,45 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
+    #[cfg(feature = "fs")]
+    #[tokio::test]
+    async fn regions_of_one_shared_file_stream_their_own_bytes() {
+        use futures_lite::StreamExt;
+
+        let file = TempFile::new("shared-regions", CJK_TEXT.as_bytes());
+        let shared = std::sync::Arc::new(file.open());
+        let total = CJK_TEXT.len() as u64;
+        let first = FileRegion::new(shared.clone(), 0, total / 2);
+        let second = FileRegion::new(shared.clone(), total / 3, total / 2);
+        let (first, second) = futures_lite::future::zip(
+            first.into_stream().try_fold(Vec::new(), |mut all, chunk| {
+                all.extend_from_slice(&chunk);
+                Ok(all)
+            }),
+            second.into_stream().try_fold(Vec::new(), |mut all, chunk| {
+                all.extend_from_slice(&chunk);
+                Ok(all)
+            }),
+        )
+        .await;
+        let bytes = CJK_TEXT.as_bytes();
+        assert_eq!(first.unwrap(), &bytes[..(total / 2) as usize]);
+        assert_eq!(
+            second.unwrap(),
+            &bytes[(total / 3) as usize..(total / 3 + total / 2) as usize]
+        );
+        // The shared file's cursor was never moved. Windows' positioned read
+        // moves it, which nothing depends on: every access is by offset.
+        #[cfg(not(windows))]
+        {
+            use std::io::Read;
+
+            let mut all = Vec::new();
+            (&*shared).read_to_end(&mut all).unwrap();
+            assert_eq!(all, bytes);
+        }
+    }
+
     #[tokio::test]
     async fn try_clone_copies_only_in_memory_bodies() {
         let body = Body::from_bytes("replayable").with_mime(mime::TEXT_PLAIN);

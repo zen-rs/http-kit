@@ -18,8 +18,7 @@ use rustls::{
 use crate::{
     engine::{Engine, tls_error},
     side::{Client, Server, Side},
-    stream::{Negotiated, ReadInner, TlsReadHalf, TlsStream, TlsWriteHalf, Transport, WriteInner},
-    user,
+    stream::{Negotiated, TlsReadHalf, TlsStream, TlsWriteHalf, Transport},
 };
 
 /// How long a handshake may take unless configured otherwise.
@@ -210,32 +209,18 @@ async fn establish<S: Transport, D: Side>(
         "TLS handshake complete"
     );
 
-    #[cfg(all(target_os = "linux", feature = "kernel"))]
-    if let Some(kernel) = kernel {
-        use crate::kernel::linux::{self, Switched};
-
-        match linux::switch(engine, &mut reader, &mut writer, kernel).await? {
-            Switched::Kernel(shared, carried) => {
-                let (read, write) = linux::split(shared, carried, (reader, writer));
-                return Ok(TlsStream {
-                    read: TlsReadHalf(ReadInner::Kernel(read)),
-                    write: TlsWriteHalf(WriteInner::Kernel(write)),
-                    negotiated: Negotiated {
-                        mode: crate::Mode::Kernel,
-                        ..negotiated
-                    },
-                });
-            }
-            Switched::User(returned) => engine = returned,
-        }
-    }
-    #[cfg(all(not(target_os = "linux"), feature = "kernel"))]
-    let _ = kernel;
-
-    let (read, write) = user::split(engine, (reader, writer));
+    let (read, write) = S::secure(
+        engine,
+        reader,
+        writer,
+        #[cfg(feature = "kernel")]
+        kernel,
+    )
+    .await?;
+    let mode = read.mode();
     Ok(TlsStream {
-        read: TlsReadHalf(ReadInner::User(read)),
-        write: TlsWriteHalf(WriteInner::User(write)),
-        negotiated,
+        read: TlsReadHalf(read),
+        write: TlsWriteHalf(write),
+        negotiated: Negotiated { mode, ..negotiated },
     })
 }

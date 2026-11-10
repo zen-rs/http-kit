@@ -115,6 +115,25 @@ pub trait WriteControl {
     ) -> impl Future<Output = BufResult<usize, (B, C)>>;
 }
 
+/// Socket options of a connected TCP stream.
+pub trait TcpOptions {
+    /// Sets `TCP_NODELAY`: with it, a small write goes out at once instead of
+    /// waiting to be coalesced with the next (Nagle's algorithm), which is
+    /// what request/response traffic wants.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the operating system rejects the option.
+    fn set_nodelay(&self, nodelay: bool) -> io::Result<()>;
+
+    /// Whether `TCP_NODELAY` is set.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the operating system cannot report it.
+    fn nodelay(&self) -> io::Result<bool>;
+}
+
 /// Sends a file region to a stream socket without passing it through user
 /// space, where the platform allows.
 ///

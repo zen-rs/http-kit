@@ -12,7 +12,7 @@ use std::{
 
 use futures_lite::{AsyncReadExt as _, AsyncWriteExt as _, future::zip};
 use http_kit_io::{
-    BufResult, DatagramSocket, IntoPoll, Io, Listener, Read, SendFile, Split, Write,
+    BufResult, DatagramSocket, IntoPoll, Io, Listener, Read, SendFile, Split, TcpOptions, Write,
     datagram::MAX_COALESCED_BYTES,
 };
 
@@ -475,6 +475,80 @@ async fn unix_poll_echo<I: Io>(io: I, name: &str) {
     assert_bytes(&echoed, &data);
 }
 
+/// `connect_unix` reaches a listener of the same implementation, and bytes
+/// round-trip.
+#[cfg(unix)]
+async fn unix_connect<I: Io>(io: I, name: &str) {
+    let (dir, path) = unix_socket_dir(name);
+    let listener = io
+        .unix_listener(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
+        .expect("adopt the listener");
+    let data = payload();
+
+    let server = async {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut buf = Vec::with_capacity(8192);
+        loop {
+            let BufResult(res, filled) = stream.read(buf).await;
+            if res.expect("server read") == 0 {
+                break;
+            }
+            let BufResult(res, filled) = stream.write_all(filled).await;
+            res.expect("server write");
+            buf = filled;
+        }
+        stream.shutdown().await.expect("server shutdown");
+    };
+    let client = async {
+        let stream = io.connect_unix(&path).await.expect("connect");
+        let (mut reader, mut writer) = stream.split();
+        let send = async {
+            let BufResult(res, _) = writer
+                .write_all("世界 せかい 세계\n".as_bytes().to_vec())
+                .await;
+            res.expect("client write");
+            let BufResult(res, _) = writer.write_all(data.clone()).await;
+            res.expect("client write");
+            writer.shutdown().await.expect("client shutdown");
+        };
+        zip(send, read_to_end(&mut reader)).await.1
+    };
+    let ((), echoed) = zip(server, client).await;
+    std::fs::remove_dir_all(dir).expect("remove the socket directory");
+    let mut expected = "世界 せかい 세계\n".as_bytes().to_vec();
+    expected.extend_from_slice(&data);
+    assert_bytes(&echoed, &expected);
+}
+
+/// A path with nothing listening is refused, not hung.
+#[cfg(unix)]
+async fn unix_connect_refused<I: Io>(io: I, name: &str) {
+    let (dir, path) = unix_socket_dir(name);
+    let Err(err) = io.connect_unix(&path).await else {
+        panic!("nothing listens");
+    };
+    std::fs::remove_dir_all(dir).expect("remove the socket directory");
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        "{err:?}"
+    );
+}
+
+async fn tcp_nodelay<I: Io>(io: I) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let addr = listener.local_addr().expect("local address");
+    let (accepted, stream) = zip(listener.accept(), io.connect(addr)).await;
+    let _accepted = accepted.expect("accept");
+    let stream = stream.expect("connect");
+    stream.set_nodelay(true).expect("set TCP_NODELAY");
+    assert!(stream.nodelay().expect("read TCP_NODELAY"));
+    stream.set_nodelay(false).expect("clear TCP_NODELAY");
+    assert!(!stream.nodelay().expect("read TCP_NODELAY"));
+}
+
 async fn timer<I: Io>(io: I) {
     let start = Instant::now();
     io.sleep(Duration::from_millis(20)).await;
@@ -554,6 +628,29 @@ macro_rules! suite {
         #[test]
         fn unix_poll_echo() {
             $run(super::unix_poll_echo($io, concat!(module_path!(), "-poll")));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unix_connect() {
+            $run(super::unix_connect(
+                $io,
+                concat!(module_path!(), "-connect"),
+            ));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unix_connect_refused() {
+            $run(super::unix_connect_refused(
+                $io,
+                concat!(module_path!(), "-refused"),
+            ));
+        }
+
+        #[test]
+        fn tcp_nodelay() {
+            $run(super::tcp_nodelay($io));
         }
 
         #[test]

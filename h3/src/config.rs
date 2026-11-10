@@ -5,12 +5,14 @@
 //! without a default is the field section limit, which bounds the memory a
 //! peer can make a request or response head cost, so each endpoint states it.
 
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use boring::{
     pkey::PKey,
-    ssl::{SslContextBuilder, SslMethod, SslVerifyMode},
-    x509::X509,
+    ssl::{
+        NameType, SslAlert, SslContextBuilder, SslMethod, SslRef, SslVerifyError, SslVerifyMode,
+    },
+    x509::{X509, X509Ref},
 };
 
 use crate::{
@@ -147,6 +149,97 @@ pub struct Roots {
     pub pem: Vec<Vec<u8>>,
 }
 
+/// Why a [`Verifier`] refuses a server's certificate chain. The handshake
+/// fails with the matching TLS alert, which the server sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Rejection {
+    /// The certificate is malformed, or unacceptable for another reason
+    /// (`bad_certificate`).
+    BadCertificate,
+    /// The chain does not lead to a trusted authority (`unknown_ca`).
+    UnknownCa,
+    /// A certificate is expired, or not yet valid (`certificate_expired`).
+    Expired,
+    /// A certificate was revoked (`certificate_revoked`).
+    Revoked,
+}
+
+impl Rejection {
+    const fn alert(self) -> SslAlert {
+        match self {
+            Self::BadCertificate => SslAlert::BAD_CERTIFICATE,
+            Self::UnknownCa => SslAlert::UNKNOWN_CA,
+            Self::Expired => SslAlert::CERTIFICATE_EXPIRED,
+            Self::Revoked => SslAlert::CERTIFICATE_REVOKED,
+        }
+    }
+}
+
+type VerifyFn = dyn Fn(&[Vec<u8>], &str) -> Result<(), Rejection> + Send + Sync;
+
+/// Decides whether a server's certificate chain is acceptable: the platform
+/// verifier, a revocation set, a pinned key.
+///
+/// The function receives the chain as the server sent it, each certificate
+/// DER-encoded and the leaf first, and the server name the client connected
+/// to. Its verdict decides the handshake: `Ok` lets it go on, a
+/// [`Rejection`] fails it. Nothing else is checked, the name included:
+/// matching the leaf against the server name is the verifier's work.
+///
+/// It runs inside the handshake on the connection's thread, so it must not
+/// block.
+#[derive(Clone)]
+pub struct Verifier(Arc<VerifyFn>);
+
+impl Verifier {
+    /// A verifier calling `verify`.
+    pub fn new(
+        verify: impl Fn(&[Vec<u8>], &str) -> Result<(), Rejection> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(verify))
+    }
+
+    /// The verdict on a handshake's chain, or the alert for a handshake that
+    /// has none to show.
+    fn check(&self, ssl: &SslRef) -> Result<(), SslVerifyError> {
+        let Some(chain) = ssl.peer_cert_chain() else {
+            return Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE));
+        };
+        let Some(name) = ssl.servername(NameType::HOST_NAME) else {
+            return Err(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR));
+        };
+        let chain = chain
+            .iter()
+            .map(X509Ref::to_der)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE))?;
+        (self.0)(&chain, name).map_err(|rejection| SslVerifyError::Invalid(rejection.alert()))
+    }
+}
+
+impl fmt::Debug for Verifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Verifier").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Verifier {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// What a client trusts a server's certificate chain on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Trust {
+    /// BoringSSL verifies the chain against these roots, and the server name
+    /// against the leaf.
+    Roots(Roots),
+    /// The [`Verifier`] alone decides; no root is consulted.
+    Verifier(Verifier),
+}
+
 /// Settings for a server endpoint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerConfig {
@@ -223,9 +316,8 @@ impl ServerConfig {
 pub struct ClientConfig {
     /// The QUIC transport.
     pub transport: TransportConfig,
-    /// The certificates the server's chain is verified against. The server
-    /// name is always verified too.
-    pub roots: Roots,
+    /// What the server's chain is verified against.
+    pub trust: Trust,
     /// The largest response header or trailer section accepted, in bytes as
     /// RFC 9114 §4.2.2 counts them (`SETTINGS_MAX_FIELD_SECTION_SIZE`).
     pub max_field_section_size: u64,
@@ -244,9 +336,21 @@ impl ClientConfig {
     /// default.
     #[must_use]
     pub fn new(roots: Roots, max_field_section_size: u64) -> Self {
+        Self::with_trust(Trust::Roots(roots), max_field_section_size)
+    }
+
+    /// A client whose server certificates `verifier` judges, accepting field
+    /// sections of up to `max_field_section_size` bytes, with every other
+    /// setting at its default.
+    #[must_use]
+    pub fn with_verifier(verifier: Verifier, max_field_section_size: u64) -> Self {
+        Self::with_trust(Trust::Verifier(verifier), max_field_section_size)
+    }
+
+    fn with_trust(trust: Trust, max_field_section_size: u64) -> Self {
         Self {
             transport: TransportConfig::default(),
-            roots,
+            trust,
             max_field_section_size,
             qpack_max_table_capacity: 0,
             qpack_blocked_streams: 0,
@@ -256,15 +360,23 @@ impl ClientConfig {
 
     pub(crate) fn quiche(&self) -> Result<(quiche::Config, H3Settings), Error> {
         let mut tls = SslContextBuilder::new(SslMethod::tls())?;
-        if self.roots.system {
-            tls.set_default_verify_paths()?;
-        }
-        for pem in &self.roots.pem {
-            for cert in X509::stack_from_pem(pem)? {
-                tls.cert_store_mut().add_cert(cert)?;
+        match &self.trust {
+            Trust::Roots(roots) => {
+                if roots.system {
+                    tls.set_default_verify_paths()?;
+                }
+                for pem in &roots.pem {
+                    for cert in X509::stack_from_pem(pem)? {
+                        tls.cert_store_mut().add_cert(cert)?;
+                    }
+                }
+                tls.set_verify(SslVerifyMode::PEER);
+            }
+            Trust::Verifier(verifier) => {
+                let verifier = verifier.clone();
+                tls.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| verifier.check(ssl));
             }
         }
-        tls.set_verify(SslVerifyMode::PEER);
         let mut quic = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)?;
         self.transport.apply(&mut quic)?;
         quic.verify_peer(true);

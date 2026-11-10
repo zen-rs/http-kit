@@ -106,9 +106,19 @@ impl<T: Family> Stream<T> {
     }
 }
 
-/// Implements [`Family`] for an IP stream socket.
+/// Implements [`Family`] for an IP stream socket, and its TCP options.
 macro_rules! impl_tcp_family {
     ($ty:ty) => {
+        impl $crate::stream::TcpOptions for $crate::readiness::Stream<$ty> {
+            fn set_nodelay(&self, nodelay: bool) -> ::std::io::Result<()> {
+                $crate::readiness::sealed::Ready::sock(self.get_ref()).set_tcp_nodelay(nodelay)
+            }
+
+            fn nodelay(&self) -> ::std::io::Result<bool> {
+                $crate::readiness::sealed::Ready::sock(self.get_ref()).tcp_nodelay()
+            }
+        }
+
         impl $crate::readiness::sealed::Family for $ty {
             type Addr = ::std::net::SocketAddr;
 
