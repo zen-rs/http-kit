@@ -3,7 +3,6 @@
 
 use std::{
     future::{Future, pending},
-    io,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -16,7 +15,8 @@ use rustls::{
 };
 
 use crate::{
-    engine::{Engine, tls_error},
+    HandshakeError,
+    engine::Engine,
     side::{Client, Server, Side},
     stream::{Negotiated, TlsReadHalf, TlsStream, TlsWriteHalf, Transport},
 };
@@ -61,7 +61,7 @@ impl TlsAcceptor {
     }
 
     /// Bounds the handshake: a peer that has not finished it in `timeout`
-    /// is refused with [`io::ErrorKind::TimedOut`]. `None` waits forever.
+    /// is refused with [`HandshakeError::TimedOut`]. `None` waits forever.
     #[must_use]
     pub const fn with_handshake_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.handshake_timeout = timeout;
@@ -91,17 +91,19 @@ impl TlsAcceptor {
     ///
     /// # Errors
     ///
-    /// The transport failed, the peer is not a TLS client this
-    /// configuration accepts ([`io::ErrorKind::InvalidData`], wrapping
-    /// rustls's error), the handshake missed its deadline
-    /// ([`io::ErrorKind::TimedOut`]), or kernel TLS was negotiated and could
-    /// not be set up for a reason other than the kernel not having it.
+    /// The peer is not a TLS client this configuration accepts, or sent an
+    /// alert ([`HandshakeError::Tls`]); the handshake missed its deadline
+    /// ([`HandshakeError::TimedOut`]); the transport failed or the peer closed
+    /// it ([`HandshakeError::Io`]); or kernel TLS was negotiated and could
+    /// not be set up for a reason other than the kernel not having it
+    /// (`HandshakeError::Kernel`, with the `kernel` feature).
     pub async fn accept<S: Transport, T: Timer>(
         &self,
         stream: S,
         timer: &T,
-    ) -> io::Result<TlsStream<S, Server>> {
-        let conn = UnbufferedServerConnection::new(self.config.clone()).map_err(tls_error)?;
+    ) -> Result<TlsStream<S, Server>, HandshakeError> {
+        let conn =
+            UnbufferedServerConnection::new(self.config.clone()).map_err(HandshakeError::Tls)?;
         let handshake = establish::<S, Server>(
             conn,
             stream,
@@ -153,15 +155,16 @@ impl TlsConnector {
     /// # Errors
     ///
     /// As [`TlsAcceptor::accept`]; a server whose certificate does not
-    /// verify for `server_name` is [`io::ErrorKind::InvalidData`].
+    /// verify for `server_name` is [`HandshakeError::Tls`] carrying
+    /// [`rustls::Error::InvalidCertificate`].
     pub async fn connect<S: Transport, T: Timer>(
         &self,
         server_name: ServerName<'static>,
         stream: S,
         timer: &T,
-    ) -> io::Result<TlsStream<S, Client>> {
-        let conn =
-            UnbufferedClientConnection::new(self.config.clone(), server_name).map_err(tls_error)?;
+    ) -> Result<TlsStream<S, Client>, HandshakeError> {
+        let conn = UnbufferedClientConnection::new(self.config.clone(), server_name)
+            .map_err(HandshakeError::Tls)?;
         let handshake = establish::<S, Client>(
             conn,
             stream,
@@ -173,21 +176,21 @@ impl TlsConnector {
 }
 
 /// Runs `handshake` until `timeout` passes.
-async fn within<T: Timer, F: Future<Output = io::Result<O>>, O>(
+async fn within<T: Timer, F: Future<Output = Result<O, HandshakeError>>, O>(
     timer: &T,
     timeout: Option<Duration>,
     handshake: F,
-) -> io::Result<O> {
-    let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+) -> Result<O, HandshakeError> {
+    let deadline =
+        timeout.and_then(|timeout| Some((timeout, Instant::now().checked_add(timeout)?)));
     let expired = async {
         match deadline {
-            Some(deadline) => timer.sleep_until(deadline).await,
+            Some((timeout, deadline)) => {
+                timer.sleep_until(deadline).await;
+                Err(HandshakeError::TimedOut(timeout))
+            }
             None => pending().await,
         }
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "the TLS handshake did not complete in time",
-        ))
     };
     or(handshake, expired).await
 }
@@ -197,7 +200,7 @@ async fn establish<S: Transport, D: Side>(
     conn: D::Connection,
     stream: S,
     #[cfg(feature = "kernel")] kernel: Option<&crate::KernelTls>,
-) -> io::Result<TlsStream<S, D>> {
+) -> Result<TlsStream<S, D>, HandshakeError> {
     let (mut reader, mut writer) = stream.split();
     let mut engine = Engine::<D>::new(conn);
     engine.handshake(&mut reader, &mut writer).await?;

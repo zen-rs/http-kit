@@ -14,7 +14,7 @@ categories = ["asynchronous", "network-programming"]
 
 [features]
 ## compio: io_uring on Linux (falling back to polling where io_uring is unavailable), IOCP on Windows, polling elsewhere.
-compio = ["dep:compio", "dep:libc", "dep:windows-sys"]
+compio = ["dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core"]
 ## tokio's reactor, adapted to owned buffers.
 tokio = ["dep:tokio", "dep:socket2", "dep:libc", "dep:windows-sys"]
 ## async-io's reactor, adapted to owned buffers.
@@ -34,6 +34,7 @@ socket2 = { version = "0.6.5", default-features = false, optional = true }
 bytes = { version = "1.12.1", default-features = false }
 futures-lite = { version = "2.6.1", default-features = false }
 libc = { version = "0.2.191", default-features = false }
+futures-core = { version = "0.3.34", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.191", default-features = false, optional = true }
