@@ -90,17 +90,6 @@ pub struct ClientConfig {
     /// `100 Continue` before sending its body anyway (RFC 9110 §10.1.1).
     /// `None` waits until the server answers.
     pub expect_continue_timeout: Option<Duration>,
-    /// How long a single wait for bytes from the server may take while a
-    /// response is being read: its head (interim `1xx` responses included)
-    /// and its body. Every read that yields data restarts the wait, so a
-    /// slow but progressing response never expires. An expired wait fails
-    /// the exchange with [`Timeout::HeadRead`](crate::Timeout::HeadRead) or
-    /// [`Timeout::BodyRead`](crate::Timeout::BodyRead), and the body case
-    /// surfaces through the response body. It bounds the socket, not the
-    /// consumer, and does not apply to an idle connection with no request in
-    /// flight nor once the connection has switched protocols. `None` waits
-    /// without bound.
-    pub read_timeout: Option<Duration>,
 }
 
 impl Default for ClientConfig {
@@ -110,7 +99,6 @@ impl Default for ClientConfig {
             read_buffer_size: 16 * 1024,
             request_target: RequestTarget::Origin,
             expect_continue_timeout: Some(Duration::from_secs(1)),
-            read_timeout: None,
         }
     }
 }

@@ -9,12 +9,12 @@
 //! The handle is `Clone` and `Send`, so a connection pool can hold it while
 //! the connection itself, like every future here, stays on one thread.
 
-use std::{cell::Cell, fmt, time::Duration};
+use std::{cell::Cell, fmt, time::Instant};
 
 use async_channel::{Receiver, Sender};
 use bytes::BytesMut;
 use http::{Method, StatusCode};
-use http_kit::{Body, Request, Response};
+use http_kit::{Body, Deadlines, Request, Response};
 use http_kit_io::{Read, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write};
 
 use crate::{
@@ -349,6 +349,15 @@ where
     async fn exchange(&mut self, exchange: Exchange) -> Result<Next, Error> {
         let (request, respond) = exchange.take();
         let (parts, body) = request.into_parts();
+        // The head deadline runs from the moment the connection takes the
+        // request, so it also bounds the request's own transmission.
+        let deadlines = parts
+            .extensions
+            .get::<Deadlines>()
+            .copied()
+            .unwrap_or_default();
+        let head_deadline = deadline_after(deadlines.response_head);
+        let body_idle = deadlines.body_idle;
         let mut head = BytesMut::with_capacity(256);
         let encoded = encode_request_head(
             &parts,
@@ -369,7 +378,6 @@ where
         let requested_upgrade = plan.upgrade;
         let limits = &self.config.limits;
         let continue_timeout = self.config.expect_continue_timeout;
-        let read_timeout = self.config.read_timeout;
         let timer = &self.timer;
 
         // A message once the server answered `100 Continue`; closed once a
@@ -402,7 +410,7 @@ where
         let recv = &mut self.recv;
         let receive = async {
             let head = loop {
-                let head = read_head(recv, limits, &method, timer, read_timeout).await?;
+                let head = read_head(recv, limits, &method, timer, head_deadline).await?;
                 if !head.is_interim() {
                     break head;
                 }
@@ -435,7 +443,7 @@ where
             let pumped = match pump {
                 None => Pumped::Complete,
                 Some((sender, decoder)) => {
-                    pump_body(recv, decoder, limits, sender, timer, read_timeout, async {}).await?
+                    pump_body(recv, decoder, limits, sender, timer, body_idle, async {}).await?
                 }
             };
             Ok(Received::Response {
@@ -489,20 +497,21 @@ enum Received {
     Upgrade,
 }
 
-/// Reads one response head, each wait for bytes bounded by `read_timeout`.
+/// Reads one response head, every wait for bytes bounded by the same
+/// `deadline`, so a head that dribbles in cannot extend it.
 async fn read_head<R: Read, T: Timer>(
     recv: &mut Recv<R>,
     limits: &crate::Limits,
     method: &Method,
     timer: &T,
-    read_timeout: Option<Duration>,
+    deadline: Option<Instant>,
 ) -> Result<ResponseHead, Error> {
     loop {
         if let Some(head) = parse_response_head(&mut recv.buf, limits, method)? {
             tracing::trace!(status = %head.parts.status, "response");
             return Ok(head);
         }
-        let read = until(timer, deadline_after(read_timeout), recv.fill())
+        let read = until(timer, deadline, recv.fill())
             .await
             .ok_or(Error::Timeout(Timeout::HeadRead))??;
         if read == 0 {

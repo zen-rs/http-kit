@@ -52,7 +52,11 @@ pub mod error;
 pub use error::{BoxHttpError, Error, HttpError, Result, ResultExt};
 mod body;
 
+mod deadlines;
+pub use deadlines::Deadlines;
+
 pub use body::Error as BodyError;
+pub use body::ReceiveError;
 pub use body::{Body, BodyFrame, DataStream, FrameSource, GenericBody, LocalBody, PipeOffer};
 #[cfg(feature = "fs")]
 pub use body::{FileRegion, FileRegionStream};

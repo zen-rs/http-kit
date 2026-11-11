@@ -36,7 +36,7 @@ use crate::{
     Error, ServerConfig,
     body::{self, Command},
     config::H3Settings,
-    conn::{Conn, ConnKey, Recv, Send, Stream, StreamRef, code},
+    conn::{Bounds, Conn, ConnKey, Recv, Send, Stream, StreamRef, code},
     driver::{Sources, Timers, Transmit, peer_error, received_on},
     fields,
     retry::{Refused, RetryConfig, Validator},
@@ -767,6 +767,7 @@ fn request(
     conn.streams.insert(
         id,
         Stream {
+            bounds: Bounds::default(),
             recv,
             send: Send::Waiting,
             credit: Some(credit),

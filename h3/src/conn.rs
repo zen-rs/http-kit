@@ -3,7 +3,11 @@
 //! Everything here is synchronous: it moves bytes between quiche and the
 //! bodies' channels, and the driver decides when to call it.
 
-use std::{collections::HashMap, net::SocketAddr, time::Instant};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use async_channel::Sender;
 use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
@@ -15,7 +19,7 @@ use quiche::{
 };
 
 use crate::{
-    Error, Malformed, TrySendError,
+    Error, Malformed, Timeout, TrySendError,
     body::{Command, FrameSender, Message},
     fields,
 };
@@ -80,6 +84,12 @@ pub(crate) struct Recv {
     trailers: Option<HeaderMap>,
     expected: Option<u64>,
     received: u64,
+    /// How long the wait for the next frame may take (a client's
+    /// [`Deadlines::body_idle`](http_kit::Deadlines::body_idle)).
+    pub(crate) idle: Option<Duration>,
+    /// When the wait in progress expires: set while the consumer waits on a
+    /// frame the stream has not yet produced, cleared once it is delivered.
+    idle_at: Option<Instant>,
 }
 
 impl Recv {
@@ -92,8 +102,20 @@ impl Recv {
             trailers: None,
             expected,
             received: 0,
+            idle: None,
+            idle_at: None,
         }
     }
+}
+
+/// The deadlines a client request's stream runs under, from its
+/// [`Deadlines`](http_kit::Deadlines).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Bounds {
+    /// When the final response head is due; spent once it arrives.
+    pub(crate) head_at: Option<Instant>,
+    /// The body's idle bound, handed to its [`Recv`].
+    pub(crate) body_idle: Option<Duration>,
 }
 
 /// The sending half of a stream.
@@ -155,6 +177,8 @@ pub(crate) struct Stream {
     /// A client's `HEAD` request, whose response describes a body it does
     /// not carry.
     pub(crate) head_request: bool,
+    /// A client's deadlines; a server's stream has none.
+    pub(crate) bounds: Bounds,
 }
 
 /// A packet quiche paced into the future, held until its release time.
@@ -227,6 +251,55 @@ impl Conn {
         .into_iter()
         .flatten()
         .min()
+    }
+
+    /// The earliest instant a stream's own deadline passes: a client's
+    /// head or body-idle bound. A server's streams have none.
+    pub(crate) fn stream_deadline(&self) -> Option<Instant> {
+        self.streams
+            .values()
+            .flat_map(|stream| {
+                [
+                    stream.respond.is_some().then_some(stream.bounds.head_at),
+                    stream.recv.as_ref().map(|recv| recv.idle_at),
+                ]
+            })
+            .flatten()
+            .flatten()
+            .min()
+    }
+
+    /// Fails every stream whose deadline has passed by `now`, and resets it
+    /// with `H3_REQUEST_CANCELLED`.
+    pub(crate) fn expire(&mut self, now: Instant) {
+        let expired: Vec<(u64, Timeout)> = self
+            .streams
+            .iter()
+            .filter_map(|(&id, stream)| {
+                if stream.respond.is_some() {
+                    stream
+                        .bounds
+                        .head_at
+                        .is_some_and(|at| at <= now)
+                        .then_some((id, Timeout::ResponseHead))
+                } else {
+                    stream
+                        .recv
+                        .as_ref()
+                        .and_then(|recv| recv.idle_at)
+                        .is_some_and(|at| at <= now)
+                        .then_some((id, Timeout::BodyIdle))
+                }
+            })
+            .collect();
+        for (id, timeout) in expired {
+            tracing::debug!(stream = id, %timeout, "deadline passed; cancelling the request");
+            self.fail(
+                id,
+                &Error::Timeout(timeout),
+                code(WireErrorCode::RequestCancelled),
+            );
+        }
     }
 
     /// The code that resets a stream this endpoint gives up on: a server
@@ -431,8 +504,22 @@ impl Conn {
     }
 
     /// Hands the consumer of a stream's body its next frame, if it asked
-    /// and one is there.
+    /// and one is there. A consumer left waiting starts the stream's
+    /// body-idle wait; a frame delivered ends it, so the next demand starts
+    /// a fresh one.
     pub(crate) fn read(&mut self, id: u64) {
+        self.deliver_next(id);
+        if let Some(recv) = self.recv_mut(id) {
+            recv.idle_at = if recv.demanded {
+                recv.idle_at
+                    .or_else(|| recv.idle.and_then(|idle| Instant::now().checked_add(idle)))
+            } else {
+                None
+            };
+        }
+    }
+
+    fn deliver_next(&mut self, id: u64) {
         let Some(h3) = self.h3.as_mut() else {
             return;
         };
