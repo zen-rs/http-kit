@@ -435,6 +435,10 @@ impl_socket!(net::UnixStream, zero_copy: false);
 /// A connected stream socket.
 pub struct Stream<S> {
     inner: S,
+    /// The socket `inner`'s descriptor names, which every use of the
+    /// descriptor's number checks it still does (debug builds).
+    #[cfg(all(unix, debug_assertions))]
+    identity: crate::sys::unix::Identity,
     /// The pipe file transfers splice through, kept between transfers. A
     /// transfer takes it out while data may sit in it, so one that fails or
     /// is cancelled midway drops it instead of leaving stale bytes behind.
@@ -472,6 +476,9 @@ impl<S: Socket> Stream<S> {
         #[cfg(not(target_os = "linux"))]
         let _ = io;
         Self {
+            #[cfg(all(unix, debug_assertions))]
+            identity: crate::sys::unix::Identity::of(inner.as_fd())
+                .expect("a stream's socket is open when the stream is made"),
             #[cfg(target_os = "linux")]
             file: files::File::new(inner.shared_fd(), io.file_table()),
             inner,
@@ -494,12 +501,36 @@ impl<S: Socket> Stream<S> {
     async fn submit<T: ::compio::driver::OpCode + 'static>(&self, op: T) -> BufResult<usize, T> {
         #[cfg(target_os = "linux")]
         {
-            self.file.submit(op).await
+            self.file().submit(op).await
         }
         #[cfg(not(target_os = "linux"))]
         {
+            self.fd();
             ::compio::runtime::submit(op).await
         }
+    }
+
+    /// The socket's descriptor, for a call that names it by its number.
+    ///
+    /// Debug builds check first that the number still names the stream's
+    /// socket, and panic if it does not (zen-rs/http-kit#159).
+    #[cfg(unix)]
+    #[track_caller]
+    fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        let fd = self.inner.as_fd();
+        #[cfg(debug_assertions)]
+        self.identity.check(fd);
+        fd
+    }
+
+    /// The socket's hold on its slot, through which every operation is
+    /// submitted: one naming the descriptor while the socket has no slot is
+    /// a use of its number, checked as [`fd`](Self::fd) checks it.
+    #[cfg(target_os = "linux")]
+    #[track_caller]
+    fn file(&self) -> &files::File {
+        self.fd();
+        &self.file
     }
 }
 
@@ -533,7 +564,7 @@ impl<S: Socket> Stream<S> {
         if self.recv_empty.get() {
             op.poll_first();
         }
-        let (BufResult(res, op), extra) = self.file.submit_with_extra(op).await;
+        let (BufResult(res, op), extra) = self.file().submit_with_extra(op).await;
         if let Some(Ok(nonempty)) = extra.map(|extra| extra.sock_nonempty()) {
             self.recv_empty.set(!nonempty);
         }
@@ -550,7 +581,7 @@ impl<S: Socket> Stream<S> {
         use compio_buf::IntoInner as _;
 
         let op = Send::new(self.inner.shared_fd(), buf, SendFlags::empty());
-        let BufResult(res, op) = self.file.submit(op).await;
+        let BufResult(res, op) = self.file().submit(op).await;
         BufResult(res, op.into_inner())
     }
 
@@ -559,7 +590,7 @@ impl<S: Socket> Stream<S> {
         use compio_buf::IntoInner as _;
 
         let op = SendVectored::new(self.inner.shared_fd(), buf, SendFlags::empty());
-        let BufResult(res, op) = self.file.submit(op).await;
+        let BufResult(res, op) = self.file().submit(op).await;
         BufResult(res, op.into_inner())
     }
 
@@ -567,7 +598,7 @@ impl<S: Socket> Stream<S> {
         use ::compio::driver::op::ShutdownSocket;
 
         let op = ShutdownSocket::new(self.inner.shared_fd(), std::net::Shutdown::Write);
-        match self.file.submit(op).await.0 {
+        match self.file().submit(op).await.0 {
             // A socket that is not connected has nothing to shut down, as
             // compio's stream has it.
             Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
@@ -638,7 +669,10 @@ impl<S: fmt::Debug> fmt::Debug for Stream<S> {
 #[cfg(unix)]
 impl<S: std::os::fd::AsFd> std::os::fd::AsFd for Stream<S> {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.inner.as_fd()
+        let fd = self.inner.as_fd();
+        #[cfg(debug_assertions)]
+        self.identity.check(fd);
+        fd
     }
 }
 
@@ -651,7 +685,7 @@ impl<S: Socket> SharedStream for Stream<S> {
     async fn read<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
         #[cfg(target_os = "linux")]
         {
-            let buf = match self.recv.read_ahead(&self.inner, &self.file, buf).await {
+            let buf = match self.recv.read_ahead(&self.inner, self.file(), buf).await {
                 recv::Copied::Done(result) => return result,
                 recv::Copied::ReadInstead(buf) => buf,
             };
@@ -666,7 +700,7 @@ impl<S: Socket> SharedStream for Stream<S> {
     async fn read_owned(&self) -> io::Result<crate::Received<Self::Buf>> {
         #[cfg(target_os = "linux")]
         {
-            self.recv.read_owned(&self.inner, &self.file).await
+            self.recv.read_owned(&self.inner, self.file()).await
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -917,11 +951,7 @@ mod splice {
                 stream.pipe.set(Some(pipe));
                 return BufResult(Ok(filled), file);
             }
-            match crate::sys::pipe::splice(
-                pipe.read.as_fd(),
-                stream.inner.as_fd(),
-                filled - drained,
-            ) {
+            match crate::sys::pipe::splice(pipe.read.as_fd(), stream.fd(), filled - drained) {
                 Ok(0) => {
                     break io::Error::new(io::ErrorKind::WriteZero, "stream accepted no bytes");
                 }
@@ -950,7 +980,7 @@ mod splice {
     /// Makes the socket `O_NONBLOCK`, once.
     fn nonblocking<S: Socket + AsFd>(stream: &Stream<S>) -> io::Result<()> {
         if !stream.nonblocking.get() {
-            crate::sys::pipe::set_nonblocking(stream.inner.as_fd())?;
+            crate::sys::pipe::set_nonblocking(stream.fd())?;
             stream.nonblocking.set(true);
         }
         Ok(())
@@ -994,7 +1024,7 @@ mod splice {
         }
         let len = max.min(pipe.capacity());
         loop {
-            match crate::sys::pipe::splice(stream.inner.as_fd(), pipe.write_fd(), len) {
+            match crate::sys::pipe::splice(stream.fd(), pipe.write_fd(), len) {
                 Ok(0) => return Ok(Spliced::End(pipe)),
                 Ok(n) => return Ok(Spliced::Filled(FilledPipe::new(pipe, n))),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1015,7 +1045,7 @@ mod splice {
         nonblocking(stream)?;
         let mut left = filled.len();
         while left > 0 {
-            match crate::sys::pipe::splice(filled.pipe().read_fd(), stream.inner.as_fd(), left) {
+            match crate::sys::pipe::splice(filled.pipe().read_fd(), stream.fd(), left) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -1515,7 +1545,7 @@ mod zero_copy {
             let rest = Shared(Rc::clone(&buf)).slice(written);
             let res = if zero_copy {
                 let op = SendVectoredZc::new(stream.inner.shared_fd(), rest, flags);
-                match stream.file.address(op) {
+                match stream.file().address(op) {
                     Ok(op) => send(op).await,
                     Err((e, _)) => Err(e),
                 }
