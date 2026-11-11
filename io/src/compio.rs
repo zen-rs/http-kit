@@ -42,6 +42,20 @@
 //! Smaller writes, the other write methods, Unix-domain streams (which the
 //! kernel does not send zero-copy) and every other platform copy.
 //!
+//! On Linux over io_uring each stream's socket takes a slot in its ring's
+//! file table, and every operation on the stream (receives, multishot ones
+//! included, sends, zero-copy ones included, polls, shutdown) names the
+//! socket by that slot (`IOSQE_FIXED_FILE`): the kernel then neither looks
+//! the descriptor up nor takes a reference to its file per operation. The
+//! stream keeps its descriptor for what is not an io_uring operation (kernel
+//! TLS options, addresses, `splice(2)`). The slot is taken on the side as the
+//! stream is created, so the first operations may still use the descriptor,
+//! and is given back once the stream is dropped. A ring registers its table,
+//! [`FileTable::slots`] slots large, when its first stream asks for a slot;
+//! a socket the table has no room for, or a kernel that cannot allocate
+//! slots (before 5.19), leaves the stream on its descriptor. The ring's
+//! table belongs to these streams: nothing else on the runtime may use it.
+//!
 //! The poll-style capability is a [`CopyingPoll`]: a completion-based driver
 //! cannot read into a buffer borrowed for one poll.
 
@@ -56,10 +70,9 @@ use std::{
     time::Instant,
 };
 
-use ::compio::{
-    io::{AsyncRead, AsyncWrite},
-    net,
-};
+#[cfg(not(target_os = "linux"))]
+use ::compio::io::{AsyncRead, AsyncWrite};
+use ::compio::net;
 use compio_buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf};
 
 use crate::{
@@ -73,24 +86,40 @@ use crate::{
 use crate::{DialUnix, FromStdUnix, ListenUnix};
 
 /// The compio implementation. compio keeps its runtime per thread, and every
-/// operation goes to the current thread's; this holds only the
-/// [`ZeroCopySend`] setting, which every stream it creates or adopts shares.
+/// operation goes to the current thread's; this holds only the operator's
+/// settings, [`ZeroCopySend`] and [`FileTable`], which every stream it
+/// creates or adopts shares.
 #[derive(Debug, Clone, Default)]
 pub struct Compio {
     zero_copy: ZeroCopySend,
+    file_table: FileTable,
 }
 
 impl Compio {
-    /// An implementation whose streams send zero-copy as `zero_copy` says.
+    /// This implementation with its streams sending zero-copy as `zero_copy`
+    /// says.
     #[must_use]
-    pub const fn with_zero_copy(zero_copy: ZeroCopySend) -> Self {
-        Self { zero_copy }
+    pub fn with_zero_copy(self, zero_copy: ZeroCopySend) -> Self {
+        Self { zero_copy, ..self }
+    }
+
+    /// This implementation with its rings' file tables sized as `file_table`
+    /// says.
+    #[must_use]
+    pub fn with_file_table(self, file_table: FileTable) -> Self {
+        Self { file_table, ..self }
     }
 
     /// The zero-copy setting its streams share.
     #[must_use]
     pub const fn zero_copy(&self) -> &ZeroCopySend {
         &self.zero_copy
+    }
+
+    /// The file-table setting its streams share.
+    #[must_use]
+    pub const fn file_table(&self) -> &FileTable {
+        &self.file_table
     }
 
     /// Adopts a connected compio stream: one a runtime of this thread
@@ -100,7 +129,58 @@ impl Compio {
     /// thread adopts its share).
     #[must_use]
     pub fn tcp_stream(&self, stream: net::TcpStream) -> TcpStream {
-        TcpStream::new(stream, self.zero_copy.clone())
+        TcpStream::new(stream, self)
+    }
+}
+
+/// How many sockets a ring's file table holds, on Linux over io_uring: each
+/// stream takes a slot while it lives, and a stream the table has no room
+/// for uses its descriptor.
+///
+/// It is the operator's runtime-adjustable handle: every clone shares one
+/// value, across threads. A ring sizes its table once, when its first stream
+/// asks for a slot (the kernel cannot resize a table holding sockets), so a
+/// change sizes the tables of rings that register theirs afterwards. `0`
+/// stops streams created afterwards from taking slots at all, on every ring.
+///
+/// The kernel refuses a table larger than the process's `RLIMIT_NOFILE`
+/// (`io_sqe_files_register`); the streams of a ring whose table was refused
+/// report that error.
+#[derive(Debug, Clone)]
+pub struct FileTable {
+    slots: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl FileTable {
+    /// The default size: the kernel's default soft `RLIMIT_NOFILE`
+    /// (`INR_OPEN_CUR`, `include/uapi/linux/fs.h`), the largest table a
+    /// process that has not raised its limit may register.
+    pub const DEFAULT_SLOTS: u32 = 1024;
+
+    /// A setting of `slots` slots.
+    #[must_use]
+    pub fn new(slots: u32) -> Self {
+        Self {
+            slots: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(slots)),
+        }
+    }
+
+    /// The slots a ring registers its table with.
+    #[must_use]
+    pub fn slots(&self) -> u32 {
+        self.slots.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sets the size for every clone of this setting.
+    pub fn set_slots(&self, slots: u32) {
+        self.slots
+            .store(slots, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Default for FileTable {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_SLOTS)
     }
 }
 
@@ -177,7 +257,7 @@ impl DialUnix for Compio {
 
     async fn connect_unix(&self, path: &std::path::Path) -> io::Result<UnixStream> {
         let stream = net::UnixStream::connect(path).await?;
-        Ok(UnixStream::new(stream, self.zero_copy.clone()))
+        Ok(UnixStream::new(stream, self))
     }
 }
 
@@ -213,14 +293,14 @@ impl FromStdUnix for Compio {
         listener: std::os::unix::net::UnixListener,
     ) -> io::Result<UnixListener> {
         let listener = net::UnixListener::from_std(listener)?;
-        Ok(UnixListener::new(listener, self.zero_copy.clone()))
+        Ok(UnixListener::new(listener, self.clone()))
     }
 }
 
 impl FromStd for Compio {
     fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
         let listener = net::TcpListener::from_std(listener)?;
-        Ok(TcpListener::new(listener, self.zero_copy.clone()))
+        Ok(TcpListener::new(listener, self.clone()))
     }
 
     fn udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<UdpSocket> {
@@ -253,7 +333,9 @@ trait Fd {}
 #[cfg(not(unix))]
 impl<T> Fd for T {}
 
-/// A stream socket of compio's, which the operations below drive through a
+/// A stream socket of compio's. On Linux the stream submits compio's
+/// operations on it itself, so that they name the socket by its slot in the
+/// ring's file table; elsewhere compio's stream drives them, through a
 /// shared reference.
 trait Socket: Clone + Fd + 'static {
     /// Whether the kernel sends from this socket zero-copy: it sets
@@ -264,18 +346,15 @@ trait Socket: Clone + Fd + 'static {
     /// The descriptor, shared with an operation that outlives a call.
     #[cfg(target_os = "linux")]
     fn shared_fd(&self) -> ::compio::driver::SharedFd<socket2::Socket>;
+    #[cfg(not(target_os = "linux"))]
     fn read<B: IoBufMut>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
+    #[cfg(not(target_os = "linux"))]
     fn write<B: IoBuf>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
+    #[cfg(not(target_os = "linux"))]
     fn write_vectored<B: IoVectoredBuf>(&self, buf: B)
     -> impl Future<Output = BufResult<usize, B>>;
+    #[cfg(not(target_os = "linux"))]
     fn shutdown(&self) -> impl Future<Output = io::Result<()>>;
-    /// `sendmsg(2)` of `buf` with the control messages in `control`.
-    #[cfg(unix)]
-    fn write_control<B: IoBuf, C: IoBuf>(
-        &self,
-        buf: B,
-        control: C,
-    ) -> impl Future<Output = BufResult<usize, (B, C)>>;
     /// `sendfile(2)` of a region once the socket is writable.
     #[cfg(target_vendor = "apple")]
     fn sendfile(
@@ -297,39 +376,28 @@ macro_rules! impl_socket {
                 ::compio::driver::ToSharedFd::to_shared_fd(self)
             }
 
+            #[cfg(not(target_os = "linux"))]
             async fn read<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
                 let mut stream = self;
                 AsyncRead::read(&mut stream, buf).await
             }
 
+            #[cfg(not(target_os = "linux"))]
             async fn write<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
                 let mut stream = self;
                 AsyncWrite::write(&mut stream, buf).await
             }
 
+            #[cfg(not(target_os = "linux"))]
             async fn write_vectored<B: IoVectoredBuf>(&self, buf: B) -> BufResult<usize, B> {
                 let mut stream = self;
                 AsyncWrite::write_vectored(&mut stream, buf).await
             }
 
+            #[cfg(not(target_os = "linux"))]
             async fn shutdown(&self) -> io::Result<()> {
                 let mut stream = self;
                 AsyncWrite::shutdown(&mut stream).await
-            }
-
-            #[cfg(unix)]
-            async fn write_control<B: IoBuf, C: IoBuf>(
-                &self,
-                buf: B,
-                control: C,
-            ) -> BufResult<usize, (B, C)> {
-                use ::compio::driver::op::{SendFlags, SendMsg};
-                use compio_buf::IntoInner as _;
-
-                let op = SendMsg::new(self.clone(), [buf], control, None, SendFlags::empty());
-                let BufResult(res, op) = ::compio::runtime::submit(op).await;
-                let ([buf], control) = op.into_inner();
-                BufResult(res, (buf, control))
             }
 
             #[cfg(target_vendor = "apple")]
@@ -377,14 +445,29 @@ pub struct Stream<S> {
     /// From what size a write sends zero-copy.
     #[cfg(target_os = "linux")]
     zero_copy: ZeroCopySend,
+    /// The socket's slot in the ring's file table, which every operation
+    /// names it by once it has one.
+    #[cfg(target_os = "linux")]
+    file: files::File,
+    /// The last receive of its own found the socket empty: the next one waits
+    /// for data before trying (`IORING_RECVSEND_POLL_FIRST`), as compio's
+    /// stream does.
+    #[cfg(target_os = "linux")]
+    recv_empty: std::cell::Cell<bool>,
 }
 
-impl<S> Stream<S> {
-    fn new(inner: S, zero_copy: ZeroCopySend) -> Self {
-        // Only Linux sends zero-copy.
+#[expect(
+    private_bounds,
+    reason = "every method is private: only this module creates and drives a stream"
+)]
+impl<S: Socket> Stream<S> {
+    fn new(inner: S, io: &Compio) -> Self {
+        // Only Linux sends zero-copy and registers files.
         #[cfg(not(target_os = "linux"))]
-        drop(zero_copy);
+        let _ = io;
         Self {
+            #[cfg(target_os = "linux")]
+            file: files::File::new(inner.shared_fd(), io.file_table()),
             inner,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             pipe: std::cell::Cell::new(None),
@@ -393,14 +476,97 @@ impl<S> Stream<S> {
             #[cfg(target_os = "linux")]
             recv: recv::Recv::default(),
             #[cfg(target_os = "linux")]
-            zero_copy,
+            zero_copy: io.zero_copy.clone(),
+            #[cfg(target_os = "linux")]
+            recv_empty: std::cell::Cell::new(false),
         }
     }
 
+    /// Submits `op`, which operates on this socket: on Linux by the socket's
+    /// slot in the file table when it has one.
+    #[cfg(unix)]
+    async fn submit<T: ::compio::driver::OpCode + 'static>(&self, op: T) -> BufResult<usize, T> {
+        #[cfg(target_os = "linux")]
+        {
+            self.file.submit(op).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ::compio::runtime::submit(op).await
+        }
+    }
+}
+
+impl<S> Stream<S> {
     /// compio's stream.
     #[must_use]
     pub fn get_ref(&self) -> &S {
         &self.inner
+    }
+}
+
+/// The socket operations, which compio's stream would submit with the
+/// descriptor.
+#[cfg(target_os = "linux")]
+#[expect(
+    private_bounds,
+    reason = "every method is private: only this module drives a stream"
+)]
+impl<S: Socket> Stream<S> {
+    async fn recv<B: IoBufMut>(&self, mut buf: B) -> BufResult<usize, B> {
+        use ::compio::driver::{
+            PollFirst as _,
+            op::{Recv, RecvFlags},
+        };
+        use compio_buf::IntoInner as _;
+
+        // compio writes from the start but only ever grows the length; the
+        // contract is a length of exactly what was read.
+        buf.clear();
+        let mut op = Recv::new(self.inner.shared_fd(), buf, RecvFlags::empty());
+        if self.recv_empty.get() {
+            op.poll_first();
+        }
+        let (BufResult(res, op), extra) = self.file.submit_with_extra(op).await;
+        if let Some(Ok(nonempty)) = extra.map(|extra| extra.sock_nonempty()) {
+            self.recv_empty.set(!nonempty);
+        }
+        let mut buf = op.into_inner();
+        if let Ok(n) = res {
+            // SAFETY: the kernel received `n` bytes into the buffer's start.
+            unsafe { buf.advance_to(n) };
+        }
+        BufResult(res, buf)
+    }
+
+    async fn send<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
+        use ::compio::driver::op::{Send, SendFlags};
+        use compio_buf::IntoInner as _;
+
+        let op = Send::new(self.inner.shared_fd(), buf, SendFlags::empty());
+        let BufResult(res, op) = self.file.submit(op).await;
+        BufResult(res, op.into_inner())
+    }
+
+    async fn send_vectored<B: IoVectoredBuf>(&self, buf: B) -> BufResult<usize, B> {
+        use ::compio::driver::op::{SendFlags, SendVectored};
+        use compio_buf::IntoInner as _;
+
+        let op = SendVectored::new(self.inner.shared_fd(), buf, SendFlags::empty());
+        let BufResult(res, op) = self.file.submit(op).await;
+        BufResult(res, op.into_inner())
+    }
+
+    async fn shutdown_write(&self) -> io::Result<()> {
+        use ::compio::driver::op::ShutdownSocket;
+
+        let op = ShutdownSocket::new(self.inner.shared_fd(), std::net::Shutdown::Write);
+        match self.file.submit(op).await.0 {
+            // A socket that is not connected has nothing to shut down, as
+            // compio's stream has it.
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
+            res => res.map(drop),
+        }
     }
 }
 
@@ -478,17 +644,23 @@ impl<S: Socket> SharedStream for Stream<S> {
 
     async fn read<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
         #[cfg(target_os = "linux")]
-        let buf = match self.recv.read_ahead(&self.inner, buf).await {
-            recv::Copied::Done(result) => return result,
-            recv::Copied::ReadInstead(buf) => buf,
-        };
-        read_single(&self.inner, buf).await
+        {
+            let buf = match self.recv.read_ahead(&self.inner, &self.file, buf).await {
+                recv::Copied::Done(result) => return result,
+                recv::Copied::ReadInstead(buf) => buf,
+            };
+            self.recv(buf).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            read_single(&self.inner, buf).await
+        }
     }
 
     async fn read_owned(&self) -> io::Result<crate::Received<Self::Buf>> {
         #[cfg(target_os = "linux")]
         {
-            self.recv.read_owned(&self.inner).await
+            self.recv.read_owned(&self.inner, &self.file).await
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -508,17 +680,31 @@ impl<S: Socket> SharedStream for Stream<S> {
     }
 
     async fn write<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
-        self.inner.write(buf).await
+        #[cfg(target_os = "linux")]
+        {
+            self.send(buf).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.inner.write(buf).await
+        }
     }
 
     async fn write_vectored<B: IoVectoredBuf>(&self, buf: B) -> BufResult<usize, B> {
-        self.inner.write_vectored(buf).await
+        #[cfg(target_os = "linux")]
+        {
+            self.send_vectored(buf).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.inner.write_vectored(buf).await
+        }
     }
 
     #[cfg(target_os = "linux")]
     async fn write_all_owned<B: IoVectoredBuf>(&self, buf: B) -> BufResult<(), Option<B>> {
         if S::ZERO_COPY && buf.total_len() >= self.zero_copy.threshold() {
-            return zero_copy::write_all(&self.inner, buf).await;
+            return zero_copy::write_all(self, buf).await;
         }
         let BufResult(res, buf) =
             crate::stream::write_all_vectored(&mut crate::stream::ByRef(self), buf).await;
@@ -526,16 +712,30 @@ impl<S: Socket> SharedStream for Stream<S> {
     }
 
     async fn shutdown(&self) -> io::Result<()> {
-        self.inner.shutdown().await
+        #[cfg(target_os = "linux")]
+        {
+            self.shutdown_write().await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.inner.shutdown().await
+        }
     }
 
+    /// `sendmsg(2)` of `buf` with the control messages in `control`.
     #[cfg(unix)]
     async fn write_control<B: IoBuf, C: IoBuf>(
         &self,
         buf: B,
         control: C,
     ) -> BufResult<usize, (B, C)> {
-        self.inner.write_control(buf, control).await
+        use ::compio::driver::op::{SendFlags, SendMsg};
+        use compio_buf::IntoInner as _;
+
+        let op = SendMsg::new(self.inner.clone(), [buf], control, None, SendFlags::empty());
+        let BufResult(res, op) = self.submit(op).await;
+        let ([buf], control) = op.into_inner();
+        BufResult(res, (buf, control))
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -581,6 +781,7 @@ impl<S: Socket> SharedStream for Stream<S> {
 }
 
 /// One receive into the caller's buffer, with a submission of its own.
+#[cfg(not(target_os = "linux"))]
 async fn read_single<S: Socket, B: IoBufMut>(socket: &S, mut buf: B) -> BufResult<usize, B> {
     // compio writes from the start but only ever grows the length; the
     // contract is a length of exactly what was read.
@@ -721,8 +922,7 @@ mod splice {
                 }
                 Ok(n) => drained += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let writable = PollOnce::new(stream.inner.clone(), Interest::Writable);
-                    if let Err(e) = ::compio::runtime::submit(writable).await.0 {
+                    if let Err(e) = ready(stream, Interest::Writable).await {
                         return BufResult(Err(e), file);
                     }
                 }
@@ -745,7 +945,8 @@ mod splice {
     /// Waits for the socket to be ready for `interest` with a poll the
     /// driver arms, which holds no thread.
     async fn ready<S: Socket + AsFd>(stream: &Stream<S>, interest: Interest) -> io::Result<()> {
-        ::compio::runtime::submit(PollOnce::new(stream.inner.clone(), interest))
+        stream
+            .submit(PollOnce::new(stream.inner.clone(), interest))
             .await
             .0
             .map(drop)
@@ -818,6 +1019,405 @@ mod splice {
     }
 }
 
+/// Registered files on io_uring: each stream's slot in its ring's file
+/// table, and compio's operations naming the socket by it.
+///
+/// compio registers a table (`register_files`, where `-1` entries are empty
+/// slots) but builds every operation on a descriptor, so [`Addressed`] wraps
+/// its operation and rewrites the entry it builds: everything else, the
+/// multishot and buffer-ring handling included, stays compio's.
+#[cfg(target_os = "linux")]
+mod files {
+    use std::{
+        cell::Cell,
+        io,
+        os::fd::{AsRawFd as _, RawFd},
+        rc::Rc,
+        task::Poll,
+    };
+
+    use ::compio::{
+        driver::{
+            Decision, Extra, IourOpCode, OpCode, OpEntry, OpType, PollOpCode, SharedFd, TakeBuffer,
+        },
+        runtime::Runtime,
+    };
+    use compio_buf::BufResult;
+    use linux_raw_sys::io_uring::{IORING_FILE_INDEX_ALLOC, io_uring_sqe};
+
+    // An entry is the kernel's submission entry, which the ring copies it
+    // into as it is.
+    const _: () = assert!(size_of::<io_uring::squeue::Entry>() == size_of::<io_uring_sqe>());
+
+    /// compio's operation `op` on a stream's socket, naming the socket by its
+    /// slot when it has one.
+    pub(super) struct Addressed<T> {
+        op: T,
+        /// The slot, and the descriptor `op` names, which the slot replaces.
+        slot: Option<(u32, RawFd)>,
+    }
+
+    /// `entry`, naming its socket by `slot` (`IOSQE_FIXED_FILE`) when there
+    /// is one.
+    fn fixed(entry: OpEntry, slot: Option<(u32, RawFd)>) -> OpEntry {
+        match (entry, slot) {
+            (OpEntry::Submission(entry), Some((index, fd))) => {
+                let mut entry = entry.flags(io_uring::squeue::Flags::FIXED_FILE);
+                let sqe = (&raw mut entry).cast::<io_uring_sqe>();
+                // SAFETY: an entry is a kernel submission entry (asserted
+                // above); compio sets its fields the same way
+                // (`set_poll_first`).
+                unsafe {
+                    debug_assert_eq!((*sqe).fd, fd, "the operation names another descriptor");
+                    (*sqe).fd = index.cast_signed();
+                }
+                OpEntry::Submission(entry)
+            }
+            (entry, _) => entry,
+        }
+    }
+
+    // SAFETY: every method is `op`'s own; the entries differ only in naming
+    // the same socket by its slot, which holds the socket while the stream
+    // lives.
+    unsafe impl<T: IourOpCode> IourOpCode for Addressed<T> {
+        type Control = T::Control;
+
+        unsafe fn init(&mut self, control: &mut Self::Control) {
+            // SAFETY: the caller's guarantee covers `op`, which `self` holds.
+            unsafe { self.op.init(control) }
+        }
+
+        fn create_entry(&mut self, control: &mut Self::Control) -> OpEntry {
+            fixed(self.op.create_entry(control), self.slot)
+        }
+
+        fn create_entry_fallback(&mut self, control: &mut Self::Control) -> OpEntry {
+            fixed(self.op.create_entry_fallback(control), self.slot)
+        }
+
+        fn call_blocking(&mut self, control: &mut Self::Control) -> io::Result<usize> {
+            self.op.call_blocking(control)
+        }
+
+        unsafe fn set_result(
+            &mut self,
+            control: &mut Self::Control,
+            res: &io::Result<usize>,
+            extra: &Extra,
+        ) {
+            // SAFETY: the result is `op`'s, as the caller guarantees.
+            unsafe { IourOpCode::set_result(&mut self.op, control, res, extra) }
+        }
+
+        unsafe fn push_multishot(
+            &mut self,
+            control: &mut Self::Control,
+            res: io::Result<usize>,
+            extra: Extra,
+        ) {
+            // SAFETY: the result is `op`'s, as the caller guarantees.
+            unsafe { self.op.push_multishot(control, res, extra) }
+        }
+
+        fn pop_multishot(
+            &mut self,
+            control: &mut Self::Control,
+        ) -> Option<BufResult<usize, Extra>> {
+            self.op.pop_multishot(control)
+        }
+    }
+
+    // SAFETY: every method is `op`'s own; the polling driver uses the
+    // descriptor, which `op` holds.
+    unsafe impl<T: PollOpCode> PollOpCode for Addressed<T> {
+        type Control = T::Control;
+
+        unsafe fn init(&mut self, control: &mut Self::Control) {
+            // SAFETY: the caller's guarantee covers `op`, which `self` holds.
+            unsafe { self.op.init(control) }
+        }
+
+        fn pre_submit(&mut self, control: &mut Self::Control) -> io::Result<Decision> {
+            self.op.pre_submit(control)
+        }
+
+        fn op_type(&mut self, control: &mut Self::Control) -> Option<OpType> {
+            self.op.op_type(control)
+        }
+
+        fn operate(&mut self, control: &mut Self::Control) -> Poll<io::Result<usize>> {
+            self.op.operate(control)
+        }
+
+        unsafe fn set_result(
+            &mut self,
+            control: &mut Self::Control,
+            res: &io::Result<usize>,
+            extra: &Extra,
+        ) {
+            // SAFETY: the result is `op`'s, as the caller guarantees.
+            unsafe { PollOpCode::set_result(&mut self.op, control, res, extra) }
+        }
+    }
+
+    impl<T: TakeBuffer> TakeBuffer for Addressed<T> {
+        type Buffer = T::Buffer;
+
+        fn take_buffer(self) -> Option<T::Buffer> {
+            self.op.take_buffer()
+        }
+    }
+
+    /// A stream's hold on its slot.
+    pub(super) struct File {
+        state: Rc<Cell<State>>,
+        /// The socket's descriptor, which the slot replaces in an entry.
+        fd: RawFd,
+    }
+
+    #[derive(Default)]
+    enum State {
+        /// The installer has not finished; operations name the descriptor.
+        Installing,
+        /// The socket holds this slot.
+        Fixed(u32),
+        /// No slot; operations name the descriptor.
+        #[default]
+        Descriptor,
+        /// Taking a slot failed other than for want of room: the next
+        /// operation reports it, and the rest name the descriptor.
+        Failed(io::Error),
+        /// The stream is gone: the installer gives back the slot it takes.
+        Dropped,
+    }
+
+    impl File {
+        /// Starts taking a slot for `socket`, on a task of the runtime, so
+        /// that no operation of the stream waits for it and none abandoned
+        /// midway loses the slot (and with it the socket, which the slot
+        /// keeps open).
+        pub(super) fn new(socket: SharedFd<socket2::Socket>, table: &super::FileTable) -> Self {
+            let fd = socket.as_raw_fd();
+            let state = Rc::new(Cell::new(State::Descriptor));
+            let slots = table.slots();
+            if slots > 0 {
+                Runtime::with_current(|runtime| {
+                    if runtime.driver_type().is_iouring() {
+                        state.set(State::Installing);
+                        runtime
+                            .spawn(install(Rc::clone(&state), socket, slots))
+                            .detach();
+                    }
+                });
+            }
+            Self { state, fd }
+        }
+
+        fn slot(&self) -> io::Result<Option<u32>> {
+            match self.state.take() {
+                State::Fixed(index) => {
+                    self.state.set(State::Fixed(index));
+                    Ok(Some(index))
+                }
+                State::Failed(error) => Err(error),
+                state => {
+                    self.state.set(state);
+                    Ok(None)
+                }
+            }
+        }
+
+        /// `op`, naming the socket by its slot when it has one; or, with
+        /// `op` back, the error taking a slot failed with.
+        pub(super) fn address<T>(&self, op: T) -> Result<Addressed<T>, (io::Error, T)> {
+            match self.slot() {
+                Ok(slot) => Ok(Addressed {
+                    op,
+                    slot: slot.map(|index| (index, self.fd)),
+                }),
+                Err(error) => Err((error, op)),
+            }
+        }
+
+        pub(super) async fn submit<T: OpCode + 'static>(&self, op: T) -> BufResult<usize, T> {
+            match self.address(op) {
+                Ok(op) => {
+                    let BufResult(res, op) = ::compio::runtime::submit(op).await;
+                    BufResult(res, op.op)
+                }
+                Err((error, op)) => BufResult(Err(error), op),
+            }
+        }
+
+        /// [`submit`](Self::submit), with what the driver reports beside the
+        /// result.
+        pub(super) async fn submit_with_extra<T: OpCode + 'static>(
+            &self,
+            op: T,
+        ) -> (BufResult<usize, T>, Option<Extra>) {
+            match self.address(op) {
+                Ok(op) => {
+                    let (BufResult(res, op), extra) =
+                        ::compio::runtime::submit(op).with_extra().await;
+                    (BufResult(res, op.op), Some(extra))
+                }
+                Err((error, op)) => (BufResult(Err(error), op), None),
+            }
+        }
+    }
+
+    impl Drop for File {
+        fn drop(&mut self) {
+            if let State::Fixed(index) = self.state.replace(State::Dropped) {
+                // Without a runtime the ring is gone, and its table with it.
+                let _ = Runtime::try_with_current(|runtime| runtime.spawn(remove(index)).detach());
+            }
+        }
+    }
+
+    /// Takes a slot for `socket` and leaves the outcome in `state`, or gives
+    /// the slot back at once when the stream is gone by then.
+    async fn install(state: Rc<Cell<State>>, socket: SharedFd<socket2::Socket>, slots: u32) {
+        let taken = take_slot(socket, slots).await;
+        if let State::Dropped = state.take() {
+            if let Ok(Some(index)) = taken {
+                remove(index).await;
+            }
+            return;
+        }
+        state.set(match taken {
+            Ok(Some(index)) => State::Fixed(index),
+            Ok(None) => State::Descriptor,
+            Err(error) => State::Failed(error),
+        });
+    }
+
+    /// The slot the kernel allocates for `socket`, registering the ring's
+    /// table first if it has none; `None` where there is no room or no
+    /// allocation.
+    async fn take_slot(socket: SharedFd<socket2::Socket>, slots: u32) -> io::Result<Option<u32>> {
+        let mut registered = false;
+        loop {
+            let op = FilesUpdate::install(socket.clone());
+            let BufResult(res, op) = ::compio::runtime::submit(op).await;
+            let Err(error) = res else {
+                return Ok(Some(op.slot()));
+            };
+            match error.raw_os_error() {
+                // The table is full (`io_fixed_fd_install`).
+                Some(libc::ENFILE) => return Ok(None),
+                // A kernel that does not allocate slots (before 5.19) reads
+                // the allocation marker as an offset, which overflows
+                // (`__io_register_rsrc_update`).
+                Some(libc::EOVERFLOW) => return Ok(None),
+                // The ring has no table yet.
+                Some(libc::ENXIO) if !registered => {
+                    register(slots)?;
+                    registered = true;
+                }
+                // A kernel without the operation (before 5.6).
+                None if error.kind() == io::ErrorKind::Unsupported => return Ok(None),
+                _ => return Err(error),
+            }
+        }
+    }
+
+    /// Registers the current ring's table, of `slots` empty slots.
+    fn register(slots: u32) -> io::Result<()> {
+        let table = vec![-1; slots as usize];
+        match Runtime::with_current(|runtime| runtime.register_files(&table)) {
+            // Another stream's installer registered it meanwhile.
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => Ok(()),
+            res => res.map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("registering a file table of {slots} slots: {error}"),
+                )
+            }),
+        }
+    }
+
+    /// Gives `index` back to the table, which drops its hold on the socket.
+    async fn remove(index: u32) {
+        let res = ::compio::runtime::submit(FilesUpdate::remove(index))
+            .await
+            .0;
+        debug_assert!(
+            res.is_ok(),
+            "giving back slot {index} of the file table: {res:?}"
+        );
+    }
+
+    /// `IORING_OP_FILES_UPDATE` of one slot.
+    struct FilesUpdate {
+        /// The descriptor to install, or `-1` to empty the slot; once a
+        /// descriptor is installed, the slot the kernel allocated for it.
+        fd: RawFd,
+        offset: i32,
+        /// The socket being installed, open until the kernel holds it.
+        _socket: Option<SharedFd<socket2::Socket>>,
+    }
+
+    impl FilesUpdate {
+        fn install(socket: SharedFd<socket2::Socket>) -> Self {
+            Self {
+                fd: socket.as_raw_fd(),
+                offset: IORING_FILE_INDEX_ALLOC,
+                _socket: Some(socket),
+            }
+        }
+
+        fn remove(index: u32) -> Self {
+            Self {
+                fd: -1,
+                offset: index.cast_signed(),
+                _socket: None,
+            }
+        }
+
+        /// The slot an install took.
+        const fn slot(&self) -> u32 {
+            self.fd.cast_unsigned()
+        }
+    }
+
+    fn unsupported() -> io::Error {
+        io::Error::new(io::ErrorKind::Unsupported, "a file table needs io_uring")
+    }
+
+    // SAFETY: the entry points at `fd`, which the operation owns and compio
+    // keeps in place until the operation completes.
+    unsafe impl IourOpCode for FilesUpdate {
+        type Control = ();
+
+        fn create_entry(&mut self, (): &mut ()) -> OpEntry {
+            // The kernel writes the slot it allocates back into `fd`.
+            io_uring::opcode::FilesUpdate::new((&raw mut self.fd).cast_const(), 1)
+                .offset(self.offset)
+                .build()
+                .into()
+        }
+
+        fn call_blocking(&mut self, (): &mut ()) -> io::Result<usize> {
+            Err(unsupported())
+        }
+    }
+
+    // SAFETY: nothing is submitted; a stream takes a slot only on io_uring.
+    unsafe impl PollOpCode for FilesUpdate {
+        type Control = ();
+
+        fn pre_submit(&mut self, (): &mut ()) -> io::Result<Decision> {
+            Err(unsupported())
+        }
+
+        fn operate(&mut self, (): &mut ()) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(unsupported()))
+        }
+    }
+}
+
 /// Zero-copy sends on io_uring.
 #[cfg(target_os = "linux")]
 mod zero_copy {
@@ -831,7 +1431,7 @@ mod zero_copy {
     use futures_core::stream::FusedStream as _;
     use futures_lite::StreamExt as _;
 
-    use super::Socket;
+    use super::{Socket, Stream};
 
     /// The caller's buffers, shared by the sends of one write: a short send
     /// is continued by another while the first still holds what it sent.
@@ -850,7 +1450,7 @@ mod zero_copy {
     /// room in the socket with a poll (`io_net_retry`), so a write is one
     /// send and one notification unless an error cuts it short.
     pub(super) async fn write_all<S: Socket, B: IoVectoredBuf>(
-        socket: &S,
+        stream: &Stream<S>,
         buf: B,
     ) -> BufResult<(), Option<B>> {
         let flags = SendFlags::from_bits_retain(libc::MSG_WAITALL.cast_unsigned());
@@ -864,9 +1464,13 @@ mod zero_copy {
             }
             let rest = Shared(Rc::clone(&buf)).slice(written);
             let res = if zero_copy {
-                send(SendVectoredZc::new(socket.shared_fd(), rest, flags)).await
+                let op = SendVectoredZc::new(stream.inner.shared_fd(), rest, flags);
+                match stream.file.address(op) {
+                    Ok(op) => send(op).await,
+                    Err((e, _)) => Err(e),
+                }
             } else {
-                socket.write_vectored(rest).await.0
+                stream.send_vectored(rest).await.0
             };
             match res {
                 Ok(0) => {
@@ -974,13 +1578,14 @@ mod recv {
     use compio_buf::{BufResult, IoBufMut};
     use futures_lite::StreamExt as _;
 
-    use super::{RecvBuf, Socket};
+    use super::{RecvBuf, Socket, files};
     use crate::{
         Received,
         splice::{Pipe, Spliced},
     };
 
-    type Op = WithCancel<SubmitMultiManaged<RecvMulti<SharedFd<socket2::Socket>>>>;
+    type Op =
+        WithCancel<SubmitMultiManaged<files::Addressed<RecvMulti<SharedFd<socket2::Socket>>>>>;
 
     /// The receive side of one stream.
     #[derive(Default)]
@@ -1039,9 +1644,10 @@ mod recv {
     }
 
     impl Armed {
-        fn new<S: Socket>(socket: &S, ring: &BufferPool) -> io::Result<Self> {
+        fn new<S: Socket>(socket: &S, file: &files::File, ring: &BufferPool) -> io::Result<Self> {
             // A length of 0 receives up to a whole ring buffer at a time.
             let op = RecvMulti::new(socket.shared_fd(), ring, 0, RecvFlags::empty())?;
+            let op = file.address(op).map_err(|(e, _)| e)?;
             let cancel = CancelToken::new();
             let op = ::compio::runtime::submit_multi(op)
                 .into_managed(ring.clone())
@@ -1074,7 +1680,7 @@ mod recv {
 
     impl State {
         /// The next received bytes, waiting for them if none are held.
-        async fn next<S: Socket>(&mut self, socket: &S) -> io::Result<Next> {
+        async fn next<S: Socket>(&mut self, socket: &S, file: &files::File) -> io::Result<Next> {
             loop {
                 if let Some(buf) = self.held.pop_front() {
                     return Ok(Next::Buf(buf));
@@ -1101,7 +1707,7 @@ mod recv {
                         let Some(ring) = ring(&mut self.ring) else {
                             return Ok(Next::ReadInstead);
                         };
-                        slot.insert(Armed::new(socket, &ring)?)
+                        slot.insert(Armed::new(socket, file, &ring)?)
                     }
                 };
                 match armed.op.next().await {
@@ -1157,6 +1763,7 @@ mod recv {
         pub(super) async fn read_ahead<S: Socket, B: IoBufMut>(
             &self,
             socket: &S,
+            file: &files::File,
             mut buf: B,
         ) -> Copied<B> {
             if buf.as_uninit().is_empty() {
@@ -1164,7 +1771,7 @@ mod recv {
                 return Copied::Done(BufResult(Ok(0), buf));
             }
             let mut state = self.0.borrow_mut();
-            match state.next(socket).await {
+            match state.next(socket, file).await {
                 Ok(Next::Buf(mut held)) => {
                     let n = copy_into(&mut buf, &held);
                     held.advance(n);
@@ -1190,8 +1797,9 @@ mod recv {
         pub(super) async fn read_owned<S: Socket>(
             &self,
             socket: &S,
+            file: &files::File,
         ) -> io::Result<Received<RecvBuf>> {
-            Ok(match self.0.borrow_mut().next(socket).await? {
+            Ok(match self.0.borrow_mut().next(socket, file).await? {
                 Next::Buf(buf) => Received::Lent(buf),
                 Next::Eof => Received::End,
                 Next::ReadInstead => Received::ReadInstead,
@@ -1349,17 +1957,17 @@ pub struct TcpListener {
     inner: net::TcpListener,
     #[cfg(target_os = "linux")]
     accepts: multishot::Accepts,
-    /// The setting each accepted stream shares.
-    zero_copy: ZeroCopySend,
+    /// The settings each accepted stream shares.
+    io: Compio,
 }
 
 impl TcpListener {
-    fn new(inner: net::TcpListener, zero_copy: ZeroCopySend) -> Self {
+    fn new(inner: net::TcpListener, io: Compio) -> Self {
         Self {
             #[cfg(target_os = "linux")]
             accepts: multishot::Accepts::new(&inner),
             inner,
-            zero_copy,
+            io,
         }
     }
 
@@ -1388,10 +1996,10 @@ impl Listener for TcpListener {
             // completions, so it reports no peer.
             let stream = net::TcpStream::from_std(accepted?.into())?;
             let peer = stream.peer_addr()?;
-            return Ok((TcpStream::new(stream, self.zero_copy.clone()), peer));
+            return Ok((self.io.tcp_stream(stream), peer));
         }
         let (stream, peer) = self.inner.accept().await?;
-        Ok((TcpStream::new(stream, self.zero_copy.clone()), peer))
+        Ok((self.io.tcp_stream(stream), peer))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -1406,18 +2014,18 @@ pub struct UnixListener {
     inner: net::UnixListener,
     #[cfg(target_os = "linux")]
     accepts: multishot::Accepts,
-    /// The setting each accepted stream shares.
-    zero_copy: ZeroCopySend,
+    /// The settings each accepted stream shares.
+    io: Compio,
 }
 
 #[cfg(unix)]
 impl UnixListener {
-    fn new(inner: net::UnixListener, zero_copy: ZeroCopySend) -> Self {
+    fn new(inner: net::UnixListener, io: Compio) -> Self {
         Self {
             #[cfg(target_os = "linux")]
             accepts: multishot::Accepts::new(&inner),
             inner,
-            zero_copy,
+            io,
         }
     }
 
@@ -1448,7 +2056,7 @@ impl Listener for UnixListener {
         };
         #[cfg(not(target_os = "linux"))]
         let (stream, _) = self.inner.accept().await?;
-        let stream = UnixStream::new(stream, self.zero_copy.clone());
+        let stream = UnixStream::new(stream, &self.io);
         let peer = stream.peer_addr()?;
         Ok((stream, peer))
     }

@@ -14,7 +14,7 @@ categories = ["asynchronous", "network-programming"]
 
 [features]
 ## compio: io_uring on Linux (falling back to polling where io_uring is unavailable), IOCP on Windows, polling elsewhere.
-compio = ["dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core"]
+compio = ["dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core", "dep:io-uring", "dep:linux-raw-sys"]
 ## tokio's reactor, adapted to owned buffers.
 tokio = ["dep:tokio", "dep:socket2", "dep:libc", "dep:windows-sys"]
 ## async-io's reactor, adapted to owned buffers.
@@ -35,6 +35,20 @@ bytes = { version = "1.12.1", default-features = false }
 futures-lite = { version = "2.6.1", default-features = false }
 libc = { version = "0.2.191", default-features = false }
 futures-core = { version = "0.3.34", default-features = false, optional = true }
+
+# The submission entries of compio's io_uring driver, which addresses a
+# socket by its slot in the ring's file table: the same crate compio builds
+# them with, so that an entry built here is one its driver takes.
+[target.'cfg(target_os = "linux")'.dependencies.io-uring]
+version = "0.7.16"
+default-features = false
+optional = true
+
+[target.'cfg(target_os = "linux")'.dependencies.linux-raw-sys]
+version = "0.12.1"
+default-features = false
+features = ["io_uring"]
+optional = true
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.191", default-features = false, optional = true }
