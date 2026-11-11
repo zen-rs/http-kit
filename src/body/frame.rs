@@ -6,15 +6,16 @@ use http::HeaderMap;
 /// One frame of a [`Body`](super::Body).
 ///
 /// A body is a stream of these: data, trailers, and — with the `fs` feature —
-/// a region of a file. A consumer that can hand a file to the kernel
-/// (sendfile, splice) sends a [`FileRegion`] as it is; one that needs bytes
-/// reads it through [`FileRegion::into_stream`]. Nothing turns a region into
-/// bytes implicitly, except the `http_body::Body` boundary, which has no frame
-/// for it and reads it out there.
+/// a region of a file, and bytes in a pipe. A consumer that can hand a file to
+/// the kernel (sendfile, splice) sends a [`FileRegion`] as it is; one that
+/// needs bytes reads it through [`FileRegion::into_stream`]. Nothing turns a
+/// region or a pipe into bytes implicitly, except the `http_body::Body`
+/// boundary and [`into_data_stream`](super::GenericBody::into_data_stream),
+/// which have no frame for them and read them out there.
 ///
-/// The enum is `#[non_exhaustive]` because the `File` variant exists only with
-/// the `fs` feature: a match in another crate must not stop compiling when a
-/// different crate in the build enables it.
+/// The enum is `#[non_exhaustive]` because the `File` and `Pipe` variants exist
+/// only with the `fs` and `pipe` features: a match in another crate must not
+/// stop compiling when a different crate in the build enables one.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum BodyFrame {
@@ -25,6 +26,14 @@ pub enum BodyFrame {
     /// A region of a file, sent as the file's bytes.
     #[cfg(feature = "fs")]
     File(FileRegion),
+    /// Body bytes still in the kernel, in a pipe.
+    ///
+    /// A source produces one only for a consumer that offered a
+    /// [`PipeOffer`](super::PipeOffer); the consumer sends it on with
+    /// `splice(2)` or reads it out with `FilledPipe::read_out`. Linux and
+    /// Android only, with the `pipe` feature.
+    #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+    Pipe(http_kit_io::splice::FilledPipe),
 }
 
 impl BodyFrame {
@@ -52,6 +61,16 @@ impl BodyFrame {
     pub const fn as_file(&self) -> Option<&FileRegion> {
         match self {
             Self::File(region) => Some(region),
+            _ => None,
+        }
+    }
+
+    /// Returns the pipe of a pipe frame, or `None` for any other frame.
+    #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+    #[must_use]
+    pub const fn as_pipe(&self) -> Option<&http_kit_io::splice::FilledPipe> {
+        match self {
+            Self::Pipe(pipe) => Some(pipe),
             _ => None,
         }
     }
