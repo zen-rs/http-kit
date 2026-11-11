@@ -37,6 +37,7 @@
 //! - `json` - JSON serialization/deserialization via serde_json (enabled by default)
 //! - `form` - Form data handling via serde_urlencoded (enabled by default)
 //! - `fs` - File-region bodies (`FileRegion`, `Body::from_file`) with MIME type detection
+//! - `pipe` - `BodyFrame::Pipe`, body bytes still in the kernel (Linux and Android)
 //! - `mime` - MIME type parsing and manipulation
 //! - `http_body` - Implementation of http_body traits
 //! - `std` - Enable standard library support (enabled by default)
@@ -52,7 +53,7 @@ pub use error::{BoxHttpError, Error, HttpError, Result, ResultExt};
 mod body;
 
 pub use body::Error as BodyError;
-pub use body::{Body, BodyFrame, DataStream, GenericBody, LocalBody};
+pub use body::{Body, BodyFrame, DataStream, FrameSource, GenericBody, LocalBody, PipeOffer};
 #[cfg(feature = "fs")]
 pub use body::{FileRegion, FileRegionStream};
 

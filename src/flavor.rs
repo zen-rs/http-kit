@@ -20,7 +20,7 @@ use bytes::Bytes;
 use core::pin::Pin;
 use futures_lite::{Stream, StreamExt};
 
-use crate::body::{into_bytes::IntoBytes, BodyFrame, Error};
+use crate::body::{into_bytes::IntoBytes, source::StreamSource, BodyFrame, Error, FrameSource};
 
 mod sealed {
     pub trait Sealed {}
@@ -31,9 +31,9 @@ mod sealed {
 /// The trait is sealed; its associated types are the erased forms a body of
 /// this flavour holds.
 pub trait Flavor: sealed::Sealed + Sized + 'static {
-    /// A stream of frames, as a body of this flavour holds it.
+    /// A source of frames, as a body of this flavour holds it.
     #[doc(hidden)]
-    type Frames: ?Sized + Stream<Item = Result<BodyFrame, Error>>;
+    type Frames: ?Sized + FrameSource;
     /// An `http_body::Body`, as a body of this flavour holds it.
     #[doc(hidden)]
     type HttpBody: ?Sized + http_body::Body<Data = Bytes, Error = Error>;
@@ -51,12 +51,12 @@ impl sealed::Sealed for Shared {}
 impl sealed::Sealed for Local {}
 
 impl Flavor for Shared {
-    type Frames = dyn Stream<Item = Result<BodyFrame, Error>> + Send + Sync;
+    type Frames = dyn FrameSource + Send + Sync;
     type HttpBody = dyn http_body::Body<Data = Bytes, Error = Error> + Send + Sync;
 }
 
 impl Flavor for Local {
-    type Frames = dyn Stream<Item = Result<BodyFrame, Error>>;
+    type Frames = dyn FrameSource;
     type HttpBody = dyn http_body::Body<Data = Bytes, Error = Error>;
 }
 
@@ -75,6 +75,12 @@ pub trait Holds<T>: Flavor {
     ) -> Pin<Box<Self::Frames>>
     where
         T: Stream<Item = I> + 'static;
+
+    /// Boxes a source of frames.
+    #[doc(hidden)]
+    fn source(source: T) -> Pin<Box<Self::Frames>>
+    where
+        T: FrameSource + 'static;
 
     /// Boxes an `http_body::Body`.
     #[doc(hidden)]
@@ -104,7 +110,14 @@ impl<T: Send + Sync> Holds<T> for Shared {
     where
         T: Stream<Item = I> + 'static,
     {
-        Box::pin(frame_stream(stream, map))
+        Box::pin(StreamSource::new(frame_stream(stream, map)))
+    }
+
+    fn source(source: T) -> Pin<Box<Self::Frames>>
+    where
+        T: FrameSource + 'static,
+    {
+        Box::pin(source)
     }
 
     fn http_body(body: T) -> Pin<Box<Self::HttpBody>>
@@ -125,7 +138,14 @@ impl<T> Holds<T> for Local {
     where
         T: Stream<Item = I> + 'static,
     {
-        Box::pin(frame_stream(stream, map))
+        Box::pin(StreamSource::new(frame_stream(stream, map)))
+    }
+
+    fn source(source: T) -> Pin<Box<Self::Frames>>
+    where
+        T: FrameSource + 'static,
+    {
+        Box::pin(source)
     }
 
     fn http_body(body: T) -> Pin<Box<Self::HttpBody>>

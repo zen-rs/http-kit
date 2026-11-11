@@ -52,6 +52,13 @@ optional = true
 version = "0.18"
 optional = true
 
+# The pipe types a `BodyFrame::Pipe` carries. Linux and Android only, like the
+# frame.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.http-kit-io]
+version = "0.4.0"
+path = "io"
+optional = true
+
 [features]
 default = ["json", "form", "std", "cookie", "ws"]
 std = []
@@ -60,9 +67,14 @@ json = ["dep:serde", "dep:serde_json"]
 form = ["dep:serde", "dep:serde_urlencoded"]
 fs = ["std", "dep:blocking", "dep:mime_guess"]
 ws = []
+## `BodyFrame::Pipe`: body bytes still in the kernel, on Linux and Android (needs Rust 1.95, the I/O crate's).
+pipe = ["std", "dep:http-kit-io"]
 cookie = ["dep:cookie"]
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0.17"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dev-dependencies]
+http-kit-io = { version = "0.4.0", path = "io", features = ["tokio"] }

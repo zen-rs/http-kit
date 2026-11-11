@@ -80,12 +80,14 @@ mod convert;
 mod error_type;
 mod frame;
 pub(crate) mod into_bytes;
+pub(crate) mod source;
 use crate::flavor::{Flavor, Holds, Local, Shared};
 use crate::sse::{Event, SseStream};
 pub use error_type::Error;
 pub use frame::BodyFrame;
 #[cfg(feature = "fs")]
 pub use frame::{FileRegion, FileRegionStream};
+pub use source::{FrameSource, PipeOffer};
 #[cfg(feature = "std")]
 extern crate std;
 use futures_lite::{ready, Stream, StreamExt};
@@ -308,6 +310,29 @@ impl<F: Flavor> GenericBody<F> {
         F: Holds<S>,
     {
         Self::from_mapped_frames(stream, |result| result)
+    }
+
+    /// Creates a body from a [`FrameSource`], which can answer a consumer's
+    /// [`PipeOffer`] with `BodyFrame::Pipe` frames.
+    ///
+    /// A body from [`from_frames`](Self::from_frames) is a source that ignores
+    /// every offer. Its length is not known up front, so [`len`](Self::len)
+    /// returns `None`.
+    ///
+    /// You are responsible for setting the MIME type of the body.
+    pub fn from_source<S>(source: S) -> Self
+    where
+        S: FrameSource + 'static,
+        F: Holds<S>,
+    {
+        Self {
+            mime: None,
+            inner: BodyInner::Frames(Frames {
+                stream: F::source(source),
+                #[cfg(feature = "fs")]
+                reading: None,
+            }),
+        }
     }
 
     fn from_mapped_frames<I: 'static, E: Into<Error> + 'static, S>(
@@ -1149,31 +1174,121 @@ impl<F: Flavor> GenericBody<F> {
 
     /// Polls the next frame with every file region read out as data: the
     /// shape of `http_body::Body`, which has no frame for a file.
+    ///
+    /// A pipe frame is read out whole (it holds bytes already, so this never
+    /// waits); no offer is made, so a source only produces one that ignores
+    /// that.
     fn poll_read_frame(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
-        #[cfg(feature = "fs")]
+        #[cfg(any(
+            feature = "fs",
+            all(feature = "pipe", any(target_os = "linux", target_os = "android"))
+        ))]
         loop {
-            match ready!(Pin::new(&mut *self).poll_next(cx)) {
+            match ready!(self.poll_frames(cx, None)) {
+                #[cfg(feature = "fs")]
                 Some(Ok(BodyFrame::File(region))) => self.read_out(region),
+                #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+                Some(Ok(BodyFrame::Pipe(pipe))) => {
+                    let data = pipe
+                        .read_out()
+                        .map(|(data, _pipe)| Frame::data(data))
+                        .map_err(Error::from);
+                    return Poll::Ready(Some(data));
+                }
                 frame => return Poll::Ready(frame.map(|frame| frame.map(into_http_frame))),
             }
         }
-        #[cfg(not(feature = "fs"))]
-        Pin::new(self)
-            .poll_next(cx)
+        #[cfg(not(any(
+            feature = "fs",
+            all(feature = "pipe", any(target_os = "linux", target_os = "android"))
+        )))]
+        self.poll_frames(cx, None)
             .map(|frame| frame.map(|frame| frame.map(into_http_frame)))
+    }
+
+    /// Polls the next frame, telling the source the consumer would take a
+    /// pipe frame of up to [`PipeOffer::max`] bytes.
+    ///
+    /// The frame is a `BodyFrame::Pipe` only if the source holds bytes in
+    /// the kernel and accepted the offer; otherwise it is whatever
+    /// [`poll_next`](Stream::poll_next) yields, so a consumer matches every
+    /// frame as it would without an offer. A frame that is not a pipe leaves
+    /// the offer as it was, its pipe still in it.
+    ///
+    /// Only a source made with [`from_source`](Self::from_source) sees the
+    /// offer; every other body ignores it.
+    pub fn poll_frame_offering(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        offer: &mut PipeOffer,
+    ) -> Poll<Option<Result<BodyFrame, Error>>> {
+        self.get_mut().poll_frames(cx, Some(offer))
+    }
+
+    fn poll_frames(
+        &mut self,
+        cx: &mut Context<'_>,
+        offer: Option<&mut PipeOffer>,
+    ) -> Poll<Option<Result<BodyFrame, Error>>> {
+        match &mut self.inner {
+            BodyInner::Once(bytes) => {
+                if bytes.is_empty() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(BodyFrame::Data(take(bytes)))))
+                }
+            }
+            #[cfg(feature = "fs")]
+            BodyInner::File(_) => {
+                let BodyInner::File(region) = take(&mut self.inner) else {
+                    unreachable!("matched a file body above")
+                };
+                Poll::Ready(Some(Ok(BodyFrame::File(region))))
+            }
+            #[cfg(feature = "fs")]
+            BodyInner::Reading(stream) => match ready!(Pin::new(stream).poll_next(cx)) {
+                Some(chunk) => Poll::Ready(Some(chunk.map(BodyFrame::Data).map_err(Error::from))),
+                None => {
+                    self.inner = BodyInner::default();
+                    Poll::Ready(None)
+                }
+            },
+            BodyInner::Frames(frames) => {
+                #[cfg(feature = "fs")]
+                if let Some(reading) = &mut frames.reading {
+                    match ready!(Pin::new(reading).poll_next(cx)) {
+                        Some(chunk) => {
+                            return Poll::Ready(Some(
+                                chunk.map(BodyFrame::Data).map_err(Error::from),
+                            ))
+                        }
+                        None => frames.reading = None,
+                    }
+                }
+                frames.stream.as_mut().poll_next_frame(cx, offer)
+            }
+            BodyInner::HttpBody(body) => body
+                .as_mut()
+                .poll_frame(cx)
+                .map(|frame| frame.map(|frame| frame.map(from_http_frame))),
+            BodyInner::Freeze => Poll::Ready(Some(Err(Error::BodyFrozen))),
+        }
     }
 }
 
-/// Converts a data or trailers frame; file regions are read out before this.
+/// Converts a data or trailers frame; file regions and pipes are read out
+/// before this.
 fn into_http_frame(frame: BodyFrame) -> Frame<Bytes> {
     match frame {
         BodyFrame::Data(data) => Frame::data(data),
         BodyFrame::Trailers(trailers) => Frame::trailers(trailers),
         #[cfg(feature = "fs")]
         BodyFrame::File(_) => unreachable!("file regions are read out before conversion"),
+        #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+        BodyFrame::Pipe(_) => unreachable!("pipes are read out before conversion"),
     }
 }
 
@@ -1252,49 +1367,7 @@ impl<F: Flavor> Stream for GenericBody<F> {
     type Item = Result<BodyFrame, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match &mut self.inner {
-            BodyInner::Once(bytes) => {
-                if bytes.is_empty() {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Ready(Some(Ok(BodyFrame::Data(take(bytes)))))
-                }
-            }
-            #[cfg(feature = "fs")]
-            BodyInner::File(_) => {
-                let BodyInner::File(region) = take(&mut self.inner) else {
-                    unreachable!("matched a file body above")
-                };
-                Poll::Ready(Some(Ok(BodyFrame::File(region))))
-            }
-            #[cfg(feature = "fs")]
-            BodyInner::Reading(stream) => match ready!(Pin::new(stream).poll_next(cx)) {
-                Some(chunk) => Poll::Ready(Some(chunk.map(BodyFrame::Data).map_err(Error::from))),
-                None => {
-                    self.inner = BodyInner::default();
-                    Poll::Ready(None)
-                }
-            },
-            BodyInner::Frames(frames) => {
-                #[cfg(feature = "fs")]
-                if let Some(reading) = &mut frames.reading {
-                    match ready!(Pin::new(reading).poll_next(cx)) {
-                        Some(chunk) => {
-                            return Poll::Ready(Some(
-                                chunk.map(BodyFrame::Data).map_err(Error::from),
-                            ))
-                        }
-                        None => frames.reading = None,
-                    }
-                }
-                frames.stream.as_mut().poll_next(cx)
-            }
-            BodyInner::HttpBody(body) => body
-                .as_mut()
-                .poll_frame(cx)
-                .map(|frame| frame.map(|frame| frame.map(from_http_frame))),
-            BodyInner::Freeze => Poll::Ready(Some(Err(Error::BodyFrozen))),
-        }
+        self.poll_frames(cx, None)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
