@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/zen-rs/http-kit/compare/h1/v0.4.0...h1/v0.5.0) - 2026-11-11
+
+### Added
+
+- *(h1)* [**breaking**] splice bodies in both directions
+
+### Fixed
+
+- *(h1)* offer the pipe after decoding framing, before reading
+
 ## [0.4.0](https://github.com/zen-rs/http-kit/compare/h1/v0.3.0...h1/v0.4.0) - 2026-11-10
 
 ### Added

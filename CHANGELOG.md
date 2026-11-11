@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/zen-rs/http-kit/compare/v0.6.0...v0.7.0) - 2026-11-11
+
+### Added
+
+- *(h1)* [**breaking**] splice bodies in both directions
+- *(tls)* [**breaking**] splice on kernel TLS connections
+- *(body)* pipe frames and pipe offers
+- *(io)* socket-to-socket splice through a pipe
+
+### Fixed
+
+- *(h1)* offer the pipe after decoding framing, before reading
+- *(io)* build the pipe types without a runtime feature
+- *(io)* splice into a socket without holding a kernel worker
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/130-tls-splice
+- *(tls)* count spliced bytes in the counting write half
+- approve the release PR's held CI instead of dispatching it
+- release from main and retire dev
+
 ## [0.6.0](https://github.com/zen-rs/http-kit/compare/v0.5.2...v0.6.0) - 2026-11-10
 
 ### Other

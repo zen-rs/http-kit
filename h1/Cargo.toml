@@ -1,6 +1,6 @@
 [package]
 name = "http-kit-h1"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Lexo Liu <me@lexo.cool>"]
@@ -21,8 +21,8 @@ fs = ["http-kit/fs"]
 pipe = ["http-kit/pipe"]
 
 [dependencies]
-http-kit = { version = "0.6.0", path = "..", default-features = false, features = ["std"] }
-http-kit-io = { version = "0.4.0", path = "../io" }
+http-kit = { version = "0.7.0", path = "..", default-features = false, features = ["std"] }
+http-kit-io = { version = "0.5.0", path = "../io" }
 http = { version = "1.5.0", default-features = false, features = ["std"] }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 httparse = { version = "1.10.1", default-features = false }
@@ -33,7 +33,7 @@ thiserror = { version = "2.0.17", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-http-kit-io = { version = "0.4.0", path = "../io", features = ["tokio", "compio"] }
+http-kit-io = { version = "0.5.0", path = "../io", features = ["tokio", "compio"] }
 compio = { version = "0.19.2", default-features = false, features = ["runtime"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
 
