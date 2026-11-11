@@ -217,6 +217,16 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     {
         std::os::windows::fs::FileExt::seek_read(file, buf, offset)
     }
+    #[cfg(target_os = "wasi")]
+    {
+        // `std::os::wasi::fs::FileExt` is unstable (`wasi_ext`), so this is a
+        // seek and a read. Like `seek_read` on Windows it moves the file's
+        // cursor.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read(buf)
+    }
 }
 
 impl<R, D: Side> fmt::Debug for Reader<R, D> {
