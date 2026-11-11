@@ -21,11 +21,11 @@ tokio = ["dep:tokio", "dep:socket2", "dep:libc", "dep:windows-sys"]
 async-io = ["dep:async-io", "dep:socket2", "dep:libc", "dep:windows-sys"]
 
 [dependencies]
-compio-buf = { version = "0.8.3", default-features = false, features = ["bytes"] }
+compio-buf = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["bytes"] }
 futures-core = { version = "0.3.34", default-features = false }
 futures-io = { version = "0.3.34", default-features = false, features = ["std"] }
 
-compio = { version = "0.19.2", default-features = false, features = ["runtime", "net", "time", "io-uring", "polling"], optional = true }
+compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["runtime", "net", "time", "io-uring", "polling"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["net", "time"], optional = true }
 async-io = { version = "2.6.0", default-features = false, optional = true }
 socket2 = { version = "0.6.5", default-features = false, optional = true }
