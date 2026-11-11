@@ -1046,3 +1046,34 @@ mod tokio {
 mod async_io {
     suite!(http_kit_io::async_io::AsyncIo, ::async_io::block_on);
 }
+
+/// Bytes put into a pipe from memory come out of it in order, at most a
+/// pipe's capacity at a time.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_pipe_is_filled_from_memory() {
+    use http_kit_io::splice::Pipe;
+
+    let pipe = Pipe::new().expect("pipe");
+    let capacity = pipe.capacity();
+    let payload = cjk_payload(capacity + 1_000);
+
+    let (pipe, error) = match Pipe::new().expect("pipe").fill(&[]) {
+        Err((error, pipe)) => (pipe, error),
+        Ok(_) => panic!("filling with nothing succeeded"),
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let filled = pipe
+        .fill(&payload)
+        .unwrap_or_else(|(e, _)| panic!("fill: {e}"));
+    assert_eq!(filled.len(), capacity);
+    let (first, pipe) = filled.read_out().expect("read out");
+    assert_eq!(&first[..], &payload[..capacity]);
+
+    let filled = pipe
+        .fill(&payload[capacity..])
+        .unwrap_or_else(|(e, _)| panic!("fill the rest: {e}"));
+    let (rest, _) = filled.read_out().expect("read out");
+    assert_eq!(&rest[..], &payload[capacity..]);
+}

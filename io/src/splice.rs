@@ -67,6 +67,38 @@ impl Pipe {
         self.capacity
     }
 
+    /// Puts bytes that are already in memory into this empty pipe, as
+    /// [`SpliceRead::splice_to_pipe`] puts bytes from a stream, so they can
+    /// go out through [`SpliceWrite::splice_from_pipe`] ahead of what the
+    /// stream splices next. A stream that holds bytes it already read (TLS
+    /// plaintext decrypted before the kernel took the connection) hands them
+    /// over this way.
+    ///
+    /// At most [`capacity`](Self::capacity) bytes go in; the filled pipe's
+    /// [`len`](FilledPipe::len) says how many of `bytes` that was, and the
+    /// caller fills again with the rest.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`io::ErrorKind::InvalidInput`] if `bytes` is empty, and
+    /// with the kernel's error otherwise. The error comes with the pipe,
+    /// still empty.
+    pub fn fill(self, bytes: &[u8]) -> Result<FilledPipe, (io::Error, Self)> {
+        if bytes.is_empty() {
+            return Err((
+                io::Error::new(io::ErrorKind::InvalidInput, "fill of zero bytes"),
+                self,
+            ));
+        }
+        let bytes = &bytes[..bytes.len().min(self.capacity)];
+        // The pipe is empty and `bytes` fits in its capacity, so the write
+        // takes it whole without waiting.
+        match crate::sys::pipe::write_pipe(self.write_fd(), bytes) {
+            Ok(written) => Ok(FilledPipe::new(self, written)),
+            Err(error) => Err((error, self)),
+        }
+    }
+
     pub(crate) fn read_fd(&self) -> BorrowedFd<'_> {
         self.read.as_fd()
     }

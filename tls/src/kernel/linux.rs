@@ -32,7 +32,11 @@ use std::{
     rc::Rc,
 };
 
-use http_kit_io::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, Write, WriteControl};
+use http_kit_io::{
+    BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, SpliceRead, SpliceWrite, Write,
+    WriteControl,
+    splice::{FilledPipe, Pipe, Spliced},
+};
 use ktls_sys::bindings as uapi;
 use rustls::{ConnectionTrafficSecrets, ContentType, ProtocolVersion, kernel::KernelConnection};
 use zeroize::Zeroize;
@@ -534,6 +538,66 @@ impl<R: Read + AsFd, D: Side> Reader<R, D> {
     }
 }
 
+impl<R: SpliceRead + AsFd, D: Side> Reader<R, D> {
+    /// [`SpliceRead::splice_to_pipe`] on the plaintext the kernel opens.
+    ///
+    /// What rustls decrypted before the switch goes first, put into the pipe
+    /// from memory, a pipe's capacity at a time. After that the socket
+    /// splices straight into the pipe, and a record other than data, which
+    /// the kernel refuses to splice with `EINVAL` and keeps, is taken and
+    /// handled as a read would: a `close_notify` ends the stream, a
+    /// `KeyUpdate` installs the next key, a `NewSessionTicket` goes to
+    /// rustls. The splice then starts again.
+    pub(crate) async fn splice_to_pipe(
+        &mut self,
+        mut pipe: Pipe,
+        max: usize,
+    ) -> Result<Spliced, (io::Error, Pipe)> {
+        if max == 0 {
+            return Err((
+                io::Error::new(io::ErrorKind::InvalidInput, "splice of zero bytes"),
+                pipe,
+            ));
+        }
+        if self.carried_read < self.carried.len() {
+            let carried = &self.carried[self.carried_read..];
+            let filled = pipe.fill(&carried[..carried.len().min(max)])?;
+            self.carried_read += filled.len();
+            if self.carried_read == self.carried.len() {
+                self.carried = Vec::new();
+                self.carried_read = 0;
+            }
+            return Ok(Spliced::Filled(filled));
+        }
+        loop {
+            if self.closed {
+                return Ok(Spliced::End(pipe));
+            }
+            match SpliceRead::splice_to_pipe(&mut self.io, pipe, max).await {
+                Ok(Spliced::End(returned)) => {
+                    return Err((
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "the peer closed the connection without a TLS close_notify",
+                        ),
+                        returned,
+                    ));
+                }
+                Ok(filled @ Spliced::Filled(_)) => return Ok(filled),
+                Err((error, returned)) => {
+                    pipe = returned;
+                    if error.raw_os_error() != Some(libc::EINVAL) {
+                        return Err((error, pipe));
+                    }
+                    if let Err(error) = self.control() {
+                        return Err((error, pipe));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Receives the record the kernel holds back, returning its content type.
 fn recv_record(fd: BorrowedFd<'_>, record: &mut Vec<u8>) -> io::Result<u8> {
     record.clear();
@@ -722,7 +786,20 @@ impl<W: Write + SendFile + WriteControl + AsFd, D: Side> Writer<W, D> {
     }
 }
 
-impl<R: Read + AsFd, D: Side> KernelRead<R, D> for Reader<R, D> {
+impl<W: SpliceWrite + SendFile + WriteControl + AsFd, D: Side> Writer<W, D> {
+    /// [`SpliceWrite::splice_from_pipe`] into the socket the kernel seals,
+    /// moving to the next key first when the bytes could take this one past
+    /// its record limit, as a write of them would.
+    pub(crate) async fn splice_from_pipe(&mut self, filled: FilledPipe) -> io::Result<Pipe> {
+        let len = filled.len();
+        self.prepare(len).await?;
+        let pipe = SpliceWrite::splice_from_pipe(&mut self.io, filled).await?;
+        self.records = self.records.saturating_add(record::records_for(len));
+        Ok(pipe)
+    }
+}
+
+impl<R: SpliceRead + AsFd, D: Side> KernelRead<R, D> for Reader<R, D> {
     const SOCKET: bool = true;
 
     fn adopt(reader: Self) -> Self {
@@ -736,9 +813,19 @@ impl<R: Read + AsFd, D: Side> KernelRead<R, D> for Reader<R, D> {
     fn read<B: IoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
         Self::read(self, buf)
     }
+
+    fn splice_to_pipe(
+        &mut self,
+        pipe: Pipe,
+        max: usize,
+    ) -> impl Future<Output = Result<Spliced, (io::Error, Pipe)>> {
+        Self::splice_to_pipe(self, pipe, max)
+    }
 }
 
-impl<W: Write + SendFile + WriteControl + AsFd, D: Side> KernelWrite<W, D> for Writer<W, D> {
+impl<W: Write + SendFile + SpliceWrite + WriteControl + AsFd, D: Side> KernelWrite<W, D>
+    for Writer<W, D>
+{
     fn get_ref(&self) -> &W {
         Self::get_ref(self)
     }
@@ -769,6 +856,10 @@ impl<W: Write + SendFile + WriteControl + AsFd, D: Side> KernelWrite<W, D> for W
         len: usize,
     ) -> impl Future<Output = BufResult<usize, F>> {
         Self::send_file(self, file, offset, len)
+    }
+
+    fn splice_from_pipe(&mut self, filled: FilledPipe) -> impl Future<Output = io::Result<Pipe>> {
+        Self::splice_from_pipe(self, filled)
     }
 }
 

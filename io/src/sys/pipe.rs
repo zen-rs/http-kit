@@ -84,3 +84,22 @@ pub(crate) fn read_pipe(pipe: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usiz
         }
     }
 }
+
+/// `write(2)` of `buf` to the write end of a pipe that has room for all of
+/// it, so it never waits.
+pub(crate) fn write_pipe(pipe: BorrowedFd<'_>, buf: &[u8]) -> io::Result<usize> {
+    loop {
+        // SAFETY: `buf` is valid for reads of its length and the descriptor
+        // is open for the duration of the call.
+        let written = unsafe { libc::write(pipe.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+        match usize::try_from(written) {
+            Ok(written) => return Ok(written),
+            Err(_) => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}

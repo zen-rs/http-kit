@@ -32,6 +32,19 @@
 //! user space. A connection the kernel cannot take stays in user space;
 //! which one it is, is [`TlsStream::mode`].
 //!
+//! A kernel TLS stream and its halves also forward without the bytes
+//! entering user space: they implement [`SpliceRead`] and [`SpliceWrite`]
+//! (Linux and Android), splicing the plaintext the kernel opens into a pipe
+//! and from a pipe into records the kernel seals. Plaintext rustls decrypted
+//! before the switch comes out first, and a record other than data (a
+//! `KeyUpdate`, a `NewSessionTicket`, a `close_notify`) is handled in the
+//! middle of a splice as it is in a read. A user-space connection reports
+//! `can_splice() == false` and refuses a splice with
+//! [`io::ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported). On Linux
+//! the kernel's socket halves must be splice-capable
+//! ([`SpliceRead`]/[`SpliceWrite`]) to be handed to the kernel, which every
+//! socket of `http-kit-io` is.
+//!
 //! # Closing
 //!
 //! Shutting the write side down sends `close_notify` first. A peer that
@@ -127,7 +140,7 @@ mod stream;
 mod user;
 
 #[cfg(doc)]
-use http_kit_io::{Read, SendFile, Split, Write};
+use http_kit_io::{Read, SendFile, SpliceRead, SpliceWrite, Split, Write};
 pub use rustls;
 
 #[cfg(feature = "kernel")]

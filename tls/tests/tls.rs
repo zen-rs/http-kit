@@ -17,7 +17,8 @@ use http::Method;
 use http_kit::{Body, BodyFrame, Request, Response};
 use http_kit_h1::{ClientConfig, ServerConfig, ServerConnection, handshake_stream};
 use http_kit_io::{
-    BufResult, Io, IoBuf, IoVectoredBuf, Listener as _, Read, SendFile, Split, Write,
+    BufResult, Io, IoBuf, IoVectoredBuf, Listener as _, Read, SendFile, SpliceRead, SpliceWrite,
+    Split, Write,
 };
 use http_kit_tls::{
     Client, Mode, Server, TlsAcceptor, TlsConnector, TlsStream, Transport,
@@ -119,7 +120,7 @@ fn acceptor_for(config: rustls::ServerConfig) -> TlsAcceptor {
     acceptor
 }
 
-fn connector(identity: &Identity, params: Params, alpn: &[&[u8]]) -> TlsConnector {
+fn client_config(identity: &Identity, params: Params, alpn: &[&[u8]]) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(identity.chain[0].clone()).expect("trust root");
     let mut config = rustls::ClientConfig::builder_with_provider(provider(params))
@@ -128,7 +129,11 @@ fn connector(identity: &Identity, params: Params, alpn: &[&[u8]]) -> TlsConnecto
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    let connector = TlsConnector::new(Arc::new(config));
+    config
+}
+
+fn connector(identity: &Identity, params: Params, alpn: &[&[u8]]) -> TlsConnector {
+    let connector = TlsConnector::new(Arc::new(client_config(identity, params, alpn)));
     #[cfg(feature = "kernel")]
     let connector = connector.with_kernel_tls(http_kit_tls::KernelTls::probe().expect("probe"));
     connector
@@ -761,6 +766,416 @@ where
     assert_bytes(&echoed, &body);
 }
 
+fn assert_read_splice<T: SpliceRead>() {}
+
+fn assert_write_splice<T: SpliceWrite>() {}
+
+/// A TLS stream and its halves implement the splice traits on every
+/// platform, whichever transport they run over.
+#[test]
+fn tls_stream_and_halves_implement_the_splice_traits() {
+    fn check<S: Transport>() {
+        assert_read_splice::<TlsStream<S, Server>>();
+        assert_write_splice::<TlsStream<S, Client>>();
+        assert_read_splice::<<TlsStream<S, Server> as Split>::ReadHalf>();
+        assert_write_splice::<<TlsStream<S, Client> as Split>::WriteHalf>();
+    }
+    check::<<http_kit_io::tokio::Tokio as Io>::TcpStream>();
+    check::<<http_kit_io::compio::Compio as Io>::TcpStream>();
+}
+
+/// A connection encrypted in user space reports that it cannot splice, on
+/// the stream and on both halves, and refuses a splice with the pipe back.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn user_mode_cannot_splice<I: Io>(io: I)
+where
+    I::TcpStream: Transport,
+{
+    use http_kit_io::splice::Pipe;
+
+    async fn check<T>(mut stream: T)
+    where
+        T: SpliceRead + SpliceWrite + Split,
+        T::ReadHalf: SpliceRead,
+        T::WriteHalf: SpliceWrite,
+    {
+        assert!(!SpliceRead::can_splice(&stream));
+        assert!(!SpliceWrite::can_splice(&stream));
+        let (error, _) = SpliceRead::splice_to_pipe(&mut stream, Pipe::new().expect("pipe"), 1)
+            .await
+            .expect_err("a user-space connection cannot splice in");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+
+        let (mut read, mut write) = stream.split();
+        assert!(!SpliceRead::can_splice(&read));
+        assert!(!SpliceWrite::can_splice(&write));
+        let (error, _) = SpliceRead::splice_to_pipe(&mut read, Pipe::new().expect("pipe"), 1)
+            .await
+            .expect_err("a user-space half cannot splice in");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let filled = Pipe::new()
+            .expect("pipe")
+            .fill(CJK.as_bytes())
+            .unwrap_or_else(|(error, _)| panic!("fill: {error}"));
+        let error = SpliceWrite::splice_from_pipe(&mut write, filled)
+            .await
+            .expect_err("a user-space half cannot splice out");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    let identity = Identity::new();
+    // No kernel probe is given, so the records stay in user space.
+    let acceptor = TlsAcceptor::new(Arc::new(server_config(&identity, TLS13_AES_128, &[])));
+    let connector = TlsConnector::new(Arc::new(client_config(&identity, TLS13_AES_128, &[])));
+    tls_pair(
+        io,
+        acceptor,
+        connector,
+        |stream| async move {
+            assert_eq!(stream.mode(), Mode::User);
+            check(stream).await;
+        },
+        |stream| async move {
+            assert_eq!(stream.mode(), Mode::User);
+            check(stream).await;
+        },
+    )
+    .await;
+}
+
+/// Forwarding through TLS against an independent TLS implementation
+/// (rustls's buffered API on a thread of its own), so the key changes and
+/// session tickets come from a peer that is not this crate.
+///
+/// Where the connection is in kernel mode the subject forwards by
+/// splicing; everywhere else it reads and writes, and the same peers check
+/// the exchange itself.
+mod forward {
+    use std::{
+        io::{Read as _, Write as _},
+        net::{SocketAddr, TcpListener, TcpStream},
+        ops::DerefMut,
+        sync::Arc,
+        thread::{self, JoinHandle},
+    };
+
+    use http_kit_io::{BufResult, Io, Listener as _, SpliceRead, SpliceWrite, Split, Write};
+    use http_kit_tls::{Transport, rustls};
+
+    use super::{
+        CJK, EXPECTED, Identity, Mode, TLS13_AES_128, acceptor, assert_bytes, cjk_body,
+        client_config, connector, localhost, loopback, server_config,
+    };
+
+    /// Whether the subject's connections forward by splicing.
+    const SPLICES: bool = cfg!(all(target_os = "linux", feature = "kernel"));
+
+    /// How many bytes the peer sends before it reads the echo of them.
+    const ROUND: usize = 40_000;
+
+    /// Whether the running kernel takes a new key for a direction it
+    /// already has one for (a TLS 1.3 `KeyUpdate`), which Linux 6.13 added
+    /// for receiving. Connections in user space always do.
+    fn takes_key_updates() -> bool {
+        #[cfg(all(target_os = "linux", feature = "kernel"))]
+        {
+            let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .expect("the running kernel's release");
+            let mut numbers = release
+                .trim()
+                .split(['.', '-'])
+                .map(|part| part.parse::<u32>().expect("a number in the kernel release"));
+            let version = (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0));
+            let takes = version >= (6, 13);
+            if !takes {
+                eprintln!(
+                    "kernel {} cannot take a new receive key: the KeyUpdate step is skipped",
+                    release.trim()
+                );
+            }
+            takes
+        }
+        #[cfg(not(all(target_os = "linux", feature = "kernel")))]
+        {
+            true
+        }
+    }
+
+    /// The round before which the peer asks for new keys, if the connection
+    /// can take them: half the rounds cross the change.
+    fn rekey_before(payload: &[u8]) -> Option<usize> {
+        takes_key_updates().then(|| payload.chunks(ROUND).count() / 2)
+    }
+
+    /// The peer's side of a lockstep exchange: it sends a round, reads the
+    /// same bytes back, and repeats, so neither side's socket buffers fill
+    /// while the other is not reading. Keys are refreshed once, before the
+    /// round `rekey_before`; the connection ends with a `close_notify`.
+    fn lockstep<C, T>(
+        mut tls: rustls::StreamOwned<C, TcpStream>,
+        payload: &[u8],
+        rekey_before: Option<usize>,
+    ) -> Vec<u8>
+    where
+        C: DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<T>>,
+        T: rustls::SideData,
+    {
+        let mut echoed = Vec::new();
+        for (round, chunk) in payload.chunks(ROUND).enumerate() {
+            if rekey_before == Some(round) {
+                tls.conn
+                    .refresh_traffic_keys()
+                    .expect("ask for a key update");
+            }
+            tls.write_all(chunk).expect("peer write");
+            tls.flush().expect("peer flush");
+            let mut back = vec![0; chunk.len()];
+            tls.read_exact(&mut back).expect("peer read");
+            echoed.extend_from_slice(&back);
+        }
+        tls.conn.send_close_notify();
+        tls.flush().expect("peer close_notify");
+        let mut rest = Vec::new();
+        tls.read_to_end(&mut rest)
+            .expect("peer reads up to the close_notify");
+        assert!(
+            rest.is_empty(),
+            "the echo ended with {} extra bytes",
+            rest.len()
+        );
+        echoed
+    }
+
+    fn client_peer(
+        addr: SocketAddr,
+        config: rustls::ClientConfig,
+        payload: Vec<u8>,
+        rekey_before: Option<usize>,
+    ) -> JoinHandle<Vec<u8>> {
+        thread::spawn(move || {
+            let socket = TcpStream::connect(addr).expect("peer connect");
+            let conn = rustls::ClientConnection::new(Arc::new(config), localhost())
+                .expect("peer client connection");
+            lockstep(
+                rustls::StreamOwned::new(conn, socket),
+                &payload,
+                rekey_before,
+            )
+        })
+    }
+
+    fn server_peer(
+        listener: TcpListener,
+        config: rustls::ServerConfig,
+        payload: Vec<u8>,
+        rekey_before: Option<usize>,
+    ) -> JoinHandle<Vec<u8>> {
+        thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("peer accept");
+            let conn =
+                rustls::ServerConnection::new(Arc::new(config)).expect("peer server connection");
+            lockstep(
+                rustls::StreamOwned::new(conn, socket),
+                &payload,
+                rekey_before,
+            )
+        })
+    }
+
+    /// Everything `read` yields goes into `write`, until the stream ends and
+    /// `write` is shut down. Returns how many bytes.
+    ///
+    /// In kernel mode the bytes go through a pipe, never into memory.
+    async fn echo(read: &mut impl SpliceRead, write: &mut impl SpliceWrite) -> usize {
+        let mut echoed = 0;
+        #[cfg(all(target_os = "linux", feature = "kernel"))]
+        {
+            use http_kit_io::splice::{Pipe, Spliced};
+
+            let mut pipe = Pipe::new().expect("pipe");
+            loop {
+                match read.splice_to_pipe(pipe, usize::MAX).await {
+                    Ok(Spliced::Filled(filled)) => {
+                        echoed += filled.len();
+                        pipe = write.splice_from_pipe(filled).await.expect("splice out");
+                    }
+                    Ok(Spliced::End(_)) => break,
+                    Err((error, _)) => panic!("splice in: {error}"),
+                }
+            }
+        }
+        #[cfg(not(all(target_os = "linux", feature = "kernel")))]
+        {
+            let mut buf = Vec::with_capacity(20_000);
+            loop {
+                let BufResult(res, filled) = read.read(buf).await;
+                if res.expect("subject read") == 0 {
+                    break;
+                }
+                let BufResult(res, filled) = write.write_all(filled).await;
+                res.expect("subject write");
+                echoed += filled.len();
+                buf = filled;
+            }
+        }
+        write.shutdown().await.expect("subject shutdown");
+        echoed
+    }
+
+    #[cfg(all(target_os = "linux", feature = "kernel"))]
+    fn assert_can_splice(read: &impl SpliceRead, write: &impl SpliceWrite) {
+        assert!(SpliceRead::can_splice(read) && SpliceWrite::can_splice(write));
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "kernel")))]
+    fn assert_can_splice(_read: &impl SpliceRead, _write: &impl SpliceWrite) {}
+
+    /// A TLS server forwards what a peer sends back to it, across the
+    /// peer's key update. In kernel mode its receiving half takes the
+    /// `KeyUpdate` out of the splice, and its writing half, asked for a key
+    /// in return, sends its own before splicing the next round out.
+    pub(super) async fn echo_as_server<I: Io>(io: I)
+    where
+        I::TcpStream: Transport,
+    {
+        let identity = Identity::new();
+        let payload = cjk_body(4_000);
+        let rekey = rekey_before(&payload);
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let peer = client_peer(
+            listener.local_addr().expect("local address"),
+            client_config(&identity, TLS13_AES_128, &[]),
+            payload.clone(),
+            rekey,
+        );
+        let (stream, _) = listener.accept().await.expect("accept");
+        let stream = acceptor(&identity, TLS13_AES_128, &[])
+            .accept(stream, &io)
+            .await
+            .expect("server handshake");
+        assert_eq!(stream.mode(), EXPECTED);
+        assert_eq!(
+            SPLICES,
+            matches!(stream.mode(), Mode::Kernel),
+            "kernel mode and splicing go together"
+        );
+        let (mut read, mut write) = stream.split();
+        assert_can_splice(&read, &write);
+        let forwarded = echo(&mut read, &mut write).await;
+        let echoed = peer.join().expect("the peer's thread");
+        assert_eq!(forwarded, payload.len());
+        assert_bytes(&echoed, &payload);
+    }
+
+    /// A TLS client forwards what the peer sends back to it. The server
+    /// peer sends session tickets after the handshake, which in kernel mode
+    /// the client's kernel hands back from the splice, and then changes
+    /// keys.
+    pub(super) async fn echo_as_client<I: Io>(io: I)
+    where
+        I::TcpStream: Transport,
+    {
+        let identity = Identity::new();
+        let payload = cjk_body(4_000);
+        let rekey = rekey_before(&payload);
+        let listener = TcpListener::bind(loopback()).expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let peer = server_peer(
+            listener,
+            server_config(&identity, TLS13_AES_128, &[]),
+            payload.clone(),
+            rekey,
+        );
+        let stream = io.connect(addr).await.expect("connect");
+        let stream = connector(&identity, TLS13_AES_128, &[])
+            .connect(localhost(), stream, &io)
+            .await
+            .expect("client handshake");
+        assert_eq!(stream.mode(), EXPECTED);
+        let (mut read, mut write) = stream.split();
+        assert_can_splice(&read, &write);
+        let forwarded = echo(&mut read, &mut write).await;
+        let echoed = peer.join().expect("the peer's thread");
+        assert_eq!(forwarded, payload.len());
+        assert_bytes(&echoed, &payload);
+    }
+
+    /// Bytes the peer sends right after its handshake are forwarded first,
+    /// whether rustls decrypted them before the kernel took the connection
+    /// (they come out of memory) or the kernel did (out of the socket).
+    pub(super) async fn early_bytes_come_first<I: Io>(io: I)
+    where
+        I::TcpStream: Transport,
+    {
+        let identity = Identity::new();
+        let later = cjk_body(3_000);
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let peer = thread::spawn({
+            let config = client_config(&identity, TLS13_AES_128, &[]);
+            move || {
+                let socket = TcpStream::connect(addr).expect("peer connect");
+                let conn = rustls::ClientConnection::new(Arc::new(config), localhost())
+                    .expect("peer client connection");
+                let mut tls = rustls::StreamOwned::new(conn, socket);
+                tls.write_all(CJK.as_bytes()).expect("peer early write");
+                tls.flush().expect("peer flush");
+                let mut received = Vec::new();
+                tls.read_to_end(&mut received).expect("peer read");
+                received
+            }
+        });
+        let (stream, _) = listener.accept().await.expect("accept");
+        let stream = acceptor(&identity, TLS13_AES_128, &[])
+            .accept(stream, &io)
+            .await
+            .expect("server handshake");
+        let (mut read, mut write) = stream.split();
+        let seen = take(&mut read, CJK.len()).await;
+        assert_bytes(&seen, CJK.as_bytes());
+        let BufResult(res, _) = write.write_all(later.clone()).await;
+        res.expect("server write");
+        write.shutdown().await.expect("server shutdown");
+        let received = peer.join().expect("the peer's thread");
+        assert_bytes(&received, &later);
+    }
+
+    /// The first `len` bytes of the stream, spliced into a pipe and read out
+    /// of it in kernel mode, read in user space.
+    async fn take(read: &mut impl SpliceRead, len: usize) -> Vec<u8> {
+        let mut seen = Vec::new();
+        #[cfg(all(target_os = "linux", feature = "kernel"))]
+        {
+            use http_kit_io::splice::{Pipe, Spliced};
+
+            let mut pipe = Pipe::new().expect("pipe");
+            while seen.len() < len {
+                match read.splice_to_pipe(pipe, usize::MAX).await {
+                    Ok(Spliced::Filled(filled)) => {
+                        let (bytes, emptied) = filled.read_out().expect("read out");
+                        seen.extend_from_slice(&bytes);
+                        pipe = emptied;
+                    }
+                    Ok(Spliced::End(_)) => panic!("the stream ended early"),
+                    Err((error, _)) => panic!("splice in: {error}"),
+                }
+            }
+        }
+        #[cfg(not(all(target_os = "linux", feature = "kernel")))]
+        {
+            let mut buf = Vec::with_capacity(len);
+            while seen.len() < len {
+                let BufResult(res, filled) = read.read(buf).await;
+                assert_ne!(res.expect("subject read"), 0, "the stream ended early");
+                seen.extend_from_slice(&filled);
+                buf = filled;
+                buf.clear();
+            }
+        }
+        seen
+    }
+}
+
 macro_rules! suite {
     ($io:expr, $run:expr) => {
         #[test]
@@ -789,6 +1204,27 @@ macro_rules! suite {
         #[test]
         fn tls_over_joined_halves() {
             $run(super::tls_over_joined_halves($io));
+        }
+
+        #[test]
+        fn forward_as_server() {
+            $run(super::forward::echo_as_server($io));
+        }
+
+        #[test]
+        fn forward_as_client() {
+            $run(super::forward::echo_as_client($io));
+        }
+
+        #[test]
+        fn early_bytes_come_first() {
+            $run(super::forward::early_bytes_come_first($io));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[test]
+        fn user_mode_cannot_splice() {
+            $run(super::user_mode_cannot_splice($io));
         }
 
         #[test]
