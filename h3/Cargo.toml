@@ -49,7 +49,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"], op
 [dev-dependencies]
 socket2 = { version = "0.6.5", default-features = false }
 http-kit-io = { version = "0.6.2", path = "../io", features = ["tokio", "compio"] }
-compio = { version = "0.19.2", default-features = false, features = ["runtime"] }
+compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["runtime"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
 
 [lints.rust]

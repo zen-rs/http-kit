@@ -37,7 +37,7 @@ http-kit-h1 = { version = "0.6.2", path = "../h1", features = ["fs"] }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 http = { version = "1.5.0", default-features = false, features = ["std"] }
-compio = { version = "0.19.2", default-features = false, features = ["runtime"] }
+compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["runtime"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
 
 [lints.rust]

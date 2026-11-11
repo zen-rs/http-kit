@@ -996,14 +996,29 @@ mod compio {
         });
     }
 
-    /// A runtime whose provided buffer ring has `buffers` buffers of `len`
-    /// bytes each.
+    /// Both ways a ring can consume its buffers: whole, and incrementally
+    /// where the kernel accepts it (Linux 6.12; whole before).
     #[cfg(target_os = "linux")]
-    fn run_with_ring<F: Future>(buffers: u16, len: usize, future: F) -> F::Output {
+    const CONSUMPTIONS: [bool; 2] = [false, true];
+
+    /// A runtime whose provided buffer ring has `buffers` buffers of `len`
+    /// bytes each, registered for incremental consumption if `incremental`.
+    #[cfg(target_os = "linux")]
+    fn run_with_ring<F: Future>(
+        buffers: u16,
+        len: usize,
+        incremental: bool,
+        future: F,
+    ) -> F::Output {
         let mut proactor = ::compio::driver::ProactorBuilder::new();
         proactor
             .buffer_pool_size(std::num::NonZeroU16::new(buffers).expect("a ring has buffers"))
             .buffer_pool_buffer_len(len);
+        if incremental {
+            proactor.buffer_pool_flag(
+                u16::try_from(io_uring::types::IOU_PBUF_RING_INC).expect("a ring flag"),
+            );
+        }
         ::compio::runtime::RuntimeBuilder::new()
             .with_proactor(proactor)
             .build()
@@ -1042,56 +1057,58 @@ mod compio {
         const MESSAGE: usize = 1024;
         const MESSAGES: usize = 64;
 
-        let data = super::payload()[..MESSAGE * MESSAGES].to_vec();
-        let sent = data.clone();
-        run_with_ring(BUFFERS, BUFFER_LEN, async move {
-            // The driver arms a poll on its own wake-up eventfd the first time
-            // it parks; park it once so that submission is not counted.
-            Compio::default()
-                .sleep(std::time::Duration::from_millis(1))
+        for incremental in CONSUMPTIONS {
+            let data = super::payload()[..MESSAGE * MESSAGES].to_vec();
+            let sent = data.clone();
+            run_with_ring(BUFFERS, BUFFER_LEN, incremental, async move {
+                // The driver arms a poll on its own wake-up eventfd the first time
+                // it parks; park it once so that submission is not counted.
+                Compio::default()
+                    .sleep(std::time::Duration::from_millis(1))
+                    .await;
+                // Each message waits for the one before it to be read, so the
+                // receive always finds a free buffer.
+                let (mut stream, peer) = accept_one(move |mut client| {
+                    for message in sent.chunks(MESSAGE) {
+                        client.write_all(message).expect("send");
+                        client.read_exact(&mut [0]).expect("wait for the read");
+                    }
+                })
                 .await;
-            // Each message waits for the one before it to be read, so the
-            // receive always finds a free buffer.
-            let (mut stream, peer) = accept_one(move |mut client| {
-                for message in sent.chunks(MESSAGE) {
-                    client.write_all(message).expect("send");
-                    client.read_exact(&mut [0]).expect("wait for the read");
+                // The stream takes its slot with a submission of its own; count
+                // from once it holds it, so the receive is armed on the slot.
+                until_held(&socket_name(&stream), 1).await;
+                let before = submitted();
+                let mut received = Vec::with_capacity(data.len());
+                let mut reads = 0;
+                while received.len() < data.len() {
+                    let Received::Lent(buf) = stream.read_owned().await.expect("read") else {
+                        panic!("the ring ran dry or the peer closed early");
+                    };
+                    reads += 1;
+                    received.extend_from_slice(&buf);
+                    drop(buf);
+                    if received.len() % MESSAGE == 0 {
+                        // The acknowledgement is a send, which is a submission;
+                        // count it out.
+                        let ack = submitted();
+                        let http_kit_io::BufResult(res, _) =
+                            http_kit_io::Write::write(&mut stream, vec![0]).await;
+                        res.expect("acknowledge");
+                        assert_eq!(submitted() - ack, 1, "an acknowledgement is one send");
+                    }
                 }
-            })
-            .await;
-            // The stream takes its slot with a submission of its own; count
-            // from once it holds it, so the receive is armed on the slot.
-            until_held(&socket_name(&stream), 1).await;
-            let before = submitted();
-            let mut received = Vec::with_capacity(data.len());
-            let mut reads = 0;
-            while received.len() < data.len() {
-                let Received::Lent(buf) = stream.read_owned().await.expect("read") else {
-                    panic!("the ring ran dry or the peer closed early");
-                };
-                reads += 1;
-                received.extend_from_slice(&buf);
-                drop(buf);
-                if received.len() % MESSAGE == 0 {
-                    // The acknowledgement is a send, which is a submission;
-                    // count it out.
-                    let ack = submitted();
-                    let http_kit_io::BufResult(res, _) =
-                        http_kit_io::Write::write(&mut stream, vec![0]).await;
-                    res.expect("acknowledge");
-                    assert_eq!(submitted() - ack, 1, "an acknowledgement is one send");
-                }
-            }
-            let acks = u32::try_from(MESSAGES).expect("message count");
-            assert_eq!(
-                submitted() - before - acks,
-                1,
-                "receive submissions for {reads} reads"
-            );
-            assert!(reads >= MESSAGES, "{reads} reads");
-            super::assert_bytes(&received, &data);
-            peer.join().expect("peer thread");
-        });
+                let acks = u32::try_from(MESSAGES).expect("message count");
+                assert_eq!(
+                    submitted() - before - acks,
+                    1,
+                    "receive submissions for {reads} reads"
+                );
+                assert!(reads >= MESSAGES, "{reads} reads");
+                super::assert_bytes(&received, &data);
+                peer.join().expect("peer thread");
+            });
+        }
     }
 
     /// A connection that carries far more than the ring holds, sent as fast
@@ -1103,27 +1120,29 @@ mod compio {
     fn a_connection_reads_more_than_the_ring_holds() {
         use std::io::Write as _;
 
-        let data = super::payload();
-        let sent = data.clone();
-        run_with_ring(2, 4096, async move {
-            let (mut stream, peer) = accept_one(move |mut client| {
-                client.write_all(&sent).expect("send");
-            })
-            .await;
-            let mut received = Vec::with_capacity(data.len());
-            let mut buf = Vec::with_capacity(1500);
-            loop {
-                let http_kit_io::BufResult(res, filled) =
-                    http_kit_io::Read::read(&mut stream, buf).await;
-                if res.expect("read") == 0 {
-                    break;
+        for incremental in CONSUMPTIONS {
+            let data = super::payload();
+            let sent = data.clone();
+            run_with_ring(2, 4096, incremental, async move {
+                let (mut stream, peer) = accept_one(move |mut client| {
+                    client.write_all(&sent).expect("send");
+                })
+                .await;
+                let mut received = Vec::with_capacity(data.len());
+                let mut buf = Vec::with_capacity(1500);
+                loop {
+                    let http_kit_io::BufResult(res, filled) =
+                        http_kit_io::Read::read(&mut stream, buf).await;
+                    if res.expect("read") == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&filled);
+                    buf = filled;
                 }
-                received.extend_from_slice(&filled);
-                buf = filled;
-            }
-            super::assert_bytes(&received, &data);
-            peer.join().expect("peer thread");
-        });
+                super::assert_bytes(&received, &data);
+                peer.join().expect("peer thread");
+            });
+        }
     }
 
     /// A splice from a socket that has received ahead of its reader moves
@@ -1138,33 +1157,35 @@ mod compio {
             splice::{Pipe, Spliced},
         };
 
-        let data = "世界 せかい 세계 ".repeat(512).into_bytes();
-        let sent = data.clone();
-        run_with_ring(8, 4096, async move {
-            let (mut stream, peer) = accept_one(move |mut client| {
-                client.write_all(&sent).expect("send");
-            })
-            .await;
-            // A small read leaves the rest of its ring buffer held.
-            let http_kit_io::BufResult(res, head) =
-                http_kit_io::Read::read(&mut stream, Vec::with_capacity(10)).await;
-            assert_eq!(res.expect("read"), 10);
-            let mut received = head;
-            let mut pipe = Pipe::new().expect("pipe");
-            loop {
-                match stream.splice_to_pipe(pipe, usize::MAX).await {
-                    Ok(Spliced::Filled(filled)) => {
-                        let (bytes, empty) = filled.read_out().expect("read the pipe");
-                        received.extend_from_slice(&bytes);
-                        pipe = empty;
+        for incremental in CONSUMPTIONS {
+            let data = "世界 せかい 세계 ".repeat(512).into_bytes();
+            let sent = data.clone();
+            run_with_ring(8, 4096, incremental, async move {
+                let (mut stream, peer) = accept_one(move |mut client| {
+                    client.write_all(&sent).expect("send");
+                })
+                .await;
+                // A small read leaves the rest of its ring buffer held.
+                let http_kit_io::BufResult(res, head) =
+                    http_kit_io::Read::read(&mut stream, Vec::with_capacity(10)).await;
+                assert_eq!(res.expect("read"), 10);
+                let mut received = head;
+                let mut pipe = Pipe::new().expect("pipe");
+                loop {
+                    match stream.splice_to_pipe(pipe, usize::MAX).await {
+                        Ok(Spliced::Filled(filled)) => {
+                            let (bytes, empty) = filled.read_out().expect("read the pipe");
+                            received.extend_from_slice(&bytes);
+                            pipe = empty;
+                        }
+                        Ok(Spliced::End(_)) => break,
+                        Err((error, _)) => panic!("splice: {error}"),
                     }
-                    Ok(Spliced::End(_)) => break,
-                    Err((error, _)) => panic!("splice: {error}"),
                 }
-            }
-            super::assert_bytes(&received, &data);
-            peer.join().expect("peer thread");
-        });
+                super::assert_bytes(&received, &data);
+                peer.join().expect("peer thread");
+            });
+        }
     }
 
     /// Stopping the read-ahead hands back what was received and not read,
@@ -1176,20 +1197,78 @@ mod compio {
 
         use http_kit_io::ReadAhead as _;
 
-        let data = "世界 せかい 세계 ".repeat(4096).into_bytes();
+        for incremental in CONSUMPTIONS {
+            let data = "世界 せかい 세계 ".repeat(4096).into_bytes();
+            let sent = data.clone();
+            run_with_ring(8, 4096, incremental, async move {
+                let (mut stream, peer) = accept_one(move |mut client| {
+                    client.write_all(&sent).expect("send");
+                })
+                .await;
+                let http_kit_io::BufResult(res, head) =
+                    http_kit_io::Read::read(&mut stream, Vec::with_capacity(10)).await;
+                assert_eq!(res.expect("read"), 10);
+                let mut received = head;
+                received.extend_from_slice(&stream.stop_read_ahead().await);
+                received.extend_from_slice(&super::read_to_end(&mut stream).await);
+                super::assert_bytes(&received, &data);
+                peer.join().expect("peer thread");
+            });
+        }
+    }
+
+    /// On a ring the kernel consumes incrementally, consecutive small reads
+    /// of a connection share a ring buffer, each continuing where the one
+    /// before ended: a ring of two buffers lends eight reads at once, where
+    /// consuming buffers whole would run it dry after two.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn small_reads_share_a_ring_buffer() {
+        use std::io::{Read as _, Write as _};
+
+        use http_kit_io::{ReadOwned as _, Received};
+
+        const MESSAGE: usize = 16;
+        const MESSAGES: usize = 8;
+
+        let data = super::payload()[..MESSAGE * MESSAGES].to_vec();
         let sent = data.clone();
-        run_with_ring(8, 4096, async move {
+        run_with_ring(2, 4096, true, async move {
+            let incremental = ::compio::runtime::Runtime::with_current(|runtime| {
+                runtime.buffer_pool()?.is_incremental()
+            })
+            .expect("the runtime's ring");
+            if !incremental {
+                eprintln!("the kernel consumes ring buffers whole (before Linux 6.12), skipping");
+                return;
+            }
+            // Each message waits for the one before it to be read, so each
+            // read is one message.
             let (mut stream, peer) = accept_one(move |mut client| {
-                client.write_all(&sent).expect("send");
+                for message in sent.chunks(MESSAGE) {
+                    client.write_all(message).expect("send");
+                    client.read_exact(&mut [0]).expect("wait for the read");
+                }
             })
             .await;
-            let http_kit_io::BufResult(res, head) =
-                http_kit_io::Read::read(&mut stream, Vec::with_capacity(10)).await;
-            assert_eq!(res.expect("read"), 10);
-            let mut received = head;
-            received.extend_from_slice(&stream.stop_read_ahead().await);
-            received.extend_from_slice(&super::read_to_end(&mut stream).await);
-            super::assert_bytes(&received, &data);
+            let mut lent = Vec::with_capacity(MESSAGES);
+            for message in data.chunks(MESSAGE) {
+                let Received::Lent(buf) = stream.read_owned().await.expect("read") else {
+                    panic!("the ring ran dry after {} reads", lent.len());
+                };
+                assert_eq!(&*buf, message);
+                lent.push(buf);
+                let http_kit_io::BufResult(res, _) =
+                    http_kit_io::Write::write(&mut stream, vec![0]).await;
+                res.expect("acknowledge");
+            }
+            for pair in lent.windows(2) {
+                assert_eq!(
+                    pair[1].as_ptr(),
+                    pair[0].as_ptr().wrapping_add(pair[0].len()),
+                    "a read continues in the buffer of the one before"
+                );
+            }
             peer.join().expect("peer thread");
         });
     }

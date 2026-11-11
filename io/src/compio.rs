@@ -15,20 +15,26 @@
 //! On Linux over io_uring a stream receives with a multishot receive into
 //! the provided buffer ring of the thread's runtime: one submission stays
 //! armed and completes once per arrival, each into a ring buffer, until the
-//! kernel ends it. A reader takes a ring buffer through
-//! [`ReadOwned`](crate::ReadOwned), or has it copied into its own through
-//! [`Read`](crate::Read); either way the buffer goes back to the ring as soon
-//! as its bytes are consumed, so an idle connection holds none. When the
-//! ring has no free buffer a read receives into the caller's buffer with a
-//! submission of its own, and the next one arms again. A splice from the
-//! socket first moves what the ring already received, so it never passes
-//! those bytes.
+//! kernel ends it. A reader takes the received bytes in the ring through
+//! [`ReadOwned`](crate::ReadOwned), or has them copied into its own buffer
+//! through [`Read`](crate::Read); either way they are released as soon as
+//! they are consumed, so an idle connection holds none of the ring. When the ring has
+//! no free buffer a read receives into the caller's buffer with a submission
+//! of its own, and the next one arms again. A splice from the socket first
+//! moves what the ring already received, so it never passes those bytes.
 //!
 //! The ring is compio's buffer pool, one per runtime: size it on the
 //! runtime's `ProactorBuilder` (`buffer_pool_size`, `buffer_pool_buffer_len`)
-//! for the connections one thread serves. Buffers are consumed whole, one per
-//! completion: compio reports no `IORING_CQE_F_BUF_MORE`, which incremental
-//! consumption (`IOU_PBUF_RING_INC`) needs.
+//! for the connections one thread serves, and have the kernel consume its
+//! buffers incrementally with `buffer_pool_flag(IOU_PBUF_RING_INC)`. On Linux
+//! 6.12 and later a completion then fills only as much of a buffer as it
+//! received and marks the buffer `IORING_CQE_F_BUF_MORE` while it keeps it;
+//! the next completion, of this connection or another on the thread,
+//! continues in it, so small reads share a buffer instead of taking one each.
+//! A buffer goes back to the ring once the kernel has finished with it and
+//! every read lent out of it is released. An earlier kernel rejects the flag
+//! when the ring registers, and compio then registers the ring without it:
+//! buffers are consumed whole, one per completion.
 //!
 //! On Linux over io_uring a TCP stream's
 //! [`write_all_owned`](crate::Write::write_all_owned) of at least
@@ -1560,9 +1566,10 @@ mod zero_copy {
 }
 
 /// Bytes a multishot receive put in a buffer of the runtime's ring, lent to
-/// the reader by [`ReadOwned`](crate::ReadOwned). Dropping it hands the
-/// buffer back to the ring, so a reader holds it only as long as it needs the
-/// bytes.
+/// the reader by [`ReadOwned`](crate::ReadOwned). Dropping it releases them,
+/// handing the buffer back to the ring unless the kernel still fills it or
+/// other bytes lent out of it are held, so a reader holds it only as long as
+/// it needs the bytes.
 #[cfg(target_os = "linux")]
 pub struct RecvBuf {
     buf: ::compio::driver::BufferRef,
