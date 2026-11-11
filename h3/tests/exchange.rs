@@ -260,6 +260,68 @@ fn file_regions_on_tokio() {
     on_tokio(file_regions);
 }
 
+/// A pipe frame is read out and sent as data: QUIC encrypts in user space, so
+/// its bytes cannot go from the kernel to the socket.
+#[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+async fn pipe_frames<I: Io>(io: I) {
+    let payload = CJK.concat();
+    let pki = pki();
+    let socket = io.bind_udp(loopback()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let server = Server::new(socket, io.clone(), &server_config(&pki)).unwrap();
+    let (stop, stopped) = async_channel::bounded::<()>(1);
+    let service = {
+        let payload = payload.clone();
+        move |_request: Request| {
+            let pipe = http_kit_io::splice::Pipe::new()
+                .unwrap()
+                .fill(payload.as_bytes())
+                .unwrap_or_else(|(error, _)| panic!("fill: {error}"));
+            async move {
+                Response::new(Body::from_frames(futures_lite::stream::iter([
+                    Ok::<_, io::Error>(BodyFrame::Data(Bytes::from_static(b"head:"))),
+                    Ok(BodyFrame::Pipe(pipe)),
+                    Ok(BodyFrame::Data(Bytes::from_static(b":tail"))),
+                ])))
+            }
+        }
+    };
+    let served = server.serve_until(&service, async move {
+        stopped.recv().await.ok();
+    });
+
+    let mut client = Client::new(&client_config(&pki)).unwrap();
+    let socket = io.bind_udp(loopback()).unwrap();
+    let peer = ([127, 0, 0, 1], port).into();
+    let (send, connection) = client
+        .connect(socket, io.clone(), "localhost", peer)
+        .unwrap();
+    let exchange = async move {
+        let response = send.send(post(port, "/pipe", Body::empty())).await.unwrap();
+        let body = response.into_body().into_bytes().await.unwrap();
+        assert_eq!(body, format!("head:{payload}:tail").as_bytes());
+    };
+    let client = async {
+        let ((), ran) = zip(exchange, connection.run()).await;
+        ran.unwrap();
+        stop.send(()).await.unwrap();
+    };
+    let (served, ()) = within(&io, LIMIT, zip(served, client)).await;
+    served.unwrap();
+}
+
+#[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+#[test]
+fn pipe_frames_on_compio() {
+    on_compio(pipe_frames);
+}
+
+#[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+#[test]
+fn pipe_frames_on_tokio() {
+    on_tokio(pipe_frames);
+}
+
 /// A request in flight when shutdown begins is answered in full, its
 /// response streaming after the GOAWAY; one sent after it is refused as safe
 /// to retry; then the server closes the connection and returns.

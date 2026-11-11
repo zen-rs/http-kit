@@ -181,6 +181,12 @@ pub(crate) async fn pump(
                 }
                 continue;
             }
+            // QUIC encrypts in user space, so a pipe's bytes are read out.
+            #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+            Some(Ok(BodyFrame::Pipe(pipe))) => match pipe.read_out() {
+                Ok((data, _pipe)) => Command::Data(stream, data),
+                Err(error) => Command::Abort(stream, Error::from(BodyError::from(error))),
+            },
             Some(Ok(_)) => Command::Abort(stream, Error::UnsupportedFrame),
             Some(Err(error)) => Command::Abort(stream, error.into()),
             None => Command::End(stream),

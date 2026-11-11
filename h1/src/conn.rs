@@ -14,13 +14,16 @@ use futures_lite::{
     StreamExt as _,
     future::{or, poll_once},
 };
-use http_kit::{Body, BodyFrame};
-use http_kit_io::{BufResult, IntoInner as _, IoBuf as _, Read, SendFile, Timer, Write};
+use http_kit::{Body, BodyFrame, PipeOffer};
+use http_kit_io::{
+    BufResult, IntoInner as _, IoBuf as _, Read, SendFile, SpliceRead, SpliceWrite, Timer, Write,
+};
 
 use crate::{
     Error, Limits, Timeout,
     body::{BodySender, Message},
     proto::{BodyDecoder, BodyEncoder, Decoded},
+    splice::{Attempt, try_splice},
 };
 
 /// The most buffers one vectored write carries. Linux and Darwin accept
@@ -111,7 +114,10 @@ impl Outbox {
         }
     }
 
-    #[cfg(feature = "fs")]
+    #[cfg(any(
+        feature = "fs",
+        all(feature = "pipe", any(target_os = "linux", target_os = "android"))
+    ))]
     pub(crate) fn extend(&mut self, bufs: impl IntoIterator<Item = Bytes>) {
         for buf in bufs {
             self.push(buf);
@@ -168,8 +174,9 @@ impl Outbox {
 ///
 /// Data frames are gathered into vectored writes; whenever the body has no
 /// frame ready, what is queued goes out first, so a slow body never holds
-/// back its head. A file region goes to [`SendFile`] untouched.
-pub(crate) async fn send_message<W: Write + SendFile>(
+/// back its head. A file region goes to [`SendFile`] untouched, and a pipe
+/// to [`SpliceWrite`], each framed on the writer side.
+pub(crate) async fn send_message<W: Write + SendFile + SpliceWrite>(
     writer: &mut W,
     outbox: &mut Outbox,
     body: Option<Body>,
@@ -206,16 +213,60 @@ pub(crate) async fn send_message<W: Write + SendFile>(
     Ok(())
 }
 
-#[cfg(feature = "fs")]
-async fn send_other_frame<W: Write + SendFile>(
+/// Sends a frame that is neither data nor trailers: a file region, or a pipe,
+/// each with the features it needs.
+#[cfg_attr(
+    not(any(
+        feature = "fs",
+        all(feature = "pipe", any(target_os = "linux", target_os = "android"))
+    )),
+    allow(unused_variables)
+)]
+async fn send_other_frame<W: Write + SendFile + SpliceWrite>(
     writer: &mut W,
     outbox: &mut Outbox,
     encoder: &mut BodyEncoder,
     frame: BodyFrame,
 ) -> Result<(), Error> {
-    let BodyFrame::File(region) = frame else {
-        return Err(Error::UnsupportedFrame);
-    };
+    match frame {
+        #[cfg(feature = "fs")]
+        BodyFrame::File(region) => send_region(writer, outbox, encoder, region).await,
+        #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+        BodyFrame::Pipe(filled) => send_pipe(writer, outbox, encoder, filled).await,
+        _ => Err(Error::UnsupportedFrame),
+    }
+}
+
+/// Sends the bytes of a pipe: spliced into the socket when it can take them,
+/// framed like a file region, and otherwise read out and sent as data.
+#[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+async fn send_pipe<W: Write + SendFile + SpliceWrite>(
+    writer: &mut W,
+    outbox: &mut Outbox,
+    encoder: &mut BodyEncoder,
+    filled: http_kit_io::splice::FilledPipe,
+) -> Result<(), Error> {
+    if !SpliceWrite::can_splice(writer) {
+        let (data, _pipe) = filled.read_out()?;
+        encoder.data(data, &mut outbox.bufs)?;
+        return Ok(());
+    }
+    let len = filled.len() as u64;
+    outbox.extend(encoder.region_start(len)?);
+    outbox.flush(writer).await?;
+    tracing::trace!(len, "sending a pipe");
+    writer.splice_from_pipe(filled).await?;
+    outbox.extend(encoder.region_end());
+    Ok(())
+}
+
+#[cfg(feature = "fs")]
+async fn send_region<W: Write + SendFile>(
+    writer: &mut W,
+    outbox: &mut Outbox,
+    encoder: &mut BodyEncoder,
+    region: http_kit::FileRegion,
+) -> Result<(), Error> {
     let (file, offset, len) = region.into_parts();
     if len == 0 {
         return Ok(());
@@ -235,16 +286,6 @@ async fn send_other_frame<W: Write + SendFile>(
     Ok(())
 }
 
-#[cfg(not(feature = "fs"))]
-async fn send_other_frame<W: Write + SendFile>(
-    _writer: &mut W,
-    _outbox: &mut Outbox,
-    _encoder: &mut BodyEncoder,
-    _frame: BodyFrame,
-) -> Result<(), Error> {
-    Err(Error::UnsupportedFrame)
-}
-
 /// How pumping a received body ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pumped {
@@ -260,7 +301,11 @@ pub(crate) enum Pumped {
 /// `before_first_read` runs once, when the consumer first asks for data and
 /// before anything is read (a server sends `100 Continue` there). Each read
 /// of the socket is bounded by `read_timeout`, if any.
-pub(crate) async fn pump_body<R: Read, T: Timer, F: Future<Output = ()>>(
+///
+/// A demand that carries a [`PipeOffer`] is answered with a pipe frame when
+/// the socket can splice, nothing is buffered and the decoder is in a raw
+/// run; every other frame is data or trailers, whatever was offered.
+pub(crate) async fn pump_body<R: Read + SpliceRead, T: Timer, F: Future<Output = ()>>(
     recv: &mut Recv<R>,
     mut decoder: BodyDecoder,
     limits: &Limits,
@@ -271,30 +316,23 @@ pub(crate) async fn pump_body<R: Read, T: Timer, F: Future<Output = ()>>(
 ) -> Result<Pumped, Error> {
     let mut before_first_read = Some(before_first_read);
     loop {
-        if !sender.demanded().await {
+        let Some(mut offer) = sender.demanded().await else {
             return Ok(Pumped::Abandoned);
-        }
+        };
         if let Some(first) = before_first_read.take() {
             first.await;
         }
-        let decoded = match next_decoded(recv, &mut decoder, limits, timer, read_timeout).await {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                sender.send(Message::Error(error.clone())).await;
-                return Err(error);
-            }
-        };
+        let frame =
+            match next_frame(recv, &mut decoder, limits, timer, read_timeout, &mut offer).await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    sender.send(Message::Error(error.clone())).await;
+                    return Err(error);
+                }
+            };
         // A send to a dropped body fails; the next demand then reports it.
-        match decoded {
-            Decoded::Data(data) => {
-                sender.send(Message::Frame(BodyFrame::Data(data))).await;
-            }
-            Decoded::Trailers(trailers) => {
-                sender
-                    .send(Message::Frame(BodyFrame::Trailers(trailers)))
-                    .await;
-            }
-            Decoded::End => {}
+        if let Some(frame) = frame {
+            sender.send(Message::Frame(frame, offer)).await;
         }
         // The end is queued behind the last frame without waiting for a
         // demand: the connection is past the body as soon as it is decoded,
@@ -306,24 +344,46 @@ pub(crate) async fn pump_body<R: Read, T: Timer, F: Future<Output = ()>>(
     }
 }
 
-async fn next_decoded<R: Read, T: Timer>(
+/// The next frame of the body, `None` when the body ended without one.
+///
+/// Each time the decoder needs bytes it first offers the socket to the
+/// consumer's pipe: a chunk's data, for one, starts right after the chunk-size
+/// line that was just decoded, with nothing buffered.
+async fn next_frame<R: Read + SpliceRead, T: Timer>(
     recv: &mut Recv<R>,
     decoder: &mut BodyDecoder,
     limits: &Limits,
     timer: &T,
     read_timeout: Option<Duration>,
-) -> Result<Decoded, Error> {
-    loop {
+    offer: &mut Option<PipeOffer>,
+) -> Result<Option<BodyFrame>, Error> {
+    let decoded = loop {
         if let Some(decoded) = decoder.decode(&mut recv.buf, limits)? {
-            return Ok(decoded);
+            break decoded;
+        }
+        // The decoder needs bytes, possibly after consuming framing from the
+        // buffer just now; the socket goes to the pipe before any read.
+        if let Some(offer) = offer {
+            match try_splice(recv, decoder, limits, timer, read_timeout, offer).await? {
+                Attempt::Skip => {}
+                #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+                Attempt::Frame(frame) => return Ok(Some(frame)),
+                #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+                Attempt::End => return Ok(None),
+            }
         }
         let read = until(timer, deadline_after(read_timeout), recv.fill())
             .await
             .ok_or(Error::Timeout(Timeout::BodyRead))??;
         if read == 0 {
-            return Ok(decoder.decode_eof(&mut recv.buf, limits)?);
+            break decoder.decode_eof(&mut recv.buf, limits)?;
         }
-    }
+    };
+    Ok(match decoded {
+        Decoded::Data(data) => Some(BodyFrame::Data(data)),
+        Decoded::Trailers(trailers) => Some(BodyFrame::Trailers(trailers)),
+        Decoded::End => None,
+    })
 }
 
 /// Drives `main` to completion while also driving `side` for as long as it

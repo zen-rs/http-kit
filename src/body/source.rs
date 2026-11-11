@@ -70,6 +70,34 @@ impl PipeOffer {
     pub const fn take_pipe(&mut self) -> Option<Pipe> {
         self.pipe.take()
     }
+
+    /// Moves the offer out of this one, leaving an offer of the same
+    /// [`max`](Self::max) that supplies no pipe.
+    ///
+    /// A source whose bytes are read by another task (a connection's driver
+    /// behind a channel) forwards the consumer's offer this way, and hands it
+    /// back with [`reattach`](Self::reattach) when it answers without using
+    /// the pipe.
+    #[must_use]
+    pub const fn detach(&mut self) -> Self {
+        Self {
+            max: self.max,
+            #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+            pipe: self.pipe.take(),
+        }
+    }
+
+    /// Takes back the pipe of an offer [`detach`](Self::detach)ed from this
+    /// one, unless this offer has been given another pipe meanwhile, in which
+    /// case the returned one is dropped.
+    pub fn reattach(&mut self, detached: Self) {
+        #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+        if self.pipe.is_none() {
+            self.pipe = detached.pipe;
+        }
+        #[cfg(not(all(feature = "pipe", any(target_os = "linux", target_os = "android"))))]
+        let _ = detached;
+    }
 }
 
 /// An async source of [`BodyFrame`]s that can answer a [`PipeOffer`].
@@ -241,6 +269,16 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_offer_keeps_its_max() {
+        let mut offer = PipeOffer::new(4096);
+        let detached = offer.detach();
+        assert_eq!(detached.max(), 4096);
+        assert_eq!(offer.max(), 4096);
+        offer.reattach(detached);
+        assert_eq!(offer.max(), 4096);
+    }
+
+    #[test]
     fn a_shared_body_is_still_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Body>();
@@ -402,6 +440,30 @@ mod pipe_tests {
         let mut body = Body::from_source(Taking(Some(filled_pipe(CJK_TEXT).await)));
         let frame = body.next().await.unwrap().unwrap();
         assert_eq!(frame.as_data().unwrap(), CJK_TEXT);
+    }
+
+    #[test]
+    fn a_detached_offer_carries_the_pipe_and_gives_it_back() {
+        let mut offer = PipeOffer::with_pipe(4096, Pipe::new().unwrap());
+        let mut detached = offer.detach();
+        assert!(offer.take_pipe().is_none(), "the pipe left with the offer");
+        offer.reattach(PipeOffer::new(1));
+        assert!(
+            offer.take_pipe().is_none(),
+            "an offer without a pipe gives none back"
+        );
+
+        let pipe = detached
+            .take_pipe()
+            .expect("the detached offer holds the pipe");
+        offer.reattach(PipeOffer::with_pipe(4096, pipe));
+        assert!(offer.take_pipe().is_some(), "the pipe came back");
+
+        // An offer that has a pipe again keeps it; the returned one is dropped.
+        let mut offer = PipeOffer::with_pipe(4096, Pipe::new().unwrap());
+        offer.reattach(PipeOffer::with_pipe(4096, Pipe::new().unwrap()));
+        assert!(offer.take_pipe().is_some());
+        assert!(offer.take_pipe().is_none());
     }
 
     #[tokio::test]

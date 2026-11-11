@@ -16,7 +16,10 @@ use http_kit::{Body, BodyFrame, Request, Response};
 use http_kit_h1::{
     ClientConfig, ClientOutcome, ServerConfig, ServerConnection, ServerOutcome, handshake_stream,
 };
-use http_kit_io::{BufResult, Io, IoBuf, IoVectoredBuf, Listener as _, SendFile, Split, Write};
+use http_kit_io::{
+    BufResult, Io, IoBuf, IoVectoredBuf, Listener as _, SendFile, SpliceRead, SpliceWrite, Split,
+    Write,
+};
 #[cfg(feature = "fs")]
 use {
     futures_lite::StreamExt as _,
@@ -89,6 +92,21 @@ impl<W: SendFile> SendFile for Counting<W> {
     }
 }
 
+impl<W: SpliceWrite> SpliceWrite for Counting<W> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        SpliceWrite::can_splice(&self.inner)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn splice_from_pipe(
+        &mut self,
+        filled: http_kit_io::splice::FilledPipe,
+    ) -> impl Future<Output = io::Result<http_kit_io::splice::Pipe>> {
+        self.inner.splice_from_pipe(filled)
+    }
+}
+
 /// A file larger than a socket buffer, so the region takes several sends.
 #[cfg(feature = "fs")]
 fn payload_file(name: &str) -> (PathBuf, Vec<u8>) {
@@ -108,7 +126,8 @@ fn loopback() -> SocketAddr {
 async fn exchange<I, S, C, Fut>(io: I, service: S, client: C) -> (Sent, Fut::Output)
 where
     I: Io,
-    <I::TcpStream as Split>::WriteHalf: SendFile,
+    <I::TcpStream as Split>::ReadHalf: SpliceRead,
+    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
     S: http_kit_h1::Service,
     C: FnOnce(http_kit_h1::SendRequest) -> Fut,
     Fut: Future,
@@ -170,7 +189,8 @@ fn get(uri: &str) -> Request {
 
 async fn keep_alive_round_trips<I: Io>(io: I)
 where
-    <I::TcpStream as Split>::WriteHalf: SendFile,
+    <I::TcpStream as Split>::ReadHalf: SpliceRead,
+    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
 {
     let service = |request: Request| async move {
         let body = request
@@ -204,7 +224,8 @@ where
 #[cfg(feature = "fs")]
 async fn file_region_response<I: Io>(io: I, name: &str)
 where
-    <I::TcpStream as Split>::WriteHalf: SendFile,
+    <I::TcpStream as Split>::ReadHalf: SpliceRead,
+    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
 {
     let (path, contents) = payload_file(name);
     let (offset, len) = (11, contents.len() - 11 - 5);
@@ -245,7 +266,8 @@ where
 #[cfg(feature = "fs")]
 async fn chunked_file_region_with_trailers<I: Io>(io: I, name: &str)
 where
-    <I::TcpStream as Split>::WriteHalf: SendFile,
+    <I::TcpStream as Split>::ReadHalf: SpliceRead,
+    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
 {
     let (path, contents) = payload_file(name);
     let service = |_: Request| {

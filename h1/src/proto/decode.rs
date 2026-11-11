@@ -58,6 +58,57 @@ impl BodyDecoder {
         self.state == State::Done
     }
 
+    /// How many bytes the body continues with that are raw body data, which
+    /// a caller may move from the socket without looking at them: the rest of
+    /// the `Content-Length`, the rest of the current chunk, or
+    /// [`u64::MAX`] for a close-delimited body, whose run ends only with the
+    /// stream. `None` while the decoder is at framing (a chunk-size line,
+    /// the CRLF after chunk data, trailers) or done.
+    ///
+    /// The caller may take the run only when nothing is buffered: whatever
+    /// [`decode`](Self::decode) has not been given yet comes first.
+    #[must_use]
+    pub const fn raw_run(&self) -> Option<u64> {
+        match self.state {
+            State::Length { remaining } | State::ChunkData { remaining } => Some(remaining),
+            State::CloseDelimited => Some(u64::MAX),
+            State::ChunkSize | State::ChunkDataEnd | State::Trailers | State::Done => None,
+        }
+    }
+
+    /// Records that `len` bytes of the [`raw_run`](Self::raw_run) were moved
+    /// by the caller, as if [`decode`](Self::decode) had returned them as
+    /// data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no raw run, or `len` is zero or beyond it.
+    pub fn consume_raw(&mut self, len: u64) {
+        assert!(len > 0, "a raw run is consumed by at least one byte");
+        match &mut self.state {
+            State::Length { remaining } => {
+                *remaining = remaining
+                    .checked_sub(len)
+                    .expect("consumed past the end of the body");
+                if *remaining == 0 {
+                    self.state = State::Done;
+                }
+            }
+            State::ChunkData { remaining } => {
+                *remaining = remaining
+                    .checked_sub(len)
+                    .expect("consumed past the end of the chunk");
+                if *remaining == 0 {
+                    self.state = State::ChunkDataEnd;
+                }
+            }
+            State::CloseDelimited => {}
+            State::ChunkSize | State::ChunkDataEnd | State::Trailers | State::Done => {
+                panic!("no raw run to consume");
+            }
+        }
+    }
+
     /// Decodes the next step of the body from the front of `buf`, or returns
     /// `Ok(None)` when `buf` holds too little to make progress.
     ///

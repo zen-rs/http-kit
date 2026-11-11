@@ -79,8 +79,10 @@ pub enum Error {
     #[error("outgoing body failed: {0}")]
     Body(#[source] Arc<BodyError>),
     /// A body yielded a frame this endpoint cannot send: a file region needs
-    /// the `fs` feature.
-    #[error("unsupported body frame (file regions need the `fs` feature)")]
+    /// the `fs` feature, a pipe the `pipe` feature.
+    #[error(
+        "unsupported body frame (file regions need the `fs` feature, pipes the `pipe` feature)"
+    )]
     UnsupportedFrame,
     /// A response is informational; only final responses can be sent.
     #[error("{0} is not a final response")]

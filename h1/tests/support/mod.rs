@@ -17,7 +17,10 @@ use std::{
 };
 
 use async_channel::{Receiver, Sender};
-use http_kit_io::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, Timer, Write};
+use http_kit_io::{
+    BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, SpliceRead, SpliceWrite, Timer,
+    Write,
+};
 
 /// A timer whose deadlines never pass, for tests that run no timeouts.
 #[derive(Debug, Clone, Copy)]
@@ -220,6 +223,39 @@ impl SendFile for PipeWriter {
             self.push(region)
         });
         BufResult(result, file)
+    }
+}
+
+/// An in-memory half has no file descriptor to splice from or to: it never
+/// answers an offer with a pipe and takes a pipe frame as data.
+impl SpliceRead for PipeReader {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        false
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_to_pipe(
+        &mut self,
+        pipe: http_kit_io::splice::Pipe,
+        _max: usize,
+    ) -> Result<http_kit_io::splice::Spliced, (io::Error, http_kit_io::splice::Pipe)> {
+        Err((io::ErrorKind::Unsupported.into(), pipe))
+    }
+}
+
+impl SpliceWrite for PipeWriter {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        false
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_from_pipe(
+        &mut self,
+        _filled: http_kit_io::splice::FilledPipe,
+    ) -> io::Result<http_kit_io::splice::Pipe> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 }
 

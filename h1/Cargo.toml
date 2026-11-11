@@ -15,6 +15,10 @@ categories = ["network-programming", "web-programming::http-server", "web-progra
 [features]
 ## File-region body frames, sent with the I/O layer's file-to-socket path.
 fs = ["http-kit/fs"]
+## Pipe body frames, on Linux and Android: a received body whose bytes are
+## still in the socket is handed up as a pipe to a consumer that offers one,
+## and a pipe frame is sent with `splice(2)`.
+pipe = ["http-kit/pipe"]
 
 [dependencies]
 http-kit = { version = "0.6.0", path = "..", default-features = false, features = ["std"] }

@@ -23,7 +23,7 @@ use bytes::{Bytes, BytesMut};
 use futures_lite::future::{or, poll_once};
 use http::{HeaderValue, Method, StatusCode, Version, response};
 use http_kit::{Body, Request, Response};
-use http_kit_io::{Read, SendFile, Split, Timer, Write};
+use http_kit_io::{Read, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write};
 
 use crate::{
     Error, ParseError, ServerConfig, Timeout, Upgraded, body,
@@ -109,8 +109,8 @@ impl<R, W, T> std::fmt::Debug for ServerConnection<R, W, T> {
 
 impl<R, W, T> ServerConnection<R, W, T>
 where
-    R: Read,
-    W: Write + SendFile,
+    R: Read + SpliceRead,
+    W: Write + SendFile + SpliceWrite,
     T: Timer,
 {
     /// A connection over a socket's read and write halves, with its
@@ -272,7 +272,7 @@ where
             kind => {
                 let (sender, incoming) = body::channel();
                 (
-                    Body::from_frames(incoming),
+                    Body::from_source(incoming),
                     Some((sender, BodyDecoder::new(kind))),
                 )
             }
@@ -424,8 +424,8 @@ where
 
 impl<R, W, T> ServerConnection<R, W, T>
 where
-    R: Read,
-    W: Write + SendFile,
+    R: Read + SpliceRead,
+    W: Write + SendFile + SpliceWrite,
     T: Timer,
 {
     /// A connection over a whole socket, split into halves so that request

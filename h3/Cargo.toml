@@ -30,6 +30,8 @@ quiche = [
 ]
 ## File-region body frames, read out through `FileRegion::into_stream`.
 fs = ["quiche", "http-kit/fs"]
+## Pipe body frames (Linux and Android), read out into data frames.
+pipe = ["quiche", "http-kit/pipe"]
 
 [dependencies]
 quiche = { version = "0.30.0", default-features = false, features = ["boringssl-boring-crate"], optional = true }
