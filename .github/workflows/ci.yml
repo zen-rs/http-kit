@@ -7,7 +7,8 @@ permissions:
 on:
   pull_request:
     branches: ["**"]
-    types: [opened, synchronize, reopened, labeled]
+  # release-plz opens its pull request under GITHUB_TOKEN, which starts no
+  # workflow, so the release workflow dispatches CI on the release branch.
   workflow_dispatch:
 
 concurrency:
@@ -19,20 +20,19 @@ env:
 
 jobs:
   tier:
-    # A pull request into `main`, or one labelled `os:all` (platform code
-    # that must be proven before release), runs the full set; every other
-    # run (dev PRs, manual dispatches) runs the Linux set. release-plz bump
-    # pull requests (`release-plz-*` heads) run nothing at all, so this
-    # job skips itself and every other job skips through `needs: tier`.
+    # A pull request runs the full set; a manual dispatch runs the Linux
+    # set. release-plz bump branches (`release-plz-*`, as a pull request
+    # head or a dispatched ref) run nothing at all, so this job skips
+    # itself and every other job skips through `needs: tier`.
     name: Tier
-    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
+    if: ${{ !startsWith(github.head_ref || github.ref_name, 'release-plz-') }}
     runs-on: ubuntu-latest
     outputs:
       os: ${{ steps.tier.outputs.os }}
     steps:
       - id: tier
         env:
-          ALL_OS: ${{ github.event_name == 'pull_request' && (github.base_ref == 'main' || contains(github.event.pull_request.labels.*.name, 'os:all')) }}
+          ALL_OS: ${{ github.event_name == 'pull_request' }}
         run: |
           if [ "$ALL_OS" = "true" ]; then
             echo 'os=["ubuntu-latest","windows-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
