@@ -435,6 +435,10 @@ impl_socket!(net::UnixStream, zero_copy: false);
 /// A connected stream socket.
 pub struct Stream<S> {
     inner: S,
+    /// The socket `inner`'s descriptor names, which every use of the
+    /// descriptor's number checks it still does (debug builds).
+    #[cfg(all(unix, debug_assertions))]
+    identity: crate::sys::unix::Identity,
     /// The pipe file transfers splice through, kept between transfers. A
     /// transfer takes it out while data may sit in it, so one that fails or
     /// is cancelled midway drops it instead of leaving stale bytes behind.
@@ -472,6 +476,11 @@ impl<S: Socket> Stream<S> {
         #[cfg(not(target_os = "linux"))]
         let _ = io;
         Self {
+            #[cfg(all(unix, debug_assertions))]
+            identity: crate::sys::unix::Identity::of(std::os::fd::AsRawFd::as_raw_fd(
+                &inner.as_fd(),
+            ))
+            .expect("a stream's socket is open when the stream is made"),
             #[cfg(target_os = "linux")]
             file: files::File::new(inner.shared_fd(), io.file_table()),
             inner,
@@ -498,8 +507,22 @@ impl<S: Socket> Stream<S> {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            self.fd();
             ::compio::runtime::submit(op).await
         }
+    }
+
+    /// The socket's descriptor, for a call that names it by its number.
+    ///
+    /// Debug builds check first that the number still names the stream's
+    /// socket, and panic if it does not (zen-rs/http-kit#159).
+    #[cfg(unix)]
+    #[track_caller]
+    fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        let fd = self.inner.as_fd();
+        #[cfg(debug_assertions)]
+        self.identity.check(std::os::fd::AsRawFd::as_raw_fd(&fd));
+        fd
     }
 }
 
@@ -638,7 +661,10 @@ impl<S: fmt::Debug> fmt::Debug for Stream<S> {
 #[cfg(unix)]
 impl<S: std::os::fd::AsFd> std::os::fd::AsFd for Stream<S> {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.inner.as_fd()
+        let fd = self.inner.as_fd();
+        #[cfg(debug_assertions)]
+        self.identity.check(std::os::fd::AsRawFd::as_raw_fd(&fd));
+        fd
     }
 }
 
@@ -917,11 +943,7 @@ mod splice {
                 stream.pipe.set(Some(pipe));
                 return BufResult(Ok(filled), file);
             }
-            match crate::sys::pipe::splice(
-                pipe.read.as_fd(),
-                stream.inner.as_fd(),
-                filled - drained,
-            ) {
+            match crate::sys::pipe::splice(pipe.read.as_fd(), stream.fd(), filled - drained) {
                 Ok(0) => {
                     break io::Error::new(io::ErrorKind::WriteZero, "stream accepted no bytes");
                 }
@@ -950,7 +972,7 @@ mod splice {
     /// Makes the socket `O_NONBLOCK`, once.
     fn nonblocking<S: Socket + AsFd>(stream: &Stream<S>) -> io::Result<()> {
         if !stream.nonblocking.get() {
-            crate::sys::pipe::set_nonblocking(stream.inner.as_fd())?;
+            crate::sys::pipe::set_nonblocking(stream.fd())?;
             stream.nonblocking.set(true);
         }
         Ok(())
@@ -994,7 +1016,7 @@ mod splice {
         }
         let len = max.min(pipe.capacity());
         loop {
-            match crate::sys::pipe::splice(stream.inner.as_fd(), pipe.write_fd(), len) {
+            match crate::sys::pipe::splice(stream.fd(), pipe.write_fd(), len) {
                 Ok(0) => return Ok(Spliced::End(pipe)),
                 Ok(n) => return Ok(Spliced::Filled(FilledPipe::new(pipe, n))),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1015,7 +1037,7 @@ mod splice {
         nonblocking(stream)?;
         let mut left = filled.len();
         while left > 0 {
-            match crate::sys::pipe::splice(filled.pipe().read_fd(), stream.inner.as_fd(), left) {
+            match crate::sys::pipe::splice(filled.pipe().read_fd(), stream.fd(), left) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -1188,6 +1210,10 @@ mod files {
         slot: Rc<Slot>,
         /// The socket's descriptor, which the slot replaces in an entry.
         fd: RawFd,
+        /// The socket `fd` names, which an operation naming the descriptor
+        /// checks it still does (debug builds, zen-rs/http-kit#159).
+        #[cfg(debug_assertions)]
+        identity: crate::sys::unix::Identity,
     }
 
     /// What a stream and its slot's keeper share.
@@ -1238,7 +1264,13 @@ mod files {
                     }
                 });
             }
-            Self { slot, fd }
+            Self {
+                slot,
+                fd,
+                #[cfg(debug_assertions)]
+                identity: crate::sys::unix::Identity::of(fd)
+                    .expect("a stream's socket is open when the stream is made"),
+            }
         }
 
         fn slot(&self) -> io::Result<Option<u32>> {
@@ -1258,12 +1290,22 @@ mod files {
 
         /// `op`, naming the socket by its slot when it has one; or, with
         /// `op` back, the error taking a slot failed with.
+        ///
+        /// Without a slot `op` names the descriptor's number, which debug
+        /// builds check still names the socket.
+        #[track_caller]
         pub(super) fn address<T>(&self, op: T) -> Result<Addressed<T>, (io::Error, T)> {
             match self.slot() {
-                Ok(slot) => Ok(Addressed {
-                    op,
-                    slot: slot.map(|index| (index, self.fd)),
-                }),
+                Ok(slot) => {
+                    #[cfg(debug_assertions)]
+                    if slot.is_none() {
+                        self.identity.check(self.fd);
+                    }
+                    Ok(Addressed {
+                        op,
+                        slot: slot.map(|index| (index, self.fd)),
+                    })
+                }
                 Err(error) => Err((error, op)),
             }
         }

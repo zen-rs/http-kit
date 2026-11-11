@@ -905,6 +905,46 @@ mod compio {
         server.join().expect("server thread");
     }
 
+    /// A stream whose descriptor number is closed and reused behind its back
+    /// (here by `dup2` of a regular file over it, which does both at once)
+    /// fails its next use of the number in a debug build instead of moving
+    /// bytes into the file now holding it (zen-rs/http-kit#159). On Linux the
+    /// use is a file region's splice into the socket.
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    #[should_panic(expected = "no longer names the stream's socket")]
+    fn a_reused_descriptor_number_fails_its_next_use() {
+        use http_kit_io::compio::Compio;
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        let listener = std::net::TcpListener::bind(super::loopback()).expect("bind");
+        let client = std::net::TcpStream::connect(listener.local_addr().expect("local addr"))
+            .expect("connect");
+        let (accepted, _) = listener.accept().expect("accept");
+        let file = super::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/io.rs"))
+            .expect("open this test's source");
+        run(async move {
+            let stream = Compio::default()
+                .tcp_stream(::compio::net::TcpStream::from_std(accepted).expect("adopt"));
+            let number = stream.as_fd().as_raw_fd();
+            // SAFETY: both descriptors are open; `dup2` replaces the
+            // stream's number with a duplicate of the file's.
+            assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), number) }, number);
+            #[cfg(target_os = "linux")]
+            {
+                use super::SendFile as _;
+
+                let mut stream = stream;
+                let _ = stream.send_file(super::Rc::new(file), 0, 64).await;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = stream.as_fd();
+            }
+        });
+        drop(client);
+    }
+
     /// How many submission queue entries the current thread's io_uring has
     /// been handed: the tail the kernel reports in the ring's fdinfo.
     #[cfg(target_os = "linux")]
