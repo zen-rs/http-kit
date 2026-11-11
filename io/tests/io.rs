@@ -884,6 +884,91 @@ mod compio {
         server.join().expect("server thread");
     }
 
+    /// How many submission queue entries the current thread's io_uring has
+    /// been handed: the tail the kernel reports in the ring's fdinfo.
+    #[cfg(target_os = "linux")]
+    fn submitted() -> u32 {
+        use std::os::fd::AsRawFd as _;
+
+        let ring = ::compio::runtime::Runtime::with_current(|runtime| runtime.as_raw_fd());
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{ring}"))
+            .expect("read the ring's fdinfo");
+        info.lines()
+            .find_map(|line| line.strip_prefix("SqTail:"))
+            .unwrap_or_else(|| panic!("the runtime is not on io_uring:\n{info}"))
+            .trim()
+            .parse()
+            .expect("submission queue tail")
+    }
+
+    /// Connects `count` blocking clients to `addr`; each completes in the
+    /// listener's backlog, through no operation of the runtime's ring.
+    #[cfg(target_os = "linux")]
+    fn backlog(addr: std::net::SocketAddr, count: usize) -> Vec<std::net::TcpStream> {
+        (0..count)
+            .map(|_| std::net::TcpStream::connect(addr).expect("connect"))
+            .collect()
+    }
+
+    /// One multishot accept serves every connection waiting on a listener,
+    /// and an accept abandoned while pending leaves it armed; compio's own
+    /// accept, the control, takes a submission per connection.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_accept_submission_serves_many_connections() {
+        use http_kit_io::{Io as _, Listener as _, Timer as _, compio::Compio};
+
+        const CONNECTIONS: usize = 32;
+        run(async {
+            // The driver arms a poll on its own wake-up eventfd the first time
+            // it parks; park it once so that submission is not counted.
+            Compio.sleep(std::time::Duration::from_millis(1)).await;
+
+            let listener = Compio.bind_tcp(super::loopback()).expect("bind");
+            let addr = listener.local_addr().expect("local address");
+            let before = submitted();
+            // Submits the accept, then drops the call that submitted it.
+            assert!(
+                futures_lite::future::poll_once(listener.accept())
+                    .await
+                    .is_none()
+            );
+            let clients = backlog(addr, CONNECTIONS);
+            let mut accepted = Vec::with_capacity(CONNECTIONS);
+            for _ in 0..CONNECTIONS {
+                let (_stream, peer) = listener.accept().await.expect("accept");
+                accepted.push(peer);
+            }
+            assert_eq!(
+                submitted() - before,
+                1,
+                "submissions for {CONNECTIONS} accepts"
+            );
+            let mut peers: Vec<_> = clients
+                .iter()
+                .map(|client| client.local_addr().expect("client address"))
+                .collect();
+            peers.sort_unstable();
+            accepted.sort_unstable();
+            assert_eq!(accepted, peers);
+
+            let single = ::compio::net::TcpListener::from_std(
+                std::net::TcpListener::bind(super::loopback()).expect("bind"),
+            )
+            .expect("register");
+            let _clients = backlog(single.local_addr().expect("local address"), CONNECTIONS);
+            let before = submitted();
+            for _ in 0..CONNECTIONS {
+                single.accept().await.expect("accept");
+            }
+            assert_eq!(
+                submitted() - before,
+                u32::try_from(CONNECTIONS).expect("connection count"),
+                "submissions for {CONNECTIONS} single-shot accepts"
+            );
+        });
+    }
+
     /// The io-wq workers of this process that are doing something other than
     /// waiting for work, each as its thread id and kernel wait channel.
     #[cfg(any(target_os = "linux", target_os = "android"))]

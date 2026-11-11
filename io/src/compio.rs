@@ -70,7 +70,7 @@ impl Io for Compio {
     }
 
     fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
-        net::TcpListener::from_std(listener).map(TcpListener)
+        net::TcpListener::from_std(listener).map(TcpListener::new)
     }
 
     #[cfg(unix)]
@@ -78,7 +78,7 @@ impl Io for Compio {
         &self,
         listener: std::os::unix::net::UnixListener,
     ) -> io::Result<UnixListener> {
-        net::UnixListener::from_std(listener).map(UnixListener)
+        net::UnixListener::from_std(listener).map(UnixListener::new)
     }
 
     fn udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<UdpSocket> {
@@ -601,22 +601,115 @@ mod splice {
     }
 }
 
+/// Multishot accept on io_uring: one submission stays armed on the
+/// listener and completes once per connection, until the kernel ends it.
+///
+/// The operation belongs to the listener, not to an `accept` call, so an
+/// accept a caller abandons (a server racing it against shutdown drops one
+/// every time) leaves it armed with whatever it has already accepted. compio
+/// accepts once per submission where the kernel predates multishot accept
+/// (5.19) or io_uring is unavailable; the next accept then submits again.
+#[cfg(target_os = "linux")]
+mod multishot {
+    use std::{
+        cell::RefCell,
+        io,
+        os::fd::{FromRawFd as _, OwnedFd},
+    };
+
+    use ::compio::{
+        driver::{SharedFd, ToSharedFd, op::AcceptMulti},
+        runtime::SubmitMulti,
+    };
+    use compio_buf::{BufResult, IntoInner as _};
+    use futures_core::stream::FusedStream as _;
+    use futures_lite::StreamExt as _;
+
+    type Op = SubmitMulti<AcceptMulti<SharedFd<socket2::Socket>>>;
+
+    fn arm(listener: &impl ToSharedFd<socket2::Socket>) -> Op {
+        ::compio::runtime::submit_multi(AcceptMulti::new(listener.to_shared_fd()))
+    }
+
+    /// The listener's armed accept, borrowed by the `accept` polling it.
+    pub(super) struct Accepts(RefCell<Op>);
+
+    impl Accepts {
+        /// An accept not yet submitted: the first `next` submits it.
+        pub(super) fn new(listener: &impl ToSharedFd<socket2::Socket>) -> Self {
+            Self(RefCell::new(arm(listener)))
+        }
+
+        /// The next connection the armed accept completes with, or `None`
+        /// while another `accept` on this listener is polling it; that caller
+        /// then accepts with a submission of its own, since the operation
+        /// wakes one waiter only.
+        #[expect(
+            clippy::await_holding_refcell_ref,
+            reason = "the borrow is the accept's exclusive hold on the operation, released when the accept ends or is dropped"
+        )]
+        pub(super) async fn next(
+            &self,
+            listener: &impl ToSharedFd<socket2::Socket>,
+        ) -> Option<io::Result<OwnedFd>> {
+            let mut op = self.0.try_borrow_mut().ok()?;
+            let BufResult(res, _) = op
+                .next()
+                .await
+                .expect("a terminated accept is replaced in the poll that ends it");
+            if !op.is_terminated() {
+                // SAFETY: a multishot completion hands over the accepted
+                // descriptor, which nothing else owns.
+                return Some(res.map(|fd| unsafe { OwnedFd::from_raw_fd(fd as _) }));
+            }
+            // The kernel ended the multishot (or there was none): a successful
+            // last completion leaves the socket in the operation.
+            let finished = std::mem::replace(&mut *op, arm(listener));
+            Some(res.map(|_| {
+                let op = finished
+                    .try_take()
+                    .map_err(drop)
+                    .expect("a terminated accept has completed");
+                OwnedFd::from(op.into_inner())
+            }))
+        }
+    }
+
+    impl std::fmt::Debug for Accepts {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Accepts").finish_non_exhaustive()
+        }
+    }
+}
+
 /// A listening TCP socket.
 #[derive(Debug)]
-pub struct TcpListener(net::TcpListener);
+pub struct TcpListener {
+    inner: net::TcpListener,
+    #[cfg(target_os = "linux")]
+    accepts: multishot::Accepts,
+}
 
 impl TcpListener {
+    fn new(inner: net::TcpListener) -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            accepts: multishot::Accepts::new(&inner),
+            inner,
+        }
+    }
+
     /// compio's listener.
     #[must_use]
     pub fn get_ref(&self) -> &net::TcpListener {
-        &self.0
+        &self.inner
     }
 }
 
 #[cfg(unix)]
 impl std::os::fd::AsFd for TcpListener {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.0.as_fd()
+        self.inner.as_fd()
     }
 }
 
@@ -625,33 +718,53 @@ impl Listener for TcpListener {
     type Addr = SocketAddr;
 
     async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        let (stream, peer) = self.0.accept().await?;
+        #[cfg(target_os = "linux")]
+        if let Some(accepted) = self.accepts.next(&self.inner).await {
+            // A multishot accept shares one address buffer between its
+            // completions, so it reports no peer.
+            let stream = net::TcpStream::from_std(accepted?.into())?;
+            let peer = stream.peer_addr()?;
+            return Ok((TcpStream::new(stream), peer));
+        }
+        let (stream, peer) = self.inner.accept().await?;
         Ok((TcpStream::new(stream), peer))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.local_addr()
+        self.inner.local_addr()
     }
 }
 
 /// A listening Unix-domain socket.
 #[cfg(unix)]
 #[derive(Debug)]
-pub struct UnixListener(net::UnixListener);
+pub struct UnixListener {
+    inner: net::UnixListener,
+    #[cfg(target_os = "linux")]
+    accepts: multishot::Accepts,
+}
 
 #[cfg(unix)]
 impl UnixListener {
+    fn new(inner: net::UnixListener) -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            accepts: multishot::Accepts::new(&inner),
+            inner,
+        }
+    }
+
     /// compio's listener.
     #[must_use]
     pub fn get_ref(&self) -> &net::UnixListener {
-        &self.0
+        &self.inner
     }
 }
 
 #[cfg(unix)]
 impl std::os::fd::AsFd for UnixListener {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.0.as_fd()
+        self.inner.as_fd()
     }
 }
 
@@ -661,14 +774,20 @@ impl Listener for UnixListener {
     type Addr = std::os::unix::net::SocketAddr;
 
     async fn accept(&self) -> io::Result<(UnixStream, Self::Addr)> {
-        let (stream, _) = self.0.accept().await?;
+        #[cfg(target_os = "linux")]
+        let stream = match self.accepts.next(&self.inner).await {
+            Some(accepted) => net::UnixStream::from_std(accepted?.into())?,
+            None => self.inner.accept().await?.0,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (stream, _) = self.inner.accept().await?;
         let stream = UnixStream::new(stream);
         let peer = stream.peer_addr()?;
         Ok((stream, peer))
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
-        crate::sys::unix::listener_addr(&self.0)
+        crate::sys::unix::listener_addr(&self.inner)
     }
 }
 
