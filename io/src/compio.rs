@@ -853,7 +853,8 @@ mod splice {
     }
 
     /// One round: up to a pipe's capacity from the file into the pipe, then
-    /// all of it from the pipe into the socket.
+    /// all of it from the pipe into the socket, or as much as the socket
+    /// took before an error, which is then what the round reports.
     ///
     /// The second step is not an io_uring splice: io_uring runs every splice
     /// on an io-wq worker, and with no poll support for the operation a
@@ -905,32 +906,39 @@ mod splice {
         };
 
         let mut drained = 0;
-        while drained < filled {
+        let error = loop {
+            if drained == filled {
+                stream.pipe.set(Some(pipe));
+                return BufResult(Ok(filled), file);
+            }
             match crate::sys::pipe::splice(
                 pipe.read.as_fd(),
                 stream.inner.as_fd(),
                 filled - drained,
             ) {
                 Ok(0) => {
-                    return BufResult(
-                        Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "stream accepted no bytes",
-                        )),
-                        file,
-                    );
+                    break io::Error::new(io::ErrorKind::WriteZero, "stream accepted no bytes");
                 }
                 Ok(n) => drained += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if let Err(e) = ready(stream, Interest::Writable).await {
-                        return BufResult(Err(e), file);
+                        break e;
                     }
                 }
-                Err(e) => return BufResult(Err(e), file),
+                Err(e) => break e,
             }
+        };
+        // The pipe may still hold bytes, so it goes with this round. What was
+        // drained before the error is in the socket: that is what this call
+        // sent, as `send_file` reports it, and the error is the next call's
+        // to report. Reporting the error instead would have a caller that
+        // retries it (`Interrupted`, in `send_file_all`) send those bytes
+        // again.
+        if drained > 0 {
+            BufResult(Ok(drained), file)
+        } else {
+            BufResult(Err(error), file)
         }
-        stream.pipe.set(Some(pipe));
-        BufResult(Ok(filled), file)
     }
 
     /// Makes the socket `O_NONBLOCK`, once.
