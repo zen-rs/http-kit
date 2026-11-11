@@ -16,7 +16,7 @@ use http_kit::{
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use http_kit_h3::{Client, ConnectionInfo, Error, Server};
-use http_kit_io::{DatagramSocket as _, Io};
+use http_kit_io::{Datagram, DatagramSocket as _, Timer};
 use support::{CJK, client_config, loopback, on_compio, on_tokio, pki, server_config, within};
 
 const LIMIT: Duration = Duration::from_secs(30);
@@ -71,9 +71,9 @@ async fn read_exactly(body: &mut Body, len: usize) -> Vec<u8> {
 
 /// Each chunk of the request is echoed back before the next is sent, so both
 /// bodies stream at once; the trailers cross in both directions.
-async fn streaming_round_trip<I: Io>(io: I) {
+async fn streaming_round_trip<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let port = socket.local_addr().unwrap().port();
     let server = Server::new(socket, io.clone(), &server_config(&pki)).unwrap();
     let (stop, stopped) = async_channel::bounded::<()>(1);
@@ -82,7 +82,7 @@ async fn streaming_round_trip<I: Io>(io: I) {
     });
 
     let mut client = Client::new(&client_config(&pki)).unwrap();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let peer = ([127, 0, 0, 1], port).into();
     let (send, connection) = client
         .connect(socket, io.clone(), "localhost", peer)
@@ -139,9 +139,9 @@ fn streaming_round_trip_on_tokio() {
 
 /// More concurrent requests than the server allows streams, and bodies
 /// larger than the flow-control windows.
-async fn many_and_large<I: Io>(io: I) {
+async fn many_and_large<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let port = socket.local_addr().unwrap().port();
     let mut config = server_config(&pki);
     config.transport.initial_max_streams_bidi = 4;
@@ -152,7 +152,7 @@ async fn many_and_large<I: Io>(io: I) {
     });
 
     let mut client = Client::new(&client_config(&pki)).unwrap();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let peer = ([127, 0, 0, 1], port).into();
     let (send, connection) = client
         .connect(socket, io.clone(), "localhost", peer)
@@ -206,12 +206,12 @@ fn many_and_large_on_tokio() {
 
 /// A file-region frame is read out and sent as the file's bytes.
 #[cfg(feature = "fs")]
-async fn file_regions<I: Io>(io: I) {
+async fn file_regions<I: Datagram + Timer + Clone>(io: I) {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/exchange.rs");
     let source = std::fs::read(path).unwrap();
     let (offset, len) = (100, source.len() - 200);
     let pki = pki();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let port = socket.local_addr().unwrap().port();
     let server = Server::new(socket, io.clone(), &server_config(&pki)).unwrap();
     let (stop, stopped) = async_channel::bounded::<()>(1);
@@ -225,7 +225,7 @@ async fn file_regions<I: Io>(io: I) {
     });
 
     let mut client = Client::new(&client_config(&pki)).unwrap();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let peer = ([127, 0, 0, 1], port).into();
     let (send, connection) = client
         .connect(socket, io.clone(), "localhost", peer)
@@ -263,10 +263,10 @@ fn file_regions_on_tokio() {
 /// A pipe frame is read out and sent as data: QUIC encrypts in user space, so
 /// its bytes cannot go from the kernel to the socket.
 #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
-async fn pipe_frames<I: Io>(io: I) {
+async fn pipe_frames<I: Datagram + Timer + Clone>(io: I) {
     let payload = CJK.concat();
     let pki = pki();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let port = socket.local_addr().unwrap().port();
     let server = Server::new(socket, io.clone(), &server_config(&pki)).unwrap();
     let (stop, stopped) = async_channel::bounded::<()>(1);
@@ -291,7 +291,7 @@ async fn pipe_frames<I: Io>(io: I) {
     });
 
     let mut client = Client::new(&client_config(&pki)).unwrap();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let peer = ([127, 0, 0, 1], port).into();
     let (send, connection) = client
         .connect(socket, io.clone(), "localhost", peer)
@@ -325,9 +325,9 @@ fn pipe_frames_on_tokio() {
 /// A request in flight when shutdown begins is answered in full, its
 /// response streaming after the GOAWAY; one sent after it is refused as safe
 /// to retry; then the server closes the connection and returns.
-async fn goaway_drains<I: Io>(io: I) {
+async fn goaway_drains<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let port = socket.local_addr().unwrap().port();
     let server = Server::new(socket, io.clone(), &server_config(&pki)).unwrap();
     let (stop, stopped) = async_channel::bounded::<()>(1);
@@ -352,7 +352,7 @@ async fn goaway_drains<I: Io>(io: I) {
     });
 
     let mut client = Client::new(&client_config(&pki)).unwrap();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let peer = ([127, 0, 0, 1], port).into();
     let (send, connection) = client
         .connect(socket, io.clone(), "localhost", peer)

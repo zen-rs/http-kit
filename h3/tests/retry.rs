@@ -11,7 +11,7 @@ use std::{net::SocketAddr, num::NonZeroU32, time::Duration};
 use futures_lite::future::zip;
 use http_kit::{Body, Request, Response, StatusCode};
 use http_kit_h3::{Client, ClientConfig, Error, RetryWhen, Server, ServerConfig, ServerStats};
-use http_kit_io::{BufResult, DatagramSocket, Io, datagram::MAX_COALESCED_BYTES};
+use http_kit_io::{BufResult, Datagram, DatagramSocket, Timer, datagram::MAX_COALESCED_BYTES};
 use support::{CJK, client_config, loopback, on_compio, on_tokio, pki, server_config, within};
 
 const LIMIT: Duration = Duration::from_secs(30);
@@ -27,13 +27,13 @@ fn get(port: u16) -> Request {
 }
 
 /// Serves `config` while `client` runs against its address, then drains.
-async fn serving<I: Io, F: Future<Output = ()>>(
+async fn serving<I: Datagram + Timer + Clone, F: Future<Output = ()>>(
     io: I,
     config: &ServerConfig,
     client: impl FnOnce(SocketAddr, ServerStats) -> F,
 ) {
     let io = &io;
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let addr = SocketAddr::from(([127, 0, 0, 1], socket.local_addr().unwrap().port()));
     let server = Server::new(socket, io.clone(), config).unwrap();
     let stats = server.stats();
@@ -50,9 +50,13 @@ async fn serving<I: Io, F: Future<Output = ()>>(
 }
 
 /// One request on a fresh connection from the HTTP/3 client.
-async fn fetch<I: Io>(io: &I, config: &ClientConfig, server: SocketAddr) -> Result<(), Error> {
+async fn fetch<I: Datagram + Timer + Clone>(
+    io: &I,
+    config: &ClientConfig,
+    server: SocketAddr,
+) -> Result<(), Error> {
     let mut client = Client::new(config).unwrap();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let (send, connection) = client
         .connect(socket, io.clone(), "localhost", server)
         .unwrap();
@@ -69,7 +73,7 @@ async fn fetch<I: Io>(io: &I, config: &ClientConfig, server: SocketAddr) -> Resu
 
 /// The default configuration retries: the client answers the Retry on its
 /// own, and its handshake checks the transport parameters naming it.
-async fn handshake_via_retry<I: Io>(io: I) {
+async fn handshake_via_retry<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
     serving(
         io.clone(),
@@ -95,7 +99,7 @@ fn handshake_via_retry_on_tokio() {
 }
 
 /// Without Retry, the first Initial opens the connection.
-async fn never_retries<I: Io>(io: I) {
+async fn never_retries<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
     let mut config = server_config(&pki);
     config.retry = None;
@@ -118,7 +122,7 @@ fn never_retries_on_tokio() {
 }
 
 /// Above the rate, a connection is retried; below it, it is not.
-async fn retries_above_rate<I: Io>(io: I) {
+async fn retries_above_rate<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
     let mut config = server_config(&pki);
     config.retry.as_mut().unwrap().when = RetryWhen::AboveRate {
@@ -147,7 +151,7 @@ fn retries_above_rate_on_tokio() {
 
 /// A token older than its validity is dropped, so the client's handshake
 /// never completes and times out.
-async fn stale_token<I: Io>(io: I) {
+async fn stale_token<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
     let mut config = server_config(&pki);
     config.retry.as_mut().unwrap().validity = Duration::ZERO;
@@ -254,13 +258,13 @@ async fn retried_initial<S: DatagramSocket>(
 /// A forged token, and a genuine one sent from another address, are dropped
 /// without a connection; the same genuine token from its own address opens
 /// one.
-async fn refused_tokens<I: Io>(io: I) {
+async fn refused_tokens<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
     serving(
         io.clone(),
         &server_config(&pki),
         |server, stats| async move {
-            let first = io.bind_udp(loopback()).unwrap();
+            let first = io.bind_udp(loopback()).await.unwrap();
             let forged = retried_initial(&first, server, |token| {
                 let last = token.len() - 1;
                 token[last] ^= 1;
@@ -269,12 +273,12 @@ async fn refused_tokens<I: Io>(io: I) {
             send(&first, server, forged).await;
 
             let replayed = retried_initial(&first, server, |_| {}).await;
-            let elsewhere = io.bind_udp(loopback()).unwrap();
+            let elsewhere = io.bind_udp(loopback()).await.unwrap();
             send(&elsewhere, server, replayed).await;
 
             // The server handles datagrams in order: once this Retry is back,
             // both Initials above have been handled.
-            let own = io.bind_udp(loopback()).unwrap();
+            let own = io.bind_udp(loopback()).await.unwrap();
             let genuine = retried_initial(&own, server, |_| {}).await;
             assert_eq!(stats.retries_sent(), 3);
             assert_eq!(stats.invalid_tokens(), 2);

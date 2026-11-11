@@ -11,6 +11,8 @@
 //! # Traits
 //!
 //! - [`Read`], [`Write`], [`Split`] and [`Listener`]: stream sockets.
+//! - [`StreamSocket`]: the bounds a connected stream carries for the protocol
+//!   crates.
 //! - [`TcpOptions`]: socket options of a connected TCP stream.
 //! - [`SendFile`]: file-to-socket transfer, through `sendfile`/`splice` where
 //!   the platform has them.
@@ -21,11 +23,25 @@
 //! - [`DatagramSocket`]: datagram sockets with segmentation offload (GSO) on
 //!   send and receive coalescing (GRO).
 //! - [`Timer`] for deadlines.
-//! - [`Io`]: one implementation's family of sockets and timer, for code that
-//!   creates its own.
 //! - [`IntoPoll`]: the poll-style `futures_io` capability for consumers that
 //!   need one. An implementation that can offer it only through a copy says
 //!   so in its type, [`CopyingPoll`].
+//!
+//! # Capabilities
+//!
+//! One implementation's ability to create sockets is split into one trait per
+//! capability, so that code names only what it uses and a platform offers only
+//! what it has:
+//!
+//! - [`Dial`] and [`DialUnix`] open stream connections.
+//! - [`Listen`] and [`ListenUnix`] bind listeners.
+//! - [`Datagram`] binds datagram sockets.
+//! - [`FromStd`] and [`FromStdUnix`] adopt sockets the operating system
+//!   created and the caller configured.
+//! - [`Resolve`] turns a host name into addresses.
+//!
+//! Every method must be called on a thread where the implementation's runtime
+//! is running.
 //!
 //! No future or buffer is required to be `Send`: the intended deployment runs
 //! one driver per thread and keeps each connection on the thread that
@@ -43,6 +59,7 @@
 
 pub mod datagram;
 pub mod poll;
+pub mod resolve;
 pub mod splice;
 pub mod stream;
 pub mod time;
@@ -66,6 +83,7 @@ pub use compio_buf::{self, BufResult, IntoInner, IoBuf, IoBufMut, IoVectoredBuf,
 pub use crate::{
     datagram::{DatagramSocket, RecvMeta},
     poll::{CopyingPoll, IntoPoll},
+    resolve::{Answer, Family, Resolve},
     splice::{SpliceRead, SpliceWrite},
     stream::{Listener, Read, ReadHalf, SendFile, Split, TcpOptions, Write, WriteHalf},
     time::Timer,
@@ -74,64 +92,96 @@ pub use crate::{
 #[cfg(unix)]
 pub use crate::stream::WriteControl;
 
-/// One I/O implementation: its stream and datagram sockets and its timer.
+/// A connected stream socket: whole for a handshake, split for full-duplex
+/// protocols.
 ///
-/// Code that only consumes sockets handed to it is generic over the socket
-/// traits; code that opens its own (a client dialling out, a server binding
-/// one listener per thread) is generic over `Io`. Every method must be called
-/// on a thread where the implementation's runtime is running.
-pub trait Io: Timer + Clone + 'static {
-    /// A connected stream socket.
-    type TcpStream: Read
-        + Write
-        + SendFile
-        + SpliceRead
-        + SpliceWrite
-        + Split
-        + IntoPoll
-        + TcpOptions
-        + 'static;
-    /// A listening stream socket.
-    type TcpListener: Listener<Stream = Self::TcpStream, Addr = SocketAddr> + 'static;
+/// It is the bound the protocol crates put on the halves of a stream, named
+/// once. It is implemented for every type that meets it.
+pub trait StreamSocket:
+    Read + Write + Split<ReadHalf: SpliceRead, WriteHalf: SendFile + SpliceWrite> + 'static
+{
+}
+
+impl<S> StreamSocket for S where
+    S: Read + Write + Split<ReadHalf: SpliceRead, WriteHalf: SendFile + SpliceWrite> + 'static
+{
+}
+
+/// Opens TCP connections.
+pub trait Dial {
+    /// A connected TCP stream.
+    type Connection: StreamSocket + TcpOptions;
+
+    /// Opens a connection to `addr`.
+    fn connect(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Connection>>;
+}
+
+/// Opens Unix-domain stream connections.
+#[cfg(unix)]
+pub trait DialUnix {
     /// A connected Unix-domain stream socket.
-    #[cfg(unix)]
-    type UnixStream: Read + Write + SendFile + SpliceRead + SpliceWrite + Split + IntoPoll + 'static;
-    /// A listening Unix-domain stream socket.
-    #[cfg(unix)]
-    type UnixListener: Listener<Stream = Self::UnixStream, Addr = std::os::unix::net::SocketAddr>
-        + 'static;
-    /// A datagram socket.
-    type UdpSocket: DatagramSocket + 'static;
+    type UnixConnection: StreamSocket;
 
-    /// Opens a stream connection to `addr`.
-    fn connect(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::TcpStream>>;
-
-    /// Opens a stream connection to the Unix-domain socket at `path`.
-    #[cfg(unix)]
+    /// Opens a connection to the Unix-domain socket at `path`.
     fn connect_unix(
         &self,
         path: &std::path::Path,
-    ) -> impl Future<Output = io::Result<Self::UnixStream>>;
+    ) -> impl Future<Output = io::Result<Self::UnixConnection>>;
+}
 
-    /// Adopts a bound, listening std socket, configured however the caller
-    /// needs (`SO_REUSEPORT` for one listener per thread, a backlog, ...).
+/// Accepts TCP connections.
+pub trait Listen {
+    /// A listening TCP socket.
+    type Listener: Listener<Addr = SocketAddr, Stream: StreamSocket + TcpOptions> + 'static;
+
+    /// Binds and listens on `addr` with the platform's default options.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the address cannot be bound.
+    fn bind_tcp(&self, addr: SocketAddr) -> io::Result<Self::Listener>;
+}
+
+/// Accepts Unix-domain stream connections.
+#[cfg(unix)]
+pub trait ListenUnix {
+    /// A listening Unix-domain socket.
+    type UnixListener: Listener<Addr = std::os::unix::net::SocketAddr, Stream: StreamSocket>
+        + 'static;
+
+    /// Binds and listens on the Unix-domain socket at `path` with the
+    /// platform's default options.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the path cannot be bound.
+    fn bind_unix(&self, path: &std::path::Path) -> io::Result<Self::UnixListener>;
+}
+
+/// Binds datagram sockets.
+pub trait Datagram {
+    /// A datagram socket.
+    type UdpSocket: DatagramSocket + 'static;
+
+    /// Binds a datagram socket to `addr` with the platform's default options.
+    ///
+    /// It is a future because a host may bind over a round trip.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the address cannot be bound.
+    fn bind_udp(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::UdpSocket>>;
+}
+
+/// Adopts sockets the operating system created and the caller configured
+/// (`SO_REUSEPORT` for one listener per thread, a backlog, ...).
+pub trait FromStd: Listen + Datagram {
+    /// Adopts a bound, listening std socket.
     ///
     /// # Errors
     ///
     /// Fails if the socket cannot be registered with the driver.
-    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<Self::TcpListener>;
-
-    /// Adopts a bound, listening std Unix-domain socket, as
-    /// [`tcp_listener`](Self::tcp_listener) adopts a TCP one.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the socket cannot be registered with the driver.
-    #[cfg(unix)]
-    fn unix_listener(
-        &self,
-        listener: std::os::unix::net::UnixListener,
-    ) -> io::Result<Self::UnixListener>;
+    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<Self::Listener>;
 
     /// Adopts a bound std datagram socket.
     ///
@@ -139,22 +189,20 @@ pub trait Io: Timer + Clone + 'static {
     ///
     /// Fails if the socket cannot be registered with the driver.
     fn udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Self::UdpSocket>;
+}
 
-    /// Binds a listener to `addr` with the platform's default options.
+/// Adopts Unix-domain sockets the operating system created and the caller
+/// configured.
+#[cfg(unix)]
+pub trait FromStdUnix: ListenUnix {
+    /// Adopts a bound, listening std Unix-domain socket, as
+    /// [`FromStd::tcp_listener`] adopts a TCP one.
     ///
     /// # Errors
     ///
-    /// Fails if the address cannot be bound.
-    fn bind_tcp(&self, addr: SocketAddr) -> io::Result<Self::TcpListener> {
-        self.tcp_listener(std::net::TcpListener::bind(addr)?)
-    }
-
-    /// Binds a datagram socket to `addr` with the platform's default options.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the address cannot be bound.
-    fn bind_udp(&self, addr: SocketAddr) -> io::Result<Self::UdpSocket> {
-        self.udp_socket(std::net::UdpSocket::bind(addr)?)
-    }
+    /// Fails if the socket cannot be registered with the driver.
+    fn unix_listener(
+        &self,
+        listener: std::os::unix::net::UnixListener,
+    ) -> io::Result<Self::UnixListener>;
 }

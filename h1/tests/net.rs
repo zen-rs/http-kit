@@ -17,8 +17,8 @@ use http_kit_h1::{
     ClientConfig, ClientOutcome, ServerConfig, ServerConnection, ServerOutcome, handshake_stream,
 };
 use http_kit_io::{
-    BufResult, Io, IoBuf, IoVectoredBuf, Listener as _, SendFile, SpliceRead, SpliceWrite, Split,
-    Write,
+    BufResult, Dial, IoBuf, IoVectoredBuf, Listen, Listener as _, SendFile, SpliceWrite, Split,
+    Timer, Write,
 };
 #[cfg(feature = "fs")]
 use {
@@ -125,9 +125,7 @@ fn loopback() -> SocketAddr {
 /// Serves one connection with `service`, and runs `client` against it.
 async fn exchange<I, S, C, Fut>(io: I, service: S, client: C) -> (Sent, Fut::Output)
 where
-    I: Io,
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
+    I: Dial + Listen + Timer + Clone,
     S: http_kit_h1::Service,
     C: FnOnce(http_kit_h1::SendRequest) -> Fut,
     Fut: Future,
@@ -187,11 +185,7 @@ fn get(uri: &str) -> Request {
     request
 }
 
-async fn keep_alive_round_trips<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn keep_alive_round_trips<I: Dial + Listen + Timer + Clone>(io: I) {
     let service = |request: Request| async move {
         let body = request
             .into_body()
@@ -222,11 +216,7 @@ where
 }
 
 #[cfg(feature = "fs")]
-async fn file_region_response<I: Io>(io: I, name: &str)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn file_region_response<I: Dial + Listen + Timer + Clone>(io: I, name: &str) {
     let (path, contents) = payload_file(name);
     let (offset, len) = (11, contents.len() - 11 - 5);
     let service = |_: Request| {
@@ -264,11 +254,7 @@ where
 }
 
 #[cfg(feature = "fs")]
-async fn chunked_file_region_with_trailers<I: Io>(io: I, name: &str)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn chunked_file_region_with_trailers<I: Dial + Listen + Timer + Clone>(io: I, name: &str) {
     let (path, contents) = payload_file(name);
     let service = |_: Request| {
         let file = File::open(&path).expect("open the file to serve");

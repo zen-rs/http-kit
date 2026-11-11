@@ -21,7 +21,7 @@ use boring::{
 use futures_lite::future::zip;
 use http_kit::{Body, Method, Request, Response};
 use http_kit_h3::{Client, Error, Server};
-use http_kit_io::{DatagramSocket as _, Io};
+use http_kit_io::{Datagram, DatagramSocket as _, Timer};
 use quiche::h3::{self, NameValue as _};
 use support::{CJK, Pki, client_config, loopback, on_compio, on_tokio, pki, server_config, within};
 
@@ -67,7 +67,7 @@ async fn assert_returned(
 }
 
 /// Waits until `send` reports the connection closed to new requests.
-async fn closed<I: Io>(io: &I, send: &http_kit_h3::SendRequest) {
+async fn closed<I: Datagram + Timer + Clone>(io: &I, send: &http_kit_h3::SendRequest) {
     while !send.is_closed() {
         io.sleep(Duration::from_millis(5)).await;
     }
@@ -76,7 +76,7 @@ async fn closed<I: Io>(io: &I, send: &http_kit_h3::SendRequest) {
 /// Starts a server whose service holds `/slow` until released, and a client
 /// connected to it; `test` gets the handle, the port, the server's stop and
 /// its release switches.
-async fn drained_server<I: Io, F: Future<Output = ()>>(
+async fn drained_server<I: Datagram + Timer + Clone, F: Future<Output = ()>>(
     io: I,
     max_streams: u64,
     test: impl FnOnce(
@@ -88,7 +88,7 @@ async fn drained_server<I: Io, F: Future<Output = ()>>(
     ) -> F,
 ) {
     let pki = pki();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let port = socket.local_addr().unwrap().port();
     let mut config = server_config(&pki);
     config.transport.initial_max_streams_bidi = max_streams;
@@ -110,7 +110,7 @@ async fn drained_server<I: Io, F: Future<Output = ()>>(
     });
 
     let mut client = Client::new(&client_config(&pki)).unwrap();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let peer = ([127, 0, 0, 1], port).into();
     let (send, connection) = client
         .connect(socket, io.clone(), "localhost", peer)
@@ -126,7 +126,7 @@ async fn drained_server<I: Io, F: Future<Output = ()>>(
 
 /// After the GOAWAY was read the handle is closed, and a request sent on it
 /// comes back whole.
-async fn closed_handle<I: Io>(io: I) {
+async fn closed_handle<I: Datagram + Timer + Clone>(io: I) {
     let io2 = io.clone();
     drained_server(io, 100, |send, port, arrived, stop, release| async move {
         let slow = async {
@@ -167,7 +167,7 @@ fn closed_handle_on_tokio() {
 /// A request waiting for a stream (the server allows one at a time, and
 /// `/slow` holds it) when the GOAWAY is read never opens one: it comes back
 /// as rejected, with its body unread.
-async fn goaway_before_stream<I: Io>(io: I) {
+async fn goaway_before_stream<I: Datagram + Timer + Clone>(io: I) {
     let io2 = io.clone();
     drained_server(io, 1, |send, port, arrived, stop, release| async move {
         let slow = async {
@@ -297,11 +297,11 @@ fn rejecting_server(pki: &Pki) -> (u16, mpsc::Sender<()>, thread::JoinHandle<()>
 
 /// A server that rejects the stream unprocessed: a request without a body
 /// comes back whole.
-async fn rejected<I: Io>(io: I) {
+async fn rejected<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
     let (port, stop, server) = rejecting_server(&pki);
     let mut client = Client::new(&client_config(&pki)).unwrap();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let peer = ([127, 0, 0, 1], port).into();
     let (send, connection) = client
         .connect(socket, io.clone(), "localhost", peer)

@@ -21,12 +21,14 @@ use ::tokio::io::{Interest, ReadBuf};
 use socket2::SockRef;
 
 use crate::{
-    Io,
+    Datagram, Dial, FromStd, Listen,
     poll::IntoPoll,
     readiness::{self, sealed::Ready},
     stream::Listener,
     time::Timer,
 };
+#[cfg(unix)]
+use crate::{DialUnix, FromStdUnix, ListenUnix};
 
 /// The tokio implementation. It holds nothing: tokio keeps its runtime
 /// context per thread.
@@ -52,40 +54,67 @@ impl Timer for Tokio {
     }
 }
 
-impl Io for Tokio {
-    type TcpStream = TcpStream;
-    type TcpListener = TcpListener;
-    #[cfg(unix)]
-    type UnixStream = UnixStream;
-    #[cfg(unix)]
-    type UnixListener = UnixListener;
-    type UdpSocket = UdpSocket;
+impl Dial for Tokio {
+    type Connection = TcpStream;
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         ::tokio::net::TcpStream::connect(addr)
             .await
             .map(readiness::Stream::new)
     }
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+impl DialUnix for Tokio {
+    type UnixConnection = UnixStream;
+
     async fn connect_unix(&self, path: &std::path::Path) -> io::Result<UnixStream> {
         ::tokio::net::UnixStream::connect(path)
             .await
             .map(readiness::Stream::new)
     }
+}
 
-    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
-        listener.set_nonblocking(true)?;
-        ::tokio::net::TcpListener::from_std(listener).map(readiness::Listener::new)
+impl Listen for Tokio {
+    type Listener = TcpListener;
+
+    fn bind_tcp(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+        self.tcp_listener(std::net::TcpListener::bind(addr)?)
     }
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+impl ListenUnix for Tokio {
+    type UnixListener = UnixListener;
+
+    fn bind_unix(&self, path: &std::path::Path) -> io::Result<UnixListener> {
+        self.unix_listener(std::os::unix::net::UnixListener::bind(path)?)
+    }
+}
+
+impl Datagram for Tokio {
+    type UdpSocket = UdpSocket;
+
+    async fn bind_udp(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
+        self.udp_socket(std::net::UdpSocket::bind(addr)?)
+    }
+}
+
+#[cfg(unix)]
+impl FromStdUnix for Tokio {
     fn unix_listener(
         &self,
         listener: std::os::unix::net::UnixListener,
     ) -> io::Result<UnixListener> {
         listener.set_nonblocking(true)?;
         ::tokio::net::UnixListener::from_std(listener).map(readiness::Listener::new)
+    }
+}
+
+impl FromStd for Tokio {
+    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
+        listener.set_nonblocking(true)?;
+        ::tokio::net::TcpListener::from_std(listener).map(readiness::Listener::new)
     }
 
     fn udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<UdpSocket> {

@@ -33,12 +33,14 @@ use ::compio::{
 use compio_buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf};
 
 use crate::{
-    Io,
+    Datagram, Dial, FromStd, Listen,
     datagram::{DatagramSocket, RecvMeta, send_batched},
     poll::{CopyingPoll, IntoPoll},
     stream::{Listener, TcpOptions, impl_stream, sealed::SharedStream},
     time::Timer,
 };
+#[cfg(unix)]
+use crate::{DialUnix, FromStdUnix, ListenUnix};
 
 /// The compio implementation. It holds nothing: compio keeps its runtime per
 /// thread, and every operation goes to the current thread's.
@@ -51,34 +53,61 @@ impl Timer for Compio {
     }
 }
 
-impl Io for Compio {
-    type TcpStream = TcpStream;
-    type TcpListener = TcpListener;
-    #[cfg(unix)]
-    type UnixStream = UnixStream;
-    #[cfg(unix)]
-    type UnixListener = UnixListener;
-    type UdpSocket = UdpSocket;
+impl Dial for Compio {
+    type Connection = TcpStream;
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         net::TcpStream::connect(addr).await.map(TcpStream::new)
     }
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+impl DialUnix for Compio {
+    type UnixConnection = UnixStream;
+
     async fn connect_unix(&self, path: &std::path::Path) -> io::Result<UnixStream> {
         net::UnixStream::connect(path).await.map(UnixStream::new)
     }
+}
 
-    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
-        net::TcpListener::from_std(listener).map(TcpListener::new)
+impl Listen for Compio {
+    type Listener = TcpListener;
+
+    fn bind_tcp(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+        self.tcp_listener(std::net::TcpListener::bind(addr)?)
     }
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+impl ListenUnix for Compio {
+    type UnixListener = UnixListener;
+
+    fn bind_unix(&self, path: &std::path::Path) -> io::Result<UnixListener> {
+        self.unix_listener(std::os::unix::net::UnixListener::bind(path)?)
+    }
+}
+
+impl Datagram for Compio {
+    type UdpSocket = UdpSocket;
+
+    async fn bind_udp(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
+        self.udp_socket(std::net::UdpSocket::bind(addr)?)
+    }
+}
+
+#[cfg(unix)]
+impl FromStdUnix for Compio {
     fn unix_listener(
         &self,
         listener: std::os::unix::net::UnixListener,
     ) -> io::Result<UnixListener> {
         net::UnixListener::from_std(listener).map(UnixListener::new)
+    }
+}
+
+impl FromStd for Compio {
+    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
+        net::TcpListener::from_std(listener).map(TcpListener::new)
     }
 
     fn udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<UdpSocket> {
