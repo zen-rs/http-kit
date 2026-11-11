@@ -10,7 +10,7 @@ use http_kit_io::{
 };
 use rustls::{ProtocolVersion, SupportedCipherSuite};
 
-use crate::{engine::Engine, side::Side, user};
+use crate::{HandshakeError, engine::Engine, side::Side, user};
 
 /// Where a connection's records are encrypted and decrypted, settled once
 /// when its handshake completes.
@@ -229,7 +229,7 @@ pub trait TransportWrite: Write + SendFile + Sized + 'static {
         reader: R,
         writer: Self,
         #[cfg(feature = "kernel")] kernel: Option<&crate::KernelTls>,
-    ) -> impl Future<Output = io::Result<(ReadInner<R, D>, WriteInner<Self, D>)>> {
+    ) -> impl Future<Output = Settled<R, Self, D>> {
         #[cfg(feature = "kernel")]
         let _ = kernel;
         secure_in_user_space(engine, reader, writer)
@@ -262,7 +262,7 @@ impl<W: Write + SendFile + SpliceWrite + http_kit_io::WriteControl + std::os::fd
         mut reader: R,
         mut writer: Self,
         kernel: Option<&crate::KernelTls>,
-    ) -> io::Result<(ReadInner<R, D>, WriteInner<Self, D>)> {
+    ) -> Result<(ReadInner<R, D>, WriteInner<Self, D>), HandshakeError> {
         use crate::kernel::linux::{self, Switched};
 
         if let Some(kernel) = kernel.filter(|_| <R::Kernel<D> as KernelRead<R, D>>::SOCKET) {
@@ -311,7 +311,7 @@ pub trait Transport: Split<ReadHalf: TransportRead, WriteHalf: TransportWrite> +
         reader: Self::ReadHalf,
         writer: Self::WriteHalf,
         #[cfg(feature = "kernel")] kernel: Option<&crate::KernelTls>,
-    ) -> impl Future<Output = io::Result<Secured<Self, D>>>;
+    ) -> impl Future<Output = Result<Secured<Self, D>, HandshakeError>>;
 }
 
 /// The two halves of a connection, once it is settled where its records are
@@ -322,12 +322,17 @@ pub type Secured<S, D> = (
     WriteInner<<S as Split>::WriteHalf, D>,
 );
 
+/// How settling where a connection's records are encrypted came out, over a
+/// reading half `R` and a writing half `W`.
+#[doc(hidden)]
+pub type Settled<R, W, D> = Result<(ReadInner<R, D>, WriteInner<W, D>), HandshakeError>;
+
 /// Records encrypted in user space, over any transport.
 async fn secure_in_user_space<R: TransportRead, W: TransportWrite, D: Side>(
     engine: Engine<D>,
     reader: R,
     writer: W,
-) -> io::Result<(ReadInner<R, D>, WriteInner<W, D>)> {
+) -> Result<(ReadInner<R, D>, WriteInner<W, D>), HandshakeError> {
     let (read, write) = user::split(engine, (reader, writer));
     Ok((ReadInner::User(read), WriteInner::User(write)))
 }
@@ -338,7 +343,7 @@ impl<S: Split<ReadHalf: TransportRead, WriteHalf: TransportWrite> + 'static> Tra
         reader: Self::ReadHalf,
         writer: Self::WriteHalf,
         #[cfg(feature = "kernel")] kernel: Option<&crate::KernelTls>,
-    ) -> io::Result<Secured<Self, D>> {
+    ) -> Result<Secured<Self, D>, HandshakeError> {
         <Self::WriteHalf as TransportWrite>::secure(
             engine,
             reader,

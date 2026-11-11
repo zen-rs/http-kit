@@ -102,7 +102,7 @@
 //!     };
 //!     let server = async {
 //!         let (stream, _) = listener.accept().await?;
-//!         let stream = acceptor.accept(stream, &Compio).await?;
+//!         let stream = acceptor.accept(stream, &Compio).await.map_err(std::io::Error::other)?;
 //!         assert_eq!(stream.alpn_protocol(), Some(&b"http/1.1"[..]));
 //!         let connection = ServerConnection::from_stream(stream, Compio, ServerConfig::default());
 //!         connection.serve(&service).await.map_err(std::io::Error::other)
@@ -110,7 +110,7 @@
 //!     let client = async {
 //!         let stream = Compio.connect(addr).await?;
 //!         let name = "localhost".try_into().unwrap();
-//!         let stream = connector.connect(name, stream, &Compio).await?;
+//!         let stream = connector.connect(name, stream, &Compio).await.map_err(std::io::Error::other)?;
 //!         let (send, connection) = handshake_stream(stream, Compio, ClientConfig::default());
 //!         let request = async move {
 //!             let mut request = Request::new(Body::empty());
@@ -131,6 +131,7 @@
 
 mod accept;
 mod engine;
+mod error;
 #[cfg(feature = "kernel")]
 mod kernel;
 #[cfg(any(test, all(target_os = "linux", feature = "kernel")))]
@@ -147,6 +148,7 @@ pub use rustls;
 pub use crate::kernel::KernelTls;
 pub use crate::{
     accept::{TlsAcceptor, TlsConnector},
+    error::HandshakeError,
     side::{Client, Server, Side},
     stream::{
         Mode, Negotiated, TlsReadHalf, TlsStream, TlsWriteHalf, Transport, TransportRead,

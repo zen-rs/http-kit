@@ -17,7 +17,7 @@ use rustls::unbuffered::{
     WriteTraffic,
 };
 
-use crate::side::Side;
+use crate::{error::Fault, side::Side};
 
 /// The most one socket read asks for: four full records.
 pub(crate) const READ_SIZE: usize = 4 * MAX_RECORD;
@@ -26,9 +26,10 @@ pub(crate) const READ_SIZE: usize = 4 * MAX_RECORD;
 /// the most expansion RFC 8446 §5.2 allows.
 const MAX_RECORD: usize = 5 + (1 << 14) + 256;
 
-/// A rustls failure as the I/O error a stream reports.
+/// A rustls failure as the I/O error an established stream reports.
+#[cfg(all(target_os = "linux", feature = "kernel"))]
 pub(crate) fn tls_error(error: rustls::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
+    Fault::Tls(error).into()
 }
 
 /// Copies as much of `src` into `dest` as fits, returning how much.
@@ -116,7 +117,7 @@ impl<D: Side> Engine<D> {
     /// Processes every complete record buffered, queueing what they decrypt
     /// to.
     #[cfg(all(target_os = "linux", feature = "kernel"))]
-    pub(crate) fn pump(&mut self) -> io::Result<()> {
+    pub(crate) fn pump(&mut self) -> Result<(), Fault> {
         let mut delivered = 0;
         loop {
             match self.step(&mut [], &mut delivered)? {
@@ -177,7 +178,11 @@ impl<D: Side> Engine<D> {
 
     /// One call into rustls: what it asked for is done, `delivered` counts
     /// the bytes of `dest` decrypted records filled.
-    fn step(&mut self, dest: &mut [MaybeUninit<u8>], delivered: &mut usize) -> io::Result<Waiting> {
+    fn step(
+        &mut self,
+        dest: &mut [MaybeUninit<u8>],
+        delivered: &mut usize,
+    ) -> Result<Waiting, Fault> {
         let UnbufferedStatus { discard, state } = D::process(&mut self.conn, &mut self.incoming);
         let sink = Sink {
             plaintext: &mut self.plaintext,
@@ -193,8 +198,8 @@ impl<D: Side> Engine<D> {
     fn discard(
         &mut self,
         discard: usize,
-        handled: io::Result<(Waiting, usize)>,
-    ) -> io::Result<Waiting> {
+        handled: Result<(Waiting, usize), Fault>,
+    ) -> Result<Waiting, Fault> {
         match handled {
             Ok((waiting, more)) => {
                 self.incoming.drain(..discard + more);
@@ -234,7 +239,7 @@ impl<D: Side> Engine<D> {
         &mut self,
         reader: &mut R,
         writer: &mut W,
-    ) -> io::Result<()> {
+    ) -> Result<(), Fault> {
         let mut delivered = 0;
         loop {
             match self.step(&mut [], &mut delivered)? {
@@ -245,10 +250,10 @@ impl<D: Side> Engine<D> {
                         return Ok(());
                     }
                     if self.peer_closed {
-                        return Err(io::Error::new(
+                        return Err(Fault::Io(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "the peer closed the connection mid-handshake",
-                        ));
+                        )));
                     }
                     self.fill(reader, READ_SIZE).await?;
                 }
@@ -281,13 +286,13 @@ fn handle<Data>(
     sink: Sink<'_>,
     dest: &mut [MaybeUninit<u8>],
     delivered: &mut usize,
-) -> io::Result<(Waiting, usize)> {
+) -> Result<(Waiting, usize), Fault> {
     let mut discard = 0;
-    let waiting = match state.map_err(tls_error)? {
+    let waiting = match state? {
         ConnectionState::ReadTraffic(mut traffic) => {
             let mut room = dest;
             while let Some(record) = traffic.next_record() {
-                let record = record.map_err(tls_error)?;
+                let record = record?;
                 discard += record.discard;
                 let n = copy_into(room, record.payload);
                 room = &mut room[n..];
@@ -317,15 +322,15 @@ fn handle<Data>(
         ConnectionState::BlockedHandshake => Waiting::Input,
         ConnectionState::WriteTraffic(_) => Waiting::Writable,
         ConnectionState::ReadEarlyData(_) => {
-            return Err(io::Error::new(
+            return Err(Fault::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "TLS early data is not supported; set `max_early_data_size` to 0",
-            ));
+            )));
         }
         state => {
-            return Err(io::Error::other(format!(
+            return Err(Fault::Io(io::Error::other(format!(
                 "unexpected TLS connection state {state:?}"
-            )));
+            ))));
         }
     };
     Ok((waiting, discard))
@@ -352,7 +357,7 @@ impl From<EncodeError> for Shortfall {
             EncodeError::InsufficientSize(InsufficientSizeError { required_size }) => {
                 Self::Needs(required_size)
             }
-            error => Self::Failed(io::Error::other(error)),
+            error => Self::Failed(io::Error::new(io::ErrorKind::InvalidData, error)),
         }
     }
 }
@@ -363,7 +368,7 @@ impl From<EncryptError> for Shortfall {
             EncryptError::InsufficientSize(InsufficientSizeError { required_size }) => {
                 Self::Needs(required_size)
             }
-            error => Self::Failed(io::Error::other(error)),
+            error => Self::Failed(io::Error::new(io::ErrorKind::InvalidData, error)),
         }
     }
 }

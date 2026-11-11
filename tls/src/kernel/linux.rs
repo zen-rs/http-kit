@@ -43,6 +43,7 @@ use zeroize::Zeroize;
 
 use super::KernelTls;
 use crate::{
+    HandshakeError,
     engine::{Engine, copy_into, tls_error},
     record::{self, Boundary, CLOSE_NOTIFY, Cipher, Control, KEY_UPDATE, MAX_FRAGMENT, Message},
     side::Side,
@@ -80,7 +81,7 @@ pub(crate) async fn switch<D: Side, R: Read, W: Write + AsFd>(
     reader: &mut R,
     writer: &mut W,
     kernel: &KernelTls,
-) -> io::Result<Switched<D>> {
+) -> Result<Switched<D>, HandshakeError> {
     let version = engine
         .conn
         .protocol_version()
@@ -112,7 +113,12 @@ pub(crate) async fn switch<D: Side, R: Read, W: Write + AsFd>(
             tracing::debug!("the peer closed before kernel TLS could take over");
             return Ok(Switched::User(engine));
         }
-        Err(error) => return Err(kernel_error("could not set TCP_ULP \"tls\"", &error)),
+        Err(error) => {
+            return Err(HandshakeError::Kernel(kernel_error(
+                "could not set TCP_ULP \"tls\"",
+                &error,
+            )));
+        }
     }
     loop {
         engine.pump()?;
@@ -121,7 +127,10 @@ pub(crate) async fn switch<D: Side, R: Read, W: Write + AsFd>(
         }
         match record::boundary(&engine.incoming) {
             Boundary::Reached => break,
-            Boundary::Short(missing) => engine.fill(reader, missing).await?,
+            Boundary::Short(missing) => engine
+                .fill(reader, missing)
+                .await
+                .map_err(HandshakeError::Io)?,
             Boundary::Held => {
                 tracing::debug!(
                     "rustls holds part of a handshake message; kernel TLS cannot start here"
@@ -132,12 +141,13 @@ pub(crate) async fn switch<D: Side, R: Read, W: Write + AsFd>(
     }
     // Records reading produced (a key update's answer) leave before the
     // kernel seals anything.
-    engine.owed.send(writer).await?;
+    engine.owed.send(writer).await.map_err(HandshakeError::Io)?;
     let carried = engine.take_unread();
-    let (secrets, conn) = D::into_kernel(engine.conn).map_err(tls_error)?;
+    let (secrets, conn) =
+        D::into_kernel(engine.conn).map_err(|error| HandshakeError::Kernel(tls_error(error)))?;
     let fd = writer.as_fd();
-    install(fd, Direction::Tx, version, secrets.tx)?;
-    install(fd, Direction::Rx, version, secrets.rx)?;
+    install(fd, Direction::Tx, version, secrets.tx).map_err(HandshakeError::Kernel)?;
+    install(fd, Direction::Rx, version, secrets.rx).map_err(HandshakeError::Kernel)?;
     tracing::trace!(
         ?suite,
         ?version,
