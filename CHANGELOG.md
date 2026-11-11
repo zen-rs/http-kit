@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/zen-rs/http-kit/compare/v0.7.0...v0.8.0) - 2026-11-11
+
+### Added
+
+- *(body)* [**breaking**] poll_frame_offering takes an optional offer
+- *(io)* [**breaking**] name stream sockets by registered file slots on io_uring
+- *(h1)* send queued buffers through write_all_owned
+- *(io)* [**breaking**] zero-copy send for large writes on io_uring
+- accessors for WithMiddleware's endpoint and middleware
+- *(h1)* [**breaking**] receive through ReadOwned
+- *(io)* [**breaking**] multishot receive into the runtime's provided buffer ring
+- [**breaking**] per-request receive deadlines, and typed failures for a body that ends early
+- *(tls)* [**breaking**] a typed handshake error
+- *(io)* [**breaking**] per-capability traits replace Io, and a resolver joins them
+
+### Other
+
+- *(h1)* drop an unused import
+- *(h1)* reuse one pipe per connection for spliced bodies
+- Merge remote-tracking branch 'origin/main' into feat/126-send-zc
+- *(h3)* clone the compio driver into the curl server
+- Merge remote-tracking branch 'origin/main' into feat/145-request-deadlines
+- Merge remote-tracking branch 'origin/main' into feat/146-tls-handshake-error
+- *(io)* drop an unused import
+- Merge remote-tracking branch 'origin/main' into feat/124-multishot-accept
+
 ## [0.7.0](https://github.com/zen-rs/http-kit/compare/v0.6.0...v0.7.0) - 2026-11-11
 
 ### Added
