@@ -122,8 +122,8 @@ fn invalid(message: impl Into<String>) -> io::Error {
 ///
 /// # Errors
 ///
-/// A fatal alert ([`io::ErrorKind::ConnectionAborted`]), a malformed or
-/// unexpected record, or a TLS 1.2 renegotiation, which is refused.
+/// A fatal alert, a malformed or unexpected record, or a TLS 1.2
+/// renegotiation, which is refused; each is [`io::ErrorKind::InvalidData`].
 pub(crate) fn parse(
     content_type: u8,
     payload: &[u8],
@@ -145,7 +145,7 @@ pub(crate) fn parse(
                 // A warning level in TLS 1.2; TLS 1.3 has no warnings.
                 _ if !tls13 && level == 1 => Ok(Control::Ignored),
                 description => Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
+                    io::ErrorKind::InvalidData,
                     format!("the peer sent a fatal TLS alert: {description:?}"),
                 )),
             }
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(parse(ALERT, &[1, 90], v13).unwrap(), Control::Ignored);
         assert_eq!(parse(ALERT, &[1, 100], v12).unwrap(), Control::Ignored);
         let fatal = parse(ALERT, &[2, 40], v13).unwrap_err();
-        assert_eq!(fatal.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(fatal.kind(), io::ErrorKind::InvalidData);
         assert!(fatal.to_string().contains("HandshakeFailure"), "{fatal}");
         assert!(parse(ALERT, &[1, 100], v13).is_err());
         assert!(parse(ALERT, &[1], v13).is_err());

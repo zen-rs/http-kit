@@ -21,9 +21,9 @@ use http_kit_io::{
     SpliceWrite, Split, Timer, Write,
 };
 use http_kit_tls::{
-    Client, Mode, Server, TlsAcceptor, TlsConnector, TlsStream, Transport,
+    Client, HandshakeError, Mode, Server, TlsAcceptor, TlsConnector, TlsStream, Transport,
     rustls::{
-        self, SupportedCipherSuite, SupportedProtocolVersion,
+        self, AlertDescription, SupportedCipherSuite, SupportedProtocolVersion,
         crypto::{CryptoProvider, ring},
         pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _},
     },
@@ -599,9 +599,75 @@ where
         acceptor.accept(stream, &io).await
     };
     let (accepted, silent) = zip(server, io.connect(addr)).await;
-    let error = accepted.expect_err("a silent peer is refused");
-    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    match accepted.expect_err("a silent peer is refused") {
+        HandshakeError::TimedOut(deadline) => assert_eq!(deadline, Duration::from_millis(100)),
+        other => panic!("expected a handshake timeout, got {other:?}"),
+    }
     drop(silent);
+}
+
+/// A server whose certificate the client does not trust is a certificate
+/// failure, not a timeout, an alert or a transport error.
+async fn bad_certificate<I: Dial + Listen + Timer>(io: I)
+where
+    I::Connection: Transport,
+    Accepted<I>: Transport,
+{
+    let served = Identity::new();
+    let trusted = Identity::new();
+    let acceptor = acceptor(&served, TLS13_AES_128, &[]);
+    let connector = connector(&trusted, TLS13_AES_128, &[]);
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let addr = listener.local_addr().expect("local address");
+    let server = async {
+        let (stream, _) = listener.accept().await.expect("accept");
+        // The client hangs up on rejecting the certificate.
+        acceptor.accept(stream, &io).await.map(drop)
+    };
+    let client = async {
+        let stream = io.connect(addr).await.expect("connect");
+        connector.connect(localhost(), stream, &io).await.map(drop)
+    };
+    let (_, client) = zip(server, client).await;
+    match client.expect_err("an untrusted certificate is refused") {
+        HandshakeError::Tls(rustls::Error::InvalidCertificate(_)) => {}
+        other => panic!("expected a certificate failure, got {other:?}"),
+    }
+}
+
+/// A fatal alert from the peer is rustls's `AlertReceived`, not a transport
+/// error.
+async fn received_alert<I: Dial + Listen + Timer>(io: I)
+where
+    I::Connection: Transport,
+    Accepted<I>: Transport,
+{
+    /// A fatal `handshake_failure` alert record (RFC 8446 §6, `AlertLevel`
+    /// 2, `AlertDescription` 40) in TLS 1.2's record framing.
+    const HANDSHAKE_FAILURE: [u8; 7] = [21, 3, 3, 0, 2, 2, 40];
+
+    let identity = Identity::new();
+    let connector = connector(&identity, TLS13_AES_128, &[]);
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let addr = listener.local_addr().expect("local address");
+    let peer = async {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (read, mut write) = stream.split();
+        let BufResult(res, _) = write.write_all(HANDSHAKE_FAILURE.to_vec()).await;
+        res.expect("peer write");
+        // Held open until the client has read the alert: closing with the
+        // ClientHello unread would reset the connection instead.
+        (read, write)
+    };
+    let client = async {
+        let stream = io.connect(addr).await.expect("connect");
+        connector.connect(localhost(), stream, &io).await.map(drop)
+    };
+    let (_peer, client) = zip(peer, client).await;
+    match client.expect_err("an alert refuses the handshake") {
+        HandshakeError::Tls(rustls::Error::AlertReceived(AlertDescription::HandshakeFailure)) => {}
+        other => panic!("expected a received alert, got {other:?}"),
+    }
 }
 
 /// A connection closed without `close_notify` is cut short, not ended.
@@ -1260,6 +1326,16 @@ macro_rules! suite {
         #[test]
         fn handshake_deadline() {
             $run(super::handshake_deadline($io));
+        }
+
+        #[test]
+        fn bad_certificate() {
+            $run(super::bad_certificate($io));
+        }
+
+        #[test]
+        fn received_alert() {
+            $run(super::received_alert($io));
         }
 
         #[test]
