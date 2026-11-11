@@ -31,7 +31,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_lite::{Stream as _, StreamExt as _, future::zip, stream};
+use futures_lite::{StreamExt as _, future::zip, stream};
 use http::{HeaderMap, HeaderValue, Method};
 use http_kit::{Body, BodyError, BodyFrame, FrameSource, PipeOffer, Request, Response};
 use http_kit_h1::{
