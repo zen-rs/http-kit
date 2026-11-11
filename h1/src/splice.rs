@@ -24,7 +24,8 @@ pub(crate) enum Attempt {
 ///
 /// The splice takes at most the run and the offer's `max`, so it never
 /// reaches past the body into the next message's bytes, which stay in the
-/// socket.
+/// socket. A stream that received ahead of its reader puts those bytes into
+/// the pipe before it splices from the socket.
 #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
 pub(crate) async fn try_splice<R: SpliceRead, T: Timer>(
     recv: &mut Recv<R>,

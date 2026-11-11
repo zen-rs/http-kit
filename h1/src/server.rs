@@ -23,7 +23,7 @@ use bytes::{Bytes, BytesMut};
 use futures_lite::future::{or, poll_once};
 use http::{HeaderValue, Method, StatusCode, Version, response};
 use http_kit::{Body, Request, Response};
-use http_kit_io::{Read, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write};
+use http_kit_io::{ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write};
 
 use crate::{
     Error, ParseError, ServerConfig, Timeout, Upgraded, body,
@@ -109,7 +109,7 @@ impl<R, W, T> std::fmt::Debug for ServerConnection<R, W, T> {
 
 impl<R, W, T> ServerConnection<R, W, T>
 where
-    R: Read + SpliceRead,
+    R: ReadOwned + SpliceRead,
     W: Write + SendFile + SpliceWrite,
     T: Timer,
 {
@@ -424,7 +424,7 @@ where
 
 impl<R, W, T> ServerConnection<R, W, T>
 where
-    R: Read + SpliceRead,
+    R: ReadOwned + SpliceRead,
     W: Write + SendFile + SpliceWrite,
     T: Timer,
 {

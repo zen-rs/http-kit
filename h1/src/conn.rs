@@ -16,7 +16,8 @@ use futures_lite::{
 };
 use http_kit::{Body, BodyFrame, PipeOffer};
 use http_kit_io::{
-    BufResult, IntoInner as _, IoBuf as _, Read, SendFile, SpliceRead, SpliceWrite, Timer, Write,
+    BufResult, IntoInner as _, IoBuf as _, ReadOwned, Received, SendFile, SpliceRead, SpliceWrite,
+    Timer, Write,
 };
 
 use crate::{
@@ -39,7 +40,7 @@ pub(crate) struct Recv<R> {
     read_size: usize,
 }
 
-impl<R: Read> Recv<R> {
+impl<R: ReadOwned> Recv<R> {
     pub(crate) fn new(reader: R, read_size: usize) -> Self {
         Self {
             reader,
@@ -51,11 +52,26 @@ impl<R: Read> Recv<R> {
     /// Reads more bytes onto the end of the buffer, returning how many; `0`
     /// is the end of the stream.
     ///
-    /// The read lands in the buffer's spare capacity, and the bytes are
-    /// later split off that same allocation, so nothing received is copied.
-    /// If this future is dropped mid-read, the buffer goes with it; the
-    /// connection is unusable then and must close.
+    /// A stream that lends its own receive buffer has the bytes copied onto
+    /// the end of this one and gets its buffer back at once, so the
+    /// connection reserves room only for bytes that arrived. Otherwise the
+    /// read lands in the buffer's spare capacity, and the bytes are later
+    /// split off that same allocation, so nothing received is copied; if this
+    /// future is dropped mid-read then, the buffer goes with it, and the
+    /// connection is unusable and must close.
     pub(crate) async fn fill(&mut self) -> Result<usize, Error> {
+        loop {
+            match self.reader.read_owned().await {
+                Ok(Received::Lent(bytes)) => {
+                    self.buf.extend_from_slice(&bytes);
+                    return Ok(bytes.len());
+                }
+                Ok(Received::End) => return Ok(0),
+                Ok(Received::ReadInstead) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         self.buf.reserve(self.read_size.max(1));
         let mut buf = mem::take(&mut self.buf);
         loop {
@@ -305,7 +321,7 @@ pub(crate) enum Pumped {
 /// A demand that carries a [`PipeOffer`] is answered with a pipe frame when
 /// the socket can splice, nothing is buffered and the decoder is in a raw
 /// run; every other frame is data or trailers, whatever was offered.
-pub(crate) async fn pump_body<R: Read + SpliceRead, T: Timer, F: Future<Output = ()>>(
+pub(crate) async fn pump_body<R: ReadOwned + SpliceRead, T: Timer, F: Future<Output = ()>>(
     recv: &mut Recv<R>,
     mut decoder: BodyDecoder,
     limits: &Limits,
@@ -349,7 +365,7 @@ pub(crate) async fn pump_body<R: Read + SpliceRead, T: Timer, F: Future<Output =
 /// Each time the decoder needs bytes it first offers the socket to the
 /// consumer's pipe: a chunk's data, for one, starts right after the chunk-size
 /// line that was just decoded, with nothing buffered.
-async fn next_frame<R: Read + SpliceRead, T: Timer>(
+async fn next_frame<R: ReadOwned + SpliceRead, T: Timer>(
     recv: &mut Recv<R>,
     decoder: &mut BodyDecoder,
     limits: &Limits,

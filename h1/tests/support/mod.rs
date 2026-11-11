@@ -18,8 +18,8 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use http_kit_io::{
-    BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, SpliceRead, SpliceWrite, Timer,
-    Write,
+    BufResult, IoBuf, IoBufMut, IoVectoredBuf, NoBuf, Read, ReadOwned, Received, SendFile,
+    SpliceRead, SpliceWrite, Timer, Write,
 };
 
 /// A timer whose deadlines never pass, for tests that run no timeouts.
@@ -190,6 +190,16 @@ impl Read for PipeReader {
             .expect("the data fits the room the caller gave");
         self.pending.drain(..n);
         BufResult(Ok(n), buf)
+    }
+}
+
+/// The reads land in the caller's buffer, which is what the reads it records
+/// are about.
+impl ReadOwned for PipeReader {
+    type Buf = NoBuf;
+
+    async fn read_owned(&mut self) -> io::Result<Received<NoBuf>> {
+        Ok(Received::ReadInstead)
     }
 }
 

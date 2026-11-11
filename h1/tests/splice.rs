@@ -31,8 +31,8 @@ use http_kit_h1::{
     ClientConfig, ClientOutcome, ServerConfig, ServerConnection, ServerOutcome, Service, handshake,
 };
 use http_kit_io::{
-    BufResult, Dial, IoBuf, IoBufMut, IoVectoredBuf, Listen, Listener as _, Read, SendFile,
-    SpliceRead, SpliceWrite, Split, Timer, Write,
+    BufResult, Dial, IoBuf, IoBufMut, IoVectoredBuf, Listen, Listener as _, Read, ReadOwned,
+    Received, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write,
     splice::{FilledPipe, Pipe, Spliced},
 };
 
@@ -67,6 +67,14 @@ struct SpyRead<R> {
 impl<R: Read> Read for SpyRead<R> {
     fn read<B: IoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
         self.inner.read(buf)
+    }
+}
+
+impl<R: ReadOwned> ReadOwned for SpyRead<R> {
+    type Buf = R::Buf;
+
+    fn read_owned(&mut self) -> impl Future<Output = io::Result<Received<R::Buf>>> {
+        self.inner.read_owned()
     }
 }
 
