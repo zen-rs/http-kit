@@ -1336,6 +1336,86 @@ mod compio {
         );
     }
 
+    /// A round that fails after part of it reached the socket reports the
+    /// part that did, as any write does, and leaves the error to the next
+    /// call: reported as the round's result, a retried error (`Interrupted`,
+    /// which `send_file_all` retries at the same offset) would send those
+    /// bytes twice.
+    ///
+    /// The peer reads nothing and both socket buffers are at their minimum,
+    /// so the round's pipe drains only partly before the socket is full;
+    /// the peer then resets the connection, which fails the rest.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn send_file_reports_what_it_sent_before_failing() {
+        use std::{sync::mpsc, time::Duration};
+
+        use http_kit_io::{BufResult, Listen as _, Listener as _, SendFile as _};
+
+        // Below the kernel's minimum, which each buffer is raised to
+        // (`SOCK_MIN_SNDBUF`, `SOCK_MIN_RCVBUF`), far below a pipe's 64 KiB.
+        const BUFFER: usize = 1;
+
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("compio-reset-peer");
+        let contents = super::payload();
+        std::fs::write(&path, &contents).expect("write the file to send");
+        let file = std::rc::Rc::new(std::fs::File::open(&path).expect("open the file to send"));
+
+        let (reset, resets) = mpsc::channel::<()>();
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let addr = addr_rx.recv().expect("listener address");
+            let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                .expect("peer socket");
+            socket
+                .set_recv_buffer_size(BUFFER)
+                .expect("peer receive buffer");
+            socket
+                .connect(&socket2::SockAddr::from(addr))
+                .expect("connect");
+            resets.recv().expect("reset");
+            // A zero linger closes with a reset.
+            socket
+                .set_linger(Some(Duration::ZERO))
+                .expect("zero linger");
+        });
+
+        let (first, next) = run(async {
+            let io = http_kit_io::compio::Compio::default();
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
+            addr_tx
+                .send(listener.local_addr().expect("local address"))
+                .expect("send address");
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            socket2::SockRef::from(&stream)
+                .set_send_buffer_size(BUFFER)
+                .expect("send buffer");
+            let send = stream.send_file(file.clone(), 0, contents.len());
+            let watch = async {
+                // The round fills its pipe and waits on the full socket.
+                ::compio::time::sleep(Duration::from_millis(300)).await;
+                reset.send(()).expect("reset the peer");
+            };
+            let (BufResult(first, _), ()) = futures_lite::future::zip(send, watch).await;
+            let sent = *first.as_ref().expect("the round reports what it sent");
+            let BufResult(next, _) = stream
+                .send_file(file.clone(), sent as u64, contents.len() - sent)
+                .await;
+            (sent, next)
+        });
+        peer.join().expect("peer thread");
+        std::fs::remove_file(&path).expect("remove the sent file");
+        assert!(
+            first > 0 && first < contents.len(),
+            "part of the region was sent: {first} of {} bytes",
+            contents.len()
+        );
+        assert!(
+            next.is_err(),
+            "the next call reports the reset connection: {next:?}"
+        );
+    }
+
     /// A buffer that records when it is dropped.
     #[cfg(target_os = "linux")]
     struct Tracked {
