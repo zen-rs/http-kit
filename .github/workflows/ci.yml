@@ -7,8 +7,6 @@ permissions:
 on:
   pull_request:
     branches: ["**"]
-  # release-plz opens its pull request under GITHUB_TOKEN, which starts no
-  # workflow, so the release workflow dispatches CI on the release branch.
   workflow_dispatch:
 
 concurrency:
