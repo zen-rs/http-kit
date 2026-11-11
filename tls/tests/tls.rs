@@ -401,6 +401,24 @@ impl<W: SendFile> SendFile for CountingWrite<W> {
     }
 }
 
+impl<W: http_kit_io::SpliceWrite> http_kit_io::SpliceWrite for CountingWrite<W> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        self.inner.can_splice()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_from_pipe(
+        &mut self,
+        filled: http_kit_io::splice::FilledPipe,
+    ) -> io::Result<http_kit_io::splice::Pipe> {
+        let len = filled.len();
+        let pipe = self.inner.splice_from_pipe(filled).await?;
+        self.add(&Ok(len), false);
+        Ok(pipe)
+    }
+}
+
 #[cfg(unix)]
 impl<W: http_kit_io::WriteControl> http_kit_io::WriteControl for CountingWrite<W> {
     fn write_control<B: IoBuf, C: IoBuf>(
