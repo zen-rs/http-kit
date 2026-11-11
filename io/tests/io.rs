@@ -937,13 +937,18 @@ mod compio {
     #[cfg(target_os = "linux")]
     #[test]
     fn one_accept_submission_serves_many_connections() {
-        use http_kit_io::{Listen as _, Listener as _, Timer as _, compio::Compio};
+        use http_kit_io::{
+            Listen as _, Listener as _, Timer as _,
+            compio::{Compio, FileTable},
+        };
 
         const CONNECTIONS: usize = 32;
         run(async {
             // The driver arms a poll on its own wake-up eventfd the first time
-            // it parks; park it once so that submission is not counted.
-            let io = Compio::default();
+            // it parks; park it once so that submission is not counted. Each
+            // stream would take a slot in the file table with a submission
+            // of its own; this counts accepts alone.
+            let io = Compio::default().with_file_table(FileTable::new(0));
             io.sleep(std::time::Duration::from_millis(1)).await;
 
             let listener = io.bind_tcp(super::loopback()).expect("bind");
@@ -1054,6 +1059,9 @@ mod compio {
                 }
             })
             .await;
+            // The stream takes its slot with a submission of its own; count
+            // from once it holds it, so the receive is armed on the slot.
+            until_held(&socket_name(&stream), 1).await;
             let before = submitted();
             let mut received = Vec::with_capacity(data.len());
             let mut reads = 0;
@@ -1471,7 +1479,7 @@ mod compio {
         let sent = data.clone();
         run(async move {
             let setting = ZeroCopySend::new(sent.len() + 1);
-            let io = Compio::with_zero_copy(setting.clone());
+            let io = Compio::default().with_zero_copy(setting.clone());
             let listener = io.bind_tcp(super::loopback()).expect("bind");
             addr_tx
                 .send(listener.local_addr().expect("local address"))
@@ -1500,6 +1508,243 @@ mod compio {
         expected.extend_from_slice(&data);
         expected.extend_from_slice(&[0; 64 * 1024]);
         super::assert_bytes(&received, &expected);
+    }
+
+    /// The name the kernel gives a socket's file, as `/proc` lists it.
+    #[cfg(target_os = "linux")]
+    fn socket_name(socket: &impl std::os::fd::AsFd) -> String {
+        use std::os::fd::AsRawFd as _;
+
+        let link = format!("/proc/self/fd/{}", socket.as_fd().as_raw_fd());
+        std::fs::read_link(link)
+            .expect("socket link")
+            .into_os_string()
+            .into_string()
+            .expect("socket name")
+    }
+
+    /// How many slots of the current ring's file table hold the file named
+    /// `name`, as the kernel lists them (`io_uring_show_fdinfo`).
+    #[cfg(target_os = "linux")]
+    fn slots_holding(name: &str) -> usize {
+        use std::os::fd::AsRawFd as _;
+
+        let ring = ::compio::runtime::Runtime::with_current(|runtime| runtime.as_raw_fd());
+        let info =
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{ring}")).expect("ring fdinfo");
+        info.lines()
+            .skip_while(|line| !line.starts_with("UserFiles:"))
+            .skip(1)
+            .take_while(|line| {
+                line.split(':')
+                    .next()
+                    .is_some_and(|slot| slot.trim().parse::<u32>().is_ok())
+            })
+            .filter(|line| line.trim_end().ends_with(name))
+            .count()
+    }
+
+    /// Waits until `held` slots hold the file named `name`.
+    #[cfg(target_os = "linux")]
+    async fn until_held(name: &str, held: usize) {
+        within(std::time::Duration::from_secs(5), "the file table", async {
+            while slots_holding(name) != held {
+                ::compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+    }
+
+    /// Once a stream holds its slot, its operations name the socket by it:
+    /// with the descriptor pointed elsewhere, the multishot receive, copying
+    /// and zero-copy sends and the shutdown still reach the socket. Dropping
+    /// the stream gives the slot back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stream_operates_through_its_registered_slot() {
+        use std::{
+            io::{Read as _, Write as _},
+            os::fd::{AsFd as _, AsRawFd as _},
+        };
+
+        use http_kit_io::{BufResult, Listen as _, Listener as _, Read as _, Write as _};
+
+        let greeting = "你好 こんにちは 안녕하세요".as_bytes();
+        let data = super::payload()[..256 * 1024].to_vec();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let addr = addr_rx.recv().expect("listener address");
+            let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+            stream.write_all(greeting).expect("greet");
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).expect("read");
+            received
+        });
+
+        let sent = data.clone();
+        run(async move {
+            let io = http_kit_io::compio::Compio::default();
+            assert!(sent.len() >= io.zero_copy().threshold());
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
+            addr_tx
+                .send(listener.local_addr().expect("local address"))
+                .expect("send address");
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let name = socket_name(&stream);
+            until_held(&name, 1).await;
+
+            let null = std::fs::File::open("/dev/null").expect("/dev/null");
+            // SAFETY: the stream's descriptor stays open, on /dev/null from
+            // here on, and the stream closes it when dropped.
+            let duped = unsafe { libc::dup2(null.as_raw_fd(), stream.as_fd().as_raw_fd()) };
+            assert_ne!(duped, -1, "dup2: {}", std::io::Error::last_os_error());
+
+            let mut echoed = Vec::new();
+            while echoed.len() < greeting.len() {
+                let BufResult(res, buf) = stream.read(Vec::with_capacity(64)).await;
+                assert_ne!(res.expect("read through the slot"), 0, "early end");
+                echoed.extend_from_slice(&buf);
+            }
+            let BufResult(res, _) = stream.write_all_owned([echoed]).await;
+            res.expect("copying write through the slot");
+            let BufResult(res, kept) = stream.write_all_owned([sent]).await;
+            res.expect("zero-copy write through the slot");
+            assert!(kept.is_none(), "the write was not zero-copy");
+            http_kit_io::Write::shutdown(&mut stream)
+                .await
+                .expect("shutdown through the slot");
+            drop(stream);
+            until_held(&name, 0).await;
+        });
+        let mut expected = greeting.to_vec();
+        expected.extend_from_slice(&data);
+        super::assert_bytes(&peer.join().expect("peer thread"), &expected);
+    }
+
+    /// A socket the ring's table has no room for stays on its descriptor and
+    /// works as any other.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_the_table_has_no_room_for_uses_its_descriptor() {
+        use std::io::{Read as _, Write as _};
+
+        use http_kit_io::{
+            BufResult, Listen as _, Listener as _, Read as _, Write as _,
+            compio::{Compio, FileTable},
+        };
+
+        let greeting = "世界 せかい 세계".as_bytes();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let peers = std::thread::spawn(move || {
+            let addr = addr_rx.recv().expect("listener address");
+            let peers = [(); 2].map(|()| {
+                let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+                stream.write_all(greeting).expect("greet");
+                stream
+            });
+            peers.map(|mut stream| {
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).expect("read");
+                received
+            })
+        });
+
+        run(async move {
+            let io = Compio::default().with_file_table(FileTable::new(1));
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
+            addr_tx
+                .send(listener.local_addr().expect("local address"))
+                .expect("send address");
+            let (first, _) = listener.accept().await.expect("accept");
+            let (second, _) = listener.accept().await.expect("accept");
+            let names = [socket_name(&first), socket_name(&second)];
+            within(
+                std::time::Duration::from_secs(5),
+                "a slot for one of the sockets",
+                async {
+                    while names.iter().map(|name| slots_holding(name)).sum::<usize>() == 0 {
+                        ::compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                },
+            )
+            .await;
+            // Both installers have run by now; the one that came second found
+            // the table full.
+            ::compio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let held = names.each_ref().map(|name| slots_holding(name));
+            assert_eq!(held.iter().sum::<usize>(), 1, "slots held: {held:?}");
+
+            for mut stream in [first, second] {
+                let mut echoed = Vec::new();
+                while echoed.len() < greeting.len() {
+                    let BufResult(res, buf) = stream.read(Vec::with_capacity(64)).await;
+                    assert_ne!(res.expect("read"), 0, "early end");
+                    echoed.extend_from_slice(&buf);
+                }
+                let BufResult(res, _) = stream.write_all_owned([echoed]).await;
+                res.expect("write");
+                http_kit_io::Write::shutdown(&mut stream)
+                    .await
+                    .expect("shutdown");
+            }
+        });
+        for received in peers.join().expect("peer thread") {
+            super::assert_bytes(&received, greeting);
+        }
+    }
+
+    /// A table the kernel refuses to register is the stream's error, not a
+    /// silent loss of the slot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_table_the_kernel_refuses_fails_the_stream() {
+        use std::io::Read as _;
+
+        use http_kit_io::{
+            BufResult, Listen as _, Listener as _, Write as _,
+            compio::{Compio, FileTable},
+        };
+
+        /// One slot more than any ring may register (`IORING_MAX_FIXED_FILES`,
+        /// `io_uring/rsrc.h`).
+        const SLOTS: u32 = (1 << 20) + 1;
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let addr = addr_rx.recv().expect("listener address");
+            let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+            let mut received = Vec::new();
+            // The stream may end in a reset once it fails.
+            let _ = stream.read_to_end(&mut received);
+        });
+
+        run(async move {
+            let io = Compio::default().with_file_table(FileTable::new(SLOTS));
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
+            addr_tx
+                .send(listener.local_addr().expect("local address"))
+                .expect("send address");
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let error = within(
+                std::time::Duration::from_secs(5),
+                "the refused table",
+                async {
+                    loop {
+                        let BufResult(res, _) = stream.write(b"x".to_vec()).await;
+                        if let Err(error) = res {
+                            break error;
+                        }
+                        ::compio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                },
+            )
+            .await;
+            assert!(
+                error.to_string().contains("registering a file table"),
+                "unexpected error: {error}"
+            );
+        });
+        peer.join().expect("peer thread");
     }
 }
 
