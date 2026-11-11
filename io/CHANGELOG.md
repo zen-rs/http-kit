@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/zen-rs/http-kit/compare/io/v0.4.0...io/v0.5.0) - 2026-11-11
+
+### Added
+
+- *(tls)* [**breaking**] splice on kernel TLS connections
+- *(io)* socket-to-socket splice through a pipe
+
+### Fixed
+
+- *(io)* build the pipe types without a runtime feature
+- *(io)* splice into a socket without holding a kernel worker
+
 ## [0.4.0](https://github.com/zen-rs/http-kit/compare/io/v0.3.2...io/v0.4.0) - 2026-11-10
 
 ### Added
