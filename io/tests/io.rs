@@ -932,6 +932,8 @@ mod compio {
             assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), number) }, number);
             #[cfg(target_os = "linux")]
             {
+                use super::SendFile as _;
+
                 let mut stream = stream;
                 let _ = stream.send_file(super::Rc::new(file), 0, 64).await;
             }
