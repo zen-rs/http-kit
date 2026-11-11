@@ -144,44 +144,20 @@ impl Outbox {
         self.bufs.len() >= MAX_WRITE_BUFFERS
     }
 
-    /// Writes everything queued.
+    /// Writes everything queued. The buffers go to the writer, which may
+    /// keep them until the kernel has sent them (a zero-copy send); a writer
+    /// that hands them back has their allocation reused for the next message.
     pub(crate) async fn flush<W: Write>(&mut self, writer: &mut W) -> Result<(), Error> {
-        let mut bufs = mem::take(&mut self.bufs);
-        while !bufs.is_empty() {
-            let BufResult(result, returned) = writer.write_vectored(bufs).await;
-            bufs = returned;
-            let mut written = match result {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "stream accepted no bytes",
-                    )
-                    .into());
-                }
-                Ok(n) => n,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let done = bufs
-                .iter()
-                .take_while(|buf| {
-                    if written >= buf.len() {
-                        written -= buf.len();
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .count();
-            bufs.drain(..done);
-            if written > 0 {
-                let first = &mut bufs[0];
-                *first = Bytes::slice(first, written..);
-            }
+        if self.bufs.is_empty() {
+            return Ok(());
         }
-        // Hand the allocation back for the next message.
-        self.bufs = bufs;
-        Ok(())
+        let bufs = mem::take(&mut self.bufs);
+        let BufResult(result, returned) = writer.write_all_owned(bufs).await;
+        if let Some(mut bufs) = returned {
+            bufs.clear();
+            self.bufs = bufs;
+        }
+        result.map_err(Error::from)
     }
 }
 
