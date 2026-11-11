@@ -11,6 +11,10 @@
 //! # Traits
 //!
 //! - [`Read`], [`Write`], [`Split`] and [`Listener`]: stream sockets.
+//! - [`ReadOwned`]: reads that lend the stream's own receive buffer (a ring
+//!   buffer the kernel received into, on io_uring), and [`ReadAhead`] to stop
+//!   a stream receiving ahead of its reader before the kernel takes the
+//!   socket.
 //! - [`StreamSocket`]: the bounds a connected stream carries for the protocol
 //!   crates.
 //! - [`TcpOptions`]: socket options of a connected TCP stream.
@@ -85,7 +89,10 @@ pub use crate::{
     poll::{CopyingPoll, IntoPoll},
     resolve::{Answer, Family, Resolve},
     splice::{SpliceRead, SpliceWrite},
-    stream::{Listener, Read, ReadHalf, SendFile, Split, TcpOptions, Write, WriteHalf},
+    stream::{
+        Listener, NoBuf, Read, ReadAhead, ReadHalf, ReadOwned, Received, SendFile, Split,
+        TcpOptions, Write, WriteHalf,
+    },
     time::Timer,
 };
 
@@ -98,12 +105,20 @@ pub use crate::stream::WriteControl;
 /// It is the bound the protocol crates put on the halves of a stream, named
 /// once. It is implemented for every type that meets it.
 pub trait StreamSocket:
-    Read + Write + Split<ReadHalf: SpliceRead, WriteHalf: SendFile + SpliceWrite> + 'static
+    ReadOwned
+    + ReadAhead
+    + Write
+    + Split<ReadHalf: ReadOwned + ReadAhead + SpliceRead, WriteHalf: SendFile + SpliceWrite>
+    + 'static
 {
 }
 
 impl<S> StreamSocket for S where
-    S: Read + Write + Split<ReadHalf: SpliceRead, WriteHalf: SendFile + SpliceWrite> + 'static
+    S: ReadOwned
+        + ReadAhead
+        + Write
+        + Split<ReadHalf: ReadOwned + ReadAhead + SpliceRead, WriteHalf: SendFile + SpliceWrite>
+        + 'static
 {
 }
 

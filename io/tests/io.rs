@@ -990,6 +990,199 @@ mod compio {
         });
     }
 
+    /// A runtime whose provided buffer ring has `buffers` buffers of `len`
+    /// bytes each.
+    #[cfg(target_os = "linux")]
+    fn run_with_ring<F: Future>(buffers: u16, len: usize, future: F) -> F::Output {
+        let mut proactor = ::compio::driver::ProactorBuilder::new();
+        proactor
+            .buffer_pool_size(std::num::NonZeroU16::new(buffers).expect("a ring has buffers"))
+            .buffer_pool_buffer_len(len);
+        ::compio::runtime::RuntimeBuilder::new()
+            .with_proactor(proactor)
+            .build()
+            .expect("compio runtime")
+            .block_on(future)
+    }
+
+    /// One accepted connection, with the peer on a thread of its own.
+    #[cfg(target_os = "linux")]
+    async fn accept_one(
+        peer: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> (http_kit_io::compio::TcpStream, std::thread::JoinHandle<()>) {
+        use http_kit_io::{Listen as _, Listener as _, compio::Compio};
+
+        let listener = Compio.bind_tcp(super::loopback()).expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let peer =
+            std::thread::spawn(move || peer(std::net::TcpStream::connect(addr).expect("connect")));
+        let (stream, _) = listener.accept().await.expect("accept");
+        (stream, peer)
+    }
+
+    /// One multishot receive serves every read of a connection. The ring
+    /// holds a quarter of what the connection carries, so each buffer must
+    /// go back to it as soon as its bytes are read; a buffer kept would run
+    /// the ring dry, end the receive and take a submission to arm it again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_receive_submission_serves_many_reads() {
+        use std::io::{Read as _, Write as _};
+
+        use http_kit_io::{ReadOwned as _, Received, Timer as _, compio::Compio};
+
+        const BUFFERS: u16 = 4;
+        const BUFFER_LEN: usize = 4096;
+        const MESSAGE: usize = 1024;
+        const MESSAGES: usize = 64;
+
+        let data = super::payload()[..MESSAGE * MESSAGES].to_vec();
+        let sent = data.clone();
+        run_with_ring(BUFFERS, BUFFER_LEN, async move {
+            // The driver arms a poll on its own wake-up eventfd the first time
+            // it parks; park it once so that submission is not counted.
+            Compio.sleep(std::time::Duration::from_millis(1)).await;
+            // Each message waits for the one before it to be read, so the
+            // receive always finds a free buffer.
+            let (mut stream, peer) = accept_one(move |mut client| {
+                for message in sent.chunks(MESSAGE) {
+                    client.write_all(message).expect("send");
+                    client.read_exact(&mut [0]).expect("wait for the read");
+                }
+            })
+            .await;
+            let before = submitted();
+            let mut received = Vec::with_capacity(data.len());
+            let mut reads = 0;
+            while received.len() < data.len() {
+                let Received::Lent(buf) = stream.read_owned().await.expect("read") else {
+                    panic!("the ring ran dry or the peer closed early");
+                };
+                reads += 1;
+                received.extend_from_slice(&buf);
+                drop(buf);
+                if received.len() % MESSAGE == 0 {
+                    // The acknowledgement is a send, which is a submission;
+                    // count it out.
+                    let ack = submitted();
+                    let http_kit_io::BufResult(res, _) =
+                        http_kit_io::Write::write(&mut stream, vec![0]).await;
+                    res.expect("acknowledge");
+                    assert_eq!(submitted() - ack, 1, "an acknowledgement is one send");
+                }
+            }
+            let acks = u32::try_from(MESSAGES).expect("message count");
+            assert_eq!(
+                submitted() - before - acks,
+                1,
+                "receive submissions for {reads} reads"
+            );
+            assert!(reads >= MESSAGES, "{reads} reads");
+            super::assert_bytes(&received, &data);
+            peer.join().expect("peer thread");
+        });
+    }
+
+    /// A connection that carries far more than the ring holds, sent as fast
+    /// as the peer can, completes: buffers go back to the ring as they are
+    /// read, and a read that finds the ring dry receives into the caller's
+    /// buffer instead. Reads smaller than a ring buffer take it in parts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_connection_reads_more_than_the_ring_holds() {
+        use std::io::Write as _;
+
+        let data = super::payload();
+        let sent = data.clone();
+        run_with_ring(2, 4096, async move {
+            let (mut stream, peer) = accept_one(move |mut client| {
+                client.write_all(&sent).expect("send");
+            })
+            .await;
+            let mut received = Vec::with_capacity(data.len());
+            let mut buf = Vec::with_capacity(1500);
+            loop {
+                let http_kit_io::BufResult(res, filled) =
+                    http_kit_io::Read::read(&mut stream, buf).await;
+                if res.expect("read") == 0 {
+                    break;
+                }
+                received.extend_from_slice(&filled);
+                buf = filled;
+            }
+            super::assert_bytes(&received, &data);
+            peer.join().expect("peer thread");
+        });
+    }
+
+    /// A splice from a socket that has received ahead of its reader moves
+    /// those bytes first, so it never passes them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_splice_takes_the_bytes_received_ahead_first() {
+        use std::io::Write as _;
+
+        use http_kit_io::{
+            SpliceRead as _,
+            splice::{Pipe, Spliced},
+        };
+
+        let data = "世界 せかい 세계 ".repeat(512).into_bytes();
+        let sent = data.clone();
+        run_with_ring(8, 4096, async move {
+            let (mut stream, peer) = accept_one(move |mut client| {
+                client.write_all(&sent).expect("send");
+            })
+            .await;
+            // A small read leaves the rest of its ring buffer held.
+            let http_kit_io::BufResult(res, head) =
+                http_kit_io::Read::read(&mut stream, Vec::with_capacity(10)).await;
+            assert_eq!(res.expect("read"), 10);
+            let mut received = head;
+            let mut pipe = Pipe::new().expect("pipe");
+            loop {
+                match stream.splice_to_pipe(pipe, usize::MAX).await {
+                    Ok(Spliced::Filled(filled)) => {
+                        let (bytes, empty) = filled.read_out().expect("read the pipe");
+                        received.extend_from_slice(&bytes);
+                        pipe = empty;
+                    }
+                    Ok(Spliced::End(_)) => break,
+                    Err((error, _)) => panic!("splice: {error}"),
+                }
+            }
+            super::assert_bytes(&received, &data);
+            peer.join().expect("peer thread");
+        });
+    }
+
+    /// Stopping the read-ahead hands back what was received and not read,
+    /// and the reads after it continue from the socket where that ended.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopping_read_ahead_hands_back_what_was_received() {
+        use std::io::Write as _;
+
+        use http_kit_io::ReadAhead as _;
+
+        let data = "世界 せかい 세계 ".repeat(4096).into_bytes();
+        let sent = data.clone();
+        run_with_ring(8, 4096, async move {
+            let (mut stream, peer) = accept_one(move |mut client| {
+                client.write_all(&sent).expect("send");
+            })
+            .await;
+            let http_kit_io::BufResult(res, head) =
+                http_kit_io::Read::read(&mut stream, Vec::with_capacity(10)).await;
+            assert_eq!(res.expect("read"), 10);
+            let mut received = head;
+            received.extend_from_slice(&stream.stop_read_ahead().await);
+            received.extend_from_slice(&super::read_to_end(&mut stream).await);
+            super::assert_bytes(&received, &data);
+            peer.join().expect("peer thread");
+        });
+    }
+
     /// The io-wq workers of this process that are doing something other than
     /// waiting for work, each as its thread id and kernel wait channel.
     #[cfg(any(target_os = "linux", target_os = "android"))]

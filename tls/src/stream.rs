@@ -5,8 +5,8 @@ use std::{borrow::Borrow, fmt, fs::File, future::Future, io};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use http_kit_io::splice::{FilledPipe, Pipe, Spliced};
 use http_kit_io::{
-    BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, SpliceRead, SpliceWrite, Split,
-    Write,
+    BufResult, IoBuf, IoBufMut, IoVectoredBuf, NoBuf, Read, ReadOwned, Received, SendFile,
+    SpliceRead, SpliceWrite, Split, Write,
 };
 use rustls::{ProtocolVersion, SupportedCipherSuite};
 
@@ -86,6 +86,12 @@ pub trait KernelRead<R, D: Side>: Sized {
     #[cfg(all(target_os = "linux", feature = "kernel"))]
     fn adopt(reader: crate::kernel::linux::Reader<R, D>) -> Self;
 
+    /// [`ReadAhead::stop_read_ahead`](http_kit_io::ReadAhead::stop_read_ahead)
+    /// on the socket's reading half before the kernel takes it; reached only
+    /// where [`SOCKET`](Self::SOCKET).
+    #[cfg(all(target_os = "linux", feature = "kernel"))]
+    fn stop_read_ahead(reader: &mut R) -> impl Future<Output = Vec<u8>>;
+
     fn get_ref(&self) -> &R;
 
     fn read<B: IoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
@@ -139,6 +145,11 @@ impl<R, D: Side> KernelRead<R, D> for Never {
     #[cfg(all(target_os = "linux", feature = "kernel"))]
     fn adopt(_reader: crate::kernel::linux::Reader<R, D>) -> Self {
         unreachable!("only a socket's reading half is adopted by the kernel")
+    }
+
+    #[cfg(all(target_os = "linux", feature = "kernel"))]
+    async fn stop_read_ahead(_reader: &mut R) -> Vec<u8> {
+        unreachable!("only a socket's reading half is handed to the kernel")
     }
 
     fn get_ref(&self) -> &R {
@@ -247,7 +258,9 @@ impl<W: Write + SendFile + 'static> TransportWrite for W {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel"))]
-impl<R: Read + SpliceRead + std::os::fd::AsFd + 'static> TransportRead for R {
+impl<R: Read + http_kit_io::ReadAhead + SpliceRead + std::os::fd::AsFd + 'static> TransportRead
+    for R
+{
     type Kernel<D: Side> = crate::kernel::linux::Reader<R, D>;
 }
 
@@ -488,6 +501,16 @@ impl<R: TransportRead, D: Side> Read for TlsReadHalf<R, D> {
     }
 }
 
+/// Plaintext is decrypted into the reader's buffer: there is none of the
+/// stream's own to lend.
+impl<R: TransportRead, D: Side> ReadOwned for TlsReadHalf<R, D> {
+    type Buf = NoBuf;
+
+    async fn read_owned(&mut self) -> io::Result<Received<NoBuf>> {
+        Ok(Received::ReadInstead)
+    }
+}
+
 impl<W: TransportWrite, D: Side> Write for TlsWriteHalf<W, D> {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         match &mut self.0 {
@@ -613,6 +636,14 @@ impl<S: Transport, D: Side> Read for TlsStream<S, D> {
         buf: B,
     ) -> impl std::future::Future<Output = BufResult<usize, B>> {
         self.read.read(buf)
+    }
+}
+
+impl<S: Transport, D: Side> ReadOwned for TlsStream<S, D> {
+    type Buf = NoBuf;
+
+    fn read_owned(&mut self) -> impl Future<Output = io::Result<Received<NoBuf>>> {
+        self.read.read_owned()
     }
 }
 

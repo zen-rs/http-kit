@@ -12,6 +12,24 @@
 //! worker; on Apple platforms through `sendfile(2)` once the socket is
 //! writable. Elsewhere the region is read into a buffer and written.
 //!
+//! On Linux over io_uring a stream receives with a multishot receive into
+//! the provided buffer ring of the thread's runtime: one submission stays
+//! armed and completes once per arrival, each into a ring buffer, until the
+//! kernel ends it. A reader takes a ring buffer through
+//! [`ReadOwned`](crate::ReadOwned), or has it copied into its own through
+//! [`Read`](crate::Read); either way the buffer goes back to the ring as soon
+//! as its bytes are consumed, so an idle connection holds none. When the
+//! ring has no free buffer a read receives into the caller's buffer with a
+//! submission of its own, and the next one arms again. A splice from the
+//! socket first moves what the ring already received, so it never passes
+//! those bytes.
+//!
+//! The ring is compio's buffer pool, one per runtime: size it on the
+//! runtime's `ProactorBuilder` (`buffer_pool_size`, `buffer_pool_buffer_len`)
+//! for the connections one thread serves. Buffers are consumed whole, one per
+//! completion: compio reports no `IORING_CQE_F_BUF_MORE`, which incremental
+//! consumption (`IOU_PBUF_RING_INC`) needs.
+//!
 //! The poll-style capability is a [`CopyingPoll`]: a completion-based driver
 //! cannot read into a buffer borrowed for one poll.
 
@@ -143,6 +161,9 @@ impl<T> Fd for T {}
 /// A stream socket of compio's, which the operations below drive through a
 /// shared reference.
 trait Socket: Clone + Fd + 'static {
+    /// The descriptor, shared with an operation that outlives a call.
+    #[cfg(target_os = "linux")]
+    fn shared_fd(&self) -> ::compio::driver::SharedFd<socket2::Socket>;
     fn read<B: IoBufMut>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
     fn write<B: IoBuf>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
     fn write_vectored<B: IoVectoredBuf>(&self, buf: B)
@@ -168,6 +189,11 @@ trait Socket: Clone + Fd + 'static {
 macro_rules! impl_socket {
     ($ty:ty) => {
         impl Socket for $ty {
+            #[cfg(target_os = "linux")]
+            fn shared_fd(&self) -> ::compio::driver::SharedFd<socket2::Socket> {
+                ::compio::driver::ToSharedFd::to_shared_fd(self)
+            }
+
             async fn read<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
                 let mut stream = self;
                 AsyncRead::read(&mut stream, buf).await
@@ -242,6 +268,9 @@ pub struct Stream<S> {
     /// inside the kernel.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     nonblocking: std::cell::Cell<bool>,
+    /// The multishot receive and what it received ahead of the reader.
+    #[cfg(target_os = "linux")]
+    recv: recv::Recv,
 }
 
 impl<S> Stream<S> {
@@ -252,6 +281,8 @@ impl<S> Stream<S> {
             pipe: std::cell::Cell::new(None),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             nonblocking: std::cell::Cell::new(false),
+            #[cfg(target_os = "linux")]
+            recv: recv::Recv::default(),
         }
     }
 
@@ -339,11 +370,40 @@ impl<S: std::os::fd::AsFd> std::os::fd::AsFd for Stream<S> {
 }
 
 impl<S: Socket> SharedStream for Stream<S> {
-    async fn read<B: IoBufMut>(&self, mut buf: B) -> BufResult<usize, B> {
-        // compio writes from the start but only ever grows the length; the
-        // contract is a length of exactly what was read.
-        buf.clear();
-        self.inner.read(buf).await
+    #[cfg(target_os = "linux")]
+    type Buf = RecvBuf;
+    #[cfg(not(target_os = "linux"))]
+    type Buf = crate::NoBuf;
+
+    async fn read<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
+        #[cfg(target_os = "linux")]
+        let buf = match self.recv.read_ahead(&self.inner, buf).await {
+            recv::Copied::Done(result) => return result,
+            recv::Copied::ReadInstead(buf) => buf,
+        };
+        read_single(&self.inner, buf).await
+    }
+
+    async fn read_owned(&self) -> io::Result<crate::Received<Self::Buf>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.recv.read_owned(&self.inner).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(crate::Received::ReadInstead)
+        }
+    }
+
+    async fn stop_read_ahead(&self) -> Vec<u8> {
+        #[cfg(target_os = "linux")]
+        {
+            self.recv.stop().await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Vec::new()
+        }
     }
 
     async fn write<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
@@ -407,6 +467,14 @@ impl<S: Socket> SharedStream for Stream<S> {
             crate::stream::copy::copy_file_region(self, file, offset, len).await
         }
     }
+}
+
+/// One receive into the caller's buffer, with a submission of its own.
+async fn read_single<S: Socket, B: IoBufMut>(socket: &S, mut buf: B) -> BufResult<usize, B> {
+    // compio writes from the start but only ever grows the length; the
+    // contract is a length of exactly what was read.
+    buf.clear();
+    socket.read(buf).await
 }
 
 impl_stream!([S: Socket] Stream<S>);
@@ -575,6 +643,10 @@ mod splice {
     /// Socket to pipe: waits for readability, then one non-blocking
     /// `splice(2)`. io_uring would run the splice on an io-wq worker, which
     /// an idle peer would hold.
+    ///
+    /// What the multishot receive took from the socket ahead of the reader
+    /// goes into the pipe first, from memory; only once nothing is held, and
+    /// the receive is no longer armed to take more, does the socket splice.
     pub(super) async fn to_pipe<S: Socket + AsFd>(
         stream: &Stream<S>,
         pipe: crate::splice::Pipe,
@@ -586,6 +658,11 @@ mod splice {
                 pipe,
             ));
         }
+        #[cfg(target_os = "linux")]
+        let pipe = match stream.recv.splice_held(pipe, max).await {
+            super::recv::Held::Spliced(spliced) => return spliced,
+            super::recv::Held::None(pipe) => pipe,
+        };
         if let Err(e) = nonblocking(stream) {
             return Err((e, pipe));
         }
@@ -627,6 +704,357 @@ mod splice {
             }
         }
         Ok(filled.into_pipe())
+    }
+}
+
+/// Bytes a multishot receive put in a buffer of the runtime's ring, lent to
+/// the reader by [`ReadOwned`](crate::ReadOwned). Dropping it hands the
+/// buffer back to the ring, so a reader holds it only as long as it needs the
+/// bytes.
+#[cfg(target_os = "linux")]
+pub struct RecvBuf {
+    buf: ::compio::driver::BufferRef,
+    /// How much of the buffer was already read.
+    start: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl RecvBuf {
+    const fn new(buf: ::compio::driver::BufferRef) -> Self {
+        Self { buf, start: 0 }
+    }
+
+    const fn advance(&mut self, n: usize) {
+        self.start += n;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for RecvBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for RecvBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecvBuf")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Multishot receive on io_uring into the runtime's provided buffer ring.
+///
+/// The operation belongs to the stream, not to a read, so a read a caller
+/// abandons (one raced against a timeout) leaves it armed with whatever it
+/// already received. It is ended (cancelled, then drained, so nothing it
+/// received is lost) only before the socket goes to someone else: a splice,
+/// or for good when the reader stops reading ahead.
+#[cfg(target_os = "linux")]
+mod recv {
+    use std::{cell::RefCell, collections::VecDeque, io};
+
+    use ::compio::{
+        driver::{
+            SharedFd,
+            op::{RecvFlags, RecvMulti},
+        },
+        runtime::{
+            BufferPool, CancelToken, Runtime, StreamExt as _, SubmitMultiManaged, WithCancel,
+        },
+    };
+    use compio_buf::{BufResult, IoBufMut};
+    use futures_lite::StreamExt as _;
+
+    use super::{RecvBuf, Socket};
+    use crate::{
+        Received,
+        splice::{Pipe, Spliced},
+    };
+
+    type Op = WithCancel<SubmitMultiManaged<RecvMulti<SharedFd<socket2::Socket>>>>;
+
+    /// The receive side of one stream.
+    #[derive(Default)]
+    pub(super) struct Recv(RefCell<State>);
+
+    #[derive(Default)]
+    struct State {
+        /// The thread's ring, looked up on the first read: `Some(None)` where
+        /// there is none (the runtime is not on io_uring, or the kernel
+        /// refused the ring).
+        ring: Option<Option<BufferPool>>,
+        armed: Option<Armed>,
+        /// Bytes received ahead of the reader, in order; the first may be
+        /// partly read.
+        held: VecDeque<RecvBuf>,
+        /// How the receive ended, reported once `held` is read.
+        end: Option<End>,
+        /// The last receive ended for want of a free ring buffer: the next
+        /// read takes the caller's buffer instead of arming again at once.
+        exhausted: bool,
+        /// The reader stopped reading ahead.
+        stopped: bool,
+    }
+
+    /// The armed receive and the token that cancels it.
+    struct Armed {
+        op: Op,
+        cancel: CancelToken,
+    }
+
+    enum End {
+        /// Sticky, like the end of a socket.
+        Eof,
+        /// Reported once; the next read arms again.
+        Error(io::Error),
+    }
+
+    enum Next {
+        Buf(RecvBuf),
+        Eof,
+        ReadInstead,
+    }
+
+    /// What a copying read came to.
+    pub(super) enum Copied<B> {
+        Done(BufResult<usize, B>),
+        /// Read into the caller's buffer with a receive of its own.
+        ReadInstead(B),
+    }
+
+    /// What a splice found held.
+    pub(super) enum Held {
+        Spliced(Result<Spliced, (io::Error, Pipe)>),
+        /// Nothing: the socket holds everything not yet read.
+        None(Pipe),
+    }
+
+    impl Armed {
+        fn new<S: Socket>(socket: &S, ring: &BufferPool) -> io::Result<Self> {
+            // A length of 0 receives up to a whole ring buffer at a time.
+            let op = RecvMulti::new(socket.shared_fd(), ring, 0, RecvFlags::empty())?;
+            let cancel = CancelToken::new();
+            let op = ::compio::runtime::submit_multi(op)
+                .into_managed(ring.clone())
+                .with_cancel(cancel.clone());
+            Ok(Self { op, cancel })
+        }
+    }
+
+    /// Whether a receive ended because the ring had no free buffer: compio's
+    /// io_uring driver reports `ENOBUFS` as a [`io::ErrorKind::ResourceBusy`]
+    /// error of its own, without the OS code (compio-driver 0.12,
+    /// `create_result`), which a real `EBUSY` would carry.
+    fn ring_dry(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::ResourceBusy && error.raw_os_error().is_none()
+    }
+
+    /// The thread's ring, looked up once per stream.
+    fn ring(ring: &mut Option<Option<BufferPool>>) -> Option<BufferPool> {
+        ring.get_or_insert_with(|| {
+            Runtime::with_current(|runtime| {
+                if runtime.driver_type().is_iouring() {
+                    runtime.buffer_pool().ok()
+                } else {
+                    None
+                }
+            })
+        })
+        .clone()
+    }
+
+    impl State {
+        /// The next received bytes, waiting for them if none are held.
+        async fn next<S: Socket>(&mut self, socket: &S) -> io::Result<Next> {
+            loop {
+                if let Some(buf) = self.held.pop_front() {
+                    return Ok(Next::Buf(buf));
+                }
+                match self.end.take() {
+                    Some(End::Eof) => {
+                        self.end = Some(End::Eof);
+                        return Ok(Next::Eof);
+                    }
+                    Some(End::Error(error)) => return Err(error),
+                    None => {}
+                }
+                if self.stopped || self.exhausted {
+                    if self.armed.is_some() {
+                        self.disarm().await;
+                        continue;
+                    }
+                    self.exhausted = false;
+                    return Ok(Next::ReadInstead);
+                }
+                let armed = match &mut self.armed {
+                    Some(armed) => armed,
+                    slot @ None => {
+                        let Some(ring) = ring(&mut self.ring) else {
+                            return Ok(Next::ReadInstead);
+                        };
+                        slot.insert(Armed::new(socket, &ring)?)
+                    }
+                };
+                match armed.op.next().await {
+                    // The kernel ended the receive with its last completion:
+                    // arm another.
+                    None => self.armed = None,
+                    Some(Ok(Some(buf))) if !buf.is_empty() => {
+                        return Ok(Next::Buf(RecvBuf::new(buf)));
+                    }
+                    Some(Ok(_)) => {
+                        self.armed = None;
+                        self.end = Some(End::Eof);
+                    }
+                    Some(Err(error)) if ring_dry(&error) => {
+                        self.armed = None;
+                        self.exhausted = true;
+                    }
+                    Some(Err(error)) => {
+                        self.armed = None;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        /// Ends the armed receive, keeping everything it received.
+        async fn disarm(&mut self) {
+            while let Some(armed) = &mut self.armed {
+                if !armed.cancel.is_cancelled() {
+                    armed.cancel.clone().cancel();
+                }
+                match armed.op.next().await {
+                    None => self.armed = None,
+                    Some(Ok(Some(buf))) if !buf.is_empty() => {
+                        self.held.push_back(RecvBuf::new(buf));
+                    }
+                    Some(Ok(_)) => self.end = Some(End::Eof),
+                    Some(Err(error))
+                        if ring_dry(&error) || error.raw_os_error() == Some(libc::ECANCELED) => {}
+                    Some(Err(error)) => self.end = Some(End::Error(error)),
+                }
+            }
+        }
+    }
+
+    impl Recv {
+        /// [`Read::read`](crate::Read::read): copies what was received into
+        /// `buf`, keeping what does not fit.
+        #[expect(
+            clippy::await_holding_refcell_ref,
+            reason = "the stream's one reader holds its receive side for the read, released when the read ends or is dropped"
+        )]
+        pub(super) async fn read_ahead<S: Socket, B: IoBufMut>(
+            &self,
+            socket: &S,
+            mut buf: B,
+        ) -> Copied<B> {
+            if buf.as_uninit().is_empty() {
+                buf.clear();
+                return Copied::Done(BufResult(Ok(0), buf));
+            }
+            let mut state = self.0.borrow_mut();
+            match state.next(socket).await {
+                Ok(Next::Buf(mut held)) => {
+                    let n = copy_into(&mut buf, &held);
+                    held.advance(n);
+                    if !held.is_empty() {
+                        state.held.push_front(held);
+                    }
+                    Copied::Done(BufResult(Ok(n), buf))
+                }
+                Ok(Next::Eof) => {
+                    buf.clear();
+                    Copied::Done(BufResult(Ok(0), buf))
+                }
+                Ok(Next::ReadInstead) => Copied::ReadInstead(buf),
+                Err(error) => Copied::Done(BufResult(Err(error), buf)),
+            }
+        }
+
+        /// [`ReadOwned::read_owned`](crate::ReadOwned::read_owned).
+        #[expect(
+            clippy::await_holding_refcell_ref,
+            reason = "the stream's one reader holds its receive side for the read, released when the read ends or is dropped"
+        )]
+        pub(super) async fn read_owned<S: Socket>(
+            &self,
+            socket: &S,
+        ) -> io::Result<Received<RecvBuf>> {
+            Ok(match self.0.borrow_mut().next(socket).await? {
+                Next::Buf(buf) => Received::Lent(buf),
+                Next::Eof => Received::End,
+                Next::ReadInstead => Received::ReadInstead,
+            })
+        }
+
+        /// [`ReadAhead::stop_read_ahead`](crate::ReadAhead::stop_read_ahead).
+        #[expect(
+            clippy::await_holding_refcell_ref,
+            reason = "the stream's one reader holds its receive side while the receive drains"
+        )]
+        pub(super) async fn stop(&self) -> Vec<u8> {
+            let mut state = self.0.borrow_mut();
+            state.stopped = true;
+            state.disarm().await;
+            let mut bytes = Vec::with_capacity(state.held.iter().map(|buf| buf.len()).sum());
+            for buf in state.held.drain(..) {
+                bytes.extend_from_slice(&buf);
+            }
+            bytes
+        }
+
+        /// Puts held bytes, at most `max`, into `pipe` ahead of anything the
+        /// socket splices. With none held, ends the armed receive first, so
+        /// that the socket holds everything not yet read.
+        #[expect(
+            clippy::await_holding_refcell_ref,
+            reason = "the stream's one reader holds its receive side while the receive drains"
+        )]
+        pub(super) async fn splice_held(&self, pipe: Pipe, max: usize) -> Held {
+            let mut state = self.0.borrow_mut();
+            if state.held.is_empty() {
+                state.disarm().await;
+            }
+            if let Some(mut buf) = state.held.pop_front() {
+                let n = buf.len().min(max);
+                let filled = pipe.fill(&buf[..n]).map(|filled| {
+                    buf.advance(filled.len());
+                    Spliced::Filled(filled)
+                });
+                if !buf.is_empty() {
+                    state.held.push_front(buf);
+                }
+                return Held::Spliced(filled);
+            }
+            match state.end.take() {
+                Some(End::Eof) => {
+                    state.end = Some(End::Eof);
+                    Held::Spliced(Ok(Spliced::End(pipe)))
+                }
+                Some(End::Error(error)) => Held::Spliced(Err((error, pipe))),
+                None => Held::None(pipe),
+            }
+        }
+    }
+
+    /// Copies as much of `bytes` as fits into `buf`, from its start, and sets
+    /// its length to that.
+    fn copy_into<B: IoBufMut>(buf: &mut B, bytes: &[u8]) -> usize {
+        let room = buf.as_uninit();
+        let n = room.len().min(bytes.len());
+        // SAFETY: `room` has at least `n` bytes, and a ring buffer never
+        // overlaps the caller's.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), room.as_mut_ptr().cast(), n) };
+        // SAFETY: the first `n` bytes were initialized just now.
+        unsafe { buf.set_len(n) };
+        n
     }
 }
 

@@ -184,6 +184,8 @@ pub(crate) fn socket_addr(addr: SockAddr) -> io::Result<SocketAddr> {
 }
 
 impl<T: Ready> SharedStream for Stream<T> {
+    type Buf = crate::NoBuf;
+
     async fn read<B: IoBufMut>(&self, mut buf: B) -> BufResult<usize, B> {
         let res = self.0.read_io(|sock| sock.recv(buf.as_uninit())).await;
         if let Ok(n) = res {
@@ -191,6 +193,17 @@ impl<T: Ready> SharedStream for Stream<T> {
             unsafe { buf.set_len(n) };
         }
         BufResult(res, buf)
+    }
+
+    /// A readiness reactor receives into the caller's buffer once the socket
+    /// is readable; it has none of its own to lend.
+    async fn read_owned(&self) -> io::Result<crate::Received<crate::NoBuf>> {
+        Ok(crate::Received::ReadInstead)
+    }
+
+    /// Nothing is received before the reader asks.
+    async fn stop_read_ahead(&self) -> Vec<u8> {
+        Vec::new()
     }
 
     async fn write<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
