@@ -30,6 +30,18 @@
 //! completion: compio reports no `IORING_CQE_F_BUF_MORE`, which incremental
 //! consumption (`IOU_PBUF_RING_INC`) needs.
 //!
+//! On Linux over io_uring a TCP stream's
+//! [`write_all_owned`](crate::Write::write_all_owned) of at least
+//! [`ZeroCopySend::threshold`] bytes sends without copying
+//! (`IORING_OP_SENDMSG_ZC`): the kernel reads the bytes from the caller's
+//! buffers until the peer acknowledges them. The write returns as soon as
+//! the kernel has taken every byte; the stream keeps the buffers until the
+//! kernel's notification says it no longer reads them, and drops them then.
+//! What the kernel holds this way is bounded like any other unacknowledged
+//! data, by the socket's send buffer, which counts zero-copy pages too.
+//! Smaller writes, the other write methods, Unix-domain streams (which the
+//! kernel does not send zero-copy) and every other platform copy.
+//!
 //! The poll-style capability is a [`CopyingPoll`]: a completion-based driver
 //! cannot read into a buffer borrowed for one poll.
 
@@ -60,10 +72,89 @@ use crate::{
 #[cfg(unix)]
 use crate::{DialUnix, FromStdUnix, ListenUnix};
 
-/// The compio implementation. It holds nothing: compio keeps its runtime per
-/// thread, and every operation goes to the current thread's.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Compio;
+/// The compio implementation. compio keeps its runtime per thread, and every
+/// operation goes to the current thread's; this holds only the
+/// [`ZeroCopySend`] setting, which every stream it creates or adopts shares.
+#[derive(Debug, Clone, Default)]
+pub struct Compio {
+    zero_copy: ZeroCopySend,
+}
+
+impl Compio {
+    /// An implementation whose streams send zero-copy as `zero_copy` says.
+    #[must_use]
+    pub const fn with_zero_copy(zero_copy: ZeroCopySend) -> Self {
+        Self { zero_copy }
+    }
+
+    /// The zero-copy setting its streams share.
+    #[must_use]
+    pub const fn zero_copy(&self) -> &ZeroCopySend {
+        &self.zero_copy
+    }
+
+    /// Adopts a connected compio stream: one a runtime of this thread
+    /// registered, such as a socket accepted elsewhere and handed over as a
+    /// std stream (on Windows a socket joins one completion port only, so a
+    /// thread-per-core server accepts where no port is involved and each
+    /// thread adopts its share).
+    #[must_use]
+    pub fn tcp_stream(&self, stream: net::TcpStream) -> TcpStream {
+        TcpStream::new(stream, self.zero_copy.clone())
+    }
+}
+
+/// When a write goes out through io_uring's zero-copy send: from
+/// [`threshold`](Self::threshold) bytes up, on Linux.
+///
+/// It is the operator's runtime-adjustable handle: every clone shares one
+/// value, across threads, and a change applies to the next write of every
+/// stream holding a clone. A threshold of `0` sends every such write
+/// zero-copy; `usize::MAX` none.
+///
+/// A zero-copy send pins the pages it sends until the peer acknowledges
+/// them, and io_uring charges them to the user's `RLIMIT_MEMLOCK` unless the
+/// process has `CAP_IPC_LOCK` (`io_notif_account_mem`). When that limit is
+/// reached the kernel refuses the send before sending anything, and the write
+/// copies instead.
+#[derive(Debug, Clone)]
+pub struct ZeroCopySend {
+    threshold: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ZeroCopySend {
+    /// The default threshold. The kernel's `MSG_ZEROCOPY` documentation
+    /// (`Documentation/networking/msg_zerocopy.rst`) finds pinning pages and
+    /// waiting for the notification "generally only effective at writes over
+    /// around 10 KB".
+    pub const DEFAULT_THRESHOLD: usize = 10 * 1024;
+
+    /// A setting with `threshold`.
+    #[must_use]
+    pub fn new(threshold: usize) -> Self {
+        Self {
+            threshold: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(threshold)),
+        }
+    }
+
+    /// The fewest bytes a write sends zero-copy.
+    #[must_use]
+    pub fn threshold(&self) -> usize {
+        self.threshold.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sets the threshold for every clone of this setting.
+    pub fn set_threshold(&self, threshold: usize) {
+        self.threshold
+            .store(threshold, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Default for ZeroCopySend {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_THRESHOLD)
+    }
+}
 
 impl Timer for Compio {
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
@@ -75,7 +166,8 @@ impl Dial for Compio {
     type Connection = TcpStream;
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
-        net::TcpStream::connect(addr).await.map(TcpStream::new)
+        let stream = net::TcpStream::connect(addr).await?;
+        Ok(self.tcp_stream(stream))
     }
 }
 
@@ -84,7 +176,8 @@ impl DialUnix for Compio {
     type UnixConnection = UnixStream;
 
     async fn connect_unix(&self, path: &std::path::Path) -> io::Result<UnixStream> {
-        net::UnixStream::connect(path).await.map(UnixStream::new)
+        let stream = net::UnixStream::connect(path).await?;
+        Ok(UnixStream::new(stream, self.zero_copy.clone()))
     }
 }
 
@@ -119,13 +212,15 @@ impl FromStdUnix for Compio {
         &self,
         listener: std::os::unix::net::UnixListener,
     ) -> io::Result<UnixListener> {
-        net::UnixListener::from_std(listener).map(UnixListener::new)
+        let listener = net::UnixListener::from_std(listener)?;
+        Ok(UnixListener::new(listener, self.zero_copy.clone()))
     }
 }
 
 impl FromStd for Compio {
     fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
-        net::TcpListener::from_std(listener).map(TcpListener::new)
+        let listener = net::TcpListener::from_std(listener)?;
+        Ok(TcpListener::new(listener, self.zero_copy.clone()))
     }
 
     fn udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<UdpSocket> {
@@ -161,6 +256,11 @@ impl<T> Fd for T {}
 /// A stream socket of compio's, which the operations below drive through a
 /// shared reference.
 trait Socket: Clone + Fd + 'static {
+    /// Whether the kernel sends from this socket zero-copy: it sets
+    /// `SOCK_SUPPORT_ZC`, which io_uring's zero-copy send requires, on TCP
+    /// sockets only (`tcp_init_sock`).
+    #[cfg(target_os = "linux")]
+    const ZERO_COPY: bool;
     /// The descriptor, shared with an operation that outlives a call.
     #[cfg(target_os = "linux")]
     fn shared_fd(&self) -> ::compio::driver::SharedFd<socket2::Socket>;
@@ -187,8 +287,11 @@ trait Socket: Clone + Fd + 'static {
 }
 
 macro_rules! impl_socket {
-    ($ty:ty) => {
+    ($ty:ty, zero_copy: $zero_copy:literal) => {
         impl Socket for $ty {
+            #[cfg(target_os = "linux")]
+            const ZERO_COPY: bool = $zero_copy;
+
             #[cfg(target_os = "linux")]
             fn shared_fd(&self) -> ::compio::driver::SharedFd<socket2::Socket> {
                 ::compio::driver::ToSharedFd::to_shared_fd(self)
@@ -251,9 +354,9 @@ macro_rules! impl_socket {
     };
 }
 
-impl_socket!(net::TcpStream);
+impl_socket!(net::TcpStream, zero_copy: true);
 #[cfg(unix)]
-impl_socket!(net::UnixStream);
+impl_socket!(net::UnixStream, zero_copy: false);
 
 /// A connected stream socket.
 pub struct Stream<S> {
@@ -271,10 +374,16 @@ pub struct Stream<S> {
     /// The multishot receive and what it received ahead of the reader.
     #[cfg(target_os = "linux")]
     recv: recv::Recv,
+    /// From what size a write sends zero-copy.
+    #[cfg(target_os = "linux")]
+    zero_copy: ZeroCopySend,
 }
 
 impl<S> Stream<S> {
-    fn new(inner: S) -> Self {
+    fn new(inner: S, zero_copy: ZeroCopySend) -> Self {
+        // Only Linux sends zero-copy.
+        #[cfg(not(target_os = "linux"))]
+        drop(zero_copy);
         Self {
             inner,
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -283,6 +392,8 @@ impl<S> Stream<S> {
             nonblocking: std::cell::Cell::new(false),
             #[cfg(target_os = "linux")]
             recv: recv::Recv::default(),
+            #[cfg(target_os = "linux")]
+            zero_copy,
         }
     }
 
@@ -290,16 +401,6 @@ impl<S> Stream<S> {
     #[must_use]
     pub fn get_ref(&self) -> &S {
         &self.inner
-    }
-}
-
-/// Adopts a connected compio stream: one a runtime of this thread registered,
-/// such as a socket accepted elsewhere and handed over as a std stream (on
-/// Windows a socket joins one completion port only, so a thread-per-core
-/// server accepts where no port is involved and each thread adopts its share).
-impl From<net::TcpStream> for TcpStream {
-    fn from(stream: net::TcpStream) -> Self {
-        Self::new(stream)
     }
 }
 
@@ -412,6 +513,16 @@ impl<S: Socket> SharedStream for Stream<S> {
 
     async fn write_vectored<B: IoVectoredBuf>(&self, buf: B) -> BufResult<usize, B> {
         self.inner.write_vectored(buf).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn write_all_owned<B: IoVectoredBuf>(&self, buf: B) -> BufResult<(), Option<B>> {
+        if S::ZERO_COPY && buf.total_len() >= self.zero_copy.threshold() {
+            return zero_copy::write_all(&self.inner, buf).await;
+        }
+        let BufResult(res, buf) =
+            crate::stream::write_all_vectored(&mut crate::stream::ByRef(self), buf).await;
+        BufResult(res, Some(buf))
     }
 
     async fn shutdown(&self) -> io::Result<()> {
@@ -704,6 +815,99 @@ mod splice {
             }
         }
         Ok(filled.into_pipe())
+    }
+}
+
+/// Zero-copy sends on io_uring.
+#[cfg(target_os = "linux")]
+mod zero_copy {
+    use std::{io, rc::Rc};
+
+    use ::compio::driver::{
+        OpCode,
+        op::{SendFlags, SendVectoredZc},
+    };
+    use compio_buf::{BufResult, IoVectoredBuf};
+    use futures_core::stream::FusedStream as _;
+    use futures_lite::StreamExt as _;
+
+    use super::Socket;
+
+    /// The caller's buffers, shared by the sends of one write: a short send
+    /// is continued by another while the first still holds what it sent.
+    struct Shared<B>(Rc<B>);
+
+    impl<B: IoVectoredBuf> IoVectoredBuf for Shared<B> {
+        fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
+            self.0.iter_slice()
+        }
+    }
+
+    /// [`Write::write_all_owned`](crate::Write::write_all_owned) through
+    /// zero-copy sends.
+    ///
+    /// With `MSG_WAITALL` io_uring finishes a short send itself, waiting for
+    /// room in the socket with a poll (`io_net_retry`), so a write is one
+    /// send and one notification unless an error cuts it short.
+    pub(super) async fn write_all<S: Socket, B: IoVectoredBuf>(
+        socket: &S,
+        buf: B,
+    ) -> BufResult<(), Option<B>> {
+        let flags = SendFlags::from_bits_retain(libc::MSG_WAITALL.cast_unsigned());
+        let len = buf.total_len();
+        let buf = Rc::new(buf);
+        let mut written = 0;
+        let mut zero_copy = true;
+        let res = loop {
+            if written == len {
+                break Ok(());
+            }
+            let rest = Shared(Rc::clone(&buf)).slice(written);
+            let res = if zero_copy {
+                send(SendVectoredZc::new(socket.shared_fd(), rest, flags)).await
+            } else {
+                socket.write_vectored(rest).await.0
+            };
+            match res {
+                Ok(0) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "stream accepted no bytes",
+                    ));
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // The pages would exceed `RLIMIT_MEMLOCK`: the kernel refused
+                // the send before sending anything, so the rest copies.
+                Err(e) if zero_copy && e.raw_os_error() == Some(libc::ENOMEM) => {
+                    zero_copy = false;
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        BufResult(res, Rc::into_inner(buf))
+    }
+
+    /// Submits a zero-copy send and returns what the send itself completed
+    /// with, as soon as it has. The operation, with the buffers it holds,
+    /// goes to a task of the runtime until the kernel's notification that it
+    /// no longer reads them, which drops them.
+    ///
+    /// It takes any zero-copy operation, whatever buffers it sends from.
+    pub(super) async fn send<T: OpCode + 'static>(op: T) -> io::Result<usize> {
+        let mut op = ::compio::runtime::submit_multi(op);
+        let BufResult(res, _) = op
+            .next()
+            .await
+            .expect("a submitted operation completes at least once");
+        // The send's own completion carries `IORING_CQE_F_MORE` when a
+        // notification follows. Without one (an error the kernel posts
+        // alone, or a kernel without the operation, where compio sends by
+        // copying) the first completion is the last.
+        if !op.is_terminated() {
+            ::compio::runtime::spawn(async move { while op.next().await.is_some() {} }).detach();
+        }
+        res
     }
 }
 
@@ -1145,14 +1349,17 @@ pub struct TcpListener {
     inner: net::TcpListener,
     #[cfg(target_os = "linux")]
     accepts: multishot::Accepts,
+    /// The setting each accepted stream shares.
+    zero_copy: ZeroCopySend,
 }
 
 impl TcpListener {
-    fn new(inner: net::TcpListener) -> Self {
+    fn new(inner: net::TcpListener, zero_copy: ZeroCopySend) -> Self {
         Self {
             #[cfg(target_os = "linux")]
             accepts: multishot::Accepts::new(&inner),
             inner,
+            zero_copy,
         }
     }
 
@@ -1181,10 +1388,10 @@ impl Listener for TcpListener {
             // completions, so it reports no peer.
             let stream = net::TcpStream::from_std(accepted?.into())?;
             let peer = stream.peer_addr()?;
-            return Ok((TcpStream::new(stream), peer));
+            return Ok((TcpStream::new(stream, self.zero_copy.clone()), peer));
         }
         let (stream, peer) = self.inner.accept().await?;
-        Ok((TcpStream::new(stream), peer))
+        Ok((TcpStream::new(stream, self.zero_copy.clone()), peer))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -1199,15 +1406,18 @@ pub struct UnixListener {
     inner: net::UnixListener,
     #[cfg(target_os = "linux")]
     accepts: multishot::Accepts,
+    /// The setting each accepted stream shares.
+    zero_copy: ZeroCopySend,
 }
 
 #[cfg(unix)]
 impl UnixListener {
-    fn new(inner: net::UnixListener) -> Self {
+    fn new(inner: net::UnixListener, zero_copy: ZeroCopySend) -> Self {
         Self {
             #[cfg(target_os = "linux")]
             accepts: multishot::Accepts::new(&inner),
             inner,
+            zero_copy,
         }
     }
 
@@ -1238,7 +1448,7 @@ impl Listener for UnixListener {
         };
         #[cfg(not(target_os = "linux"))]
         let (stream, _) = self.inner.accept().await?;
-        let stream = UnixStream::new(stream);
+        let stream = UnixStream::new(stream, self.zero_copy.clone());
         let peer = stream.peer_addr()?;
         Ok((stream, peer))
     }

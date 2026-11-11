@@ -94,6 +94,29 @@ pub trait Write {
     /// Shuts down the write direction (a TCP FIN) after flushing.
     fn shutdown(&mut self) -> impl Future<Output = io::Result<()>>;
 
+    /// Writes all the bytes of `buf`, several buffers gathered as
+    /// [`write_vectored`](Self::write_vectored) takes them, and hands `buf`
+    /// back unless the writer still needs it.
+    ///
+    /// A writer that sends without copying (the compio implementation's
+    /// zero-copy send on Linux) returns once the kernel has taken every byte,
+    /// but the kernel goes on reading them from `buf` until the peer
+    /// acknowledges them: such a writer keeps `buf`, drops it when the kernel
+    /// is done with it, and answers `None`. A write that copies answers
+    /// `Some(buf)`, so the caller can reuse the allocation.
+    ///
+    /// A zero-length write before the end is reported as
+    /// [`io::ErrorKind::WriteZero`].
+    fn write_all_owned<B: IoVectoredBuf>(
+        &mut self,
+        buf: B,
+    ) -> impl Future<Output = BufResult<(), Option<B>>> {
+        async move {
+            let BufResult(res, buf) = write_all_vectored(self, buf).await;
+            BufResult(res, Some(buf))
+        }
+    }
+
     /// Writes all of `buf`'s initialized bytes.
     ///
     /// A zero-length write before the end is reported as
@@ -124,6 +147,35 @@ pub trait Write {
             BufResult(Ok(()), buf)
         }
     }
+}
+
+/// Writes all of `buf` through [`Write::write_vectored`], copying.
+pub(crate) async fn write_all_vectored<W: Write + ?Sized, B: IoVectoredBuf>(
+    writer: &mut W,
+    buf: B,
+) -> BufResult<(), B> {
+    let len = buf.total_len();
+    let mut buf = buf;
+    let mut written = 0;
+    while written < len {
+        let BufResult(res, slice) = writer.write_vectored(buf.slice(written)).await;
+        buf = slice.into_inner();
+        match res {
+            Ok(0) => {
+                return BufResult(
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "stream accepted no bytes",
+                    )),
+                    buf,
+                );
+            }
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return BufResult(Err(e), buf),
+        }
+    }
+    BufResult(Ok(()), buf)
 }
 
 /// Splits a stream into halves that read and write concurrently, for
@@ -270,6 +322,21 @@ pub(crate) mod sealed {
             &self,
             buf: B,
         ) -> impl Future<Output = BufResult<usize, B>>;
+        /// [`Write::write_all_owned`](crate::Write::write_all_owned); a
+        /// socket that sends without copying overrides it.
+        fn write_all_owned<B: IoVectoredBuf>(
+            &self,
+            buf: B,
+        ) -> impl Future<Output = BufResult<(), Option<B>>>
+        where
+            Self: Sized,
+        {
+            async move {
+                let BufResult(res, buf) =
+                    super::write_all_vectored(&mut super::ByRef(self), buf).await;
+                BufResult(res, Some(buf))
+            }
+        }
         fn shutdown(&self) -> impl Future<Output = io::Result<()>>;
         fn send_file<F: Borrow<File> + 'static>(
             &self,
@@ -298,6 +365,31 @@ pub(crate) mod sealed {
 }
 
 use sealed::SharedStream;
+
+/// [`Write`] over a shared reference to a socket, for the copying paths
+/// that reuse the trait's provided methods.
+pub(crate) struct ByRef<'a, S>(pub(crate) &'a S);
+
+impl<S: SharedStream> Write for ByRef<'_, S> {
+    fn write<B: IoBuf>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
+        self.0.write(buf)
+    }
+
+    fn write_vectored<B: IoVectoredBuf>(
+        &mut self,
+        buf: B,
+    ) -> impl Future<Output = BufResult<usize, B>> {
+        self.0.write_vectored(buf)
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> {
+        self.0.shutdown()
+    }
+}
 
 /// Implements the public stream traits for a whole socket type over its
 /// [`SharedStream`] operations, and [`Split`] into [`ReadHalf`]/[`WriteHalf`].
@@ -346,6 +438,13 @@ macro_rules! impl_stream {
                 buf: B,
             ) -> impl ::std::future::Future<Output = ::compio_buf::BufResult<usize, B>> {
                 $crate::stream::sealed::SharedStream::write_vectored(&*self, buf)
+            }
+
+            fn write_all_owned<B: ::compio_buf::IoVectoredBuf>(
+                &mut self,
+                buf: B,
+            ) -> impl ::std::future::Future<Output = ::compio_buf::BufResult<(), Option<B>>> {
+                $crate::stream::sealed::SharedStream::write_all_owned(&*self, buf)
             }
 
             async fn flush(&mut self) -> ::std::io::Result<()> {
@@ -515,6 +614,13 @@ impl<S: SharedStream> Write for WriteHalf<S> {
         self.0.write_vectored(buf)
     }
 
+    fn write_all_owned<B: IoVectoredBuf>(
+        &mut self,
+        buf: B,
+    ) -> impl Future<Output = BufResult<(), Option<B>>> {
+        self.0.write_all_owned(buf)
+    }
+
     async fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -584,11 +690,11 @@ impl<S: SharedStream> WriteControl for WriteHalf<S> {
     not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
 ))]
 pub(crate) mod copy {
-    use std::{borrow::Borrow, fs::File, future::Future, io};
+    use std::{borrow::Borrow, fs::File};
 
-    use compio_buf::{BufResult, IoBuf, IoVectoredBuf};
+    use compio_buf::BufResult;
 
-    use super::{SharedStream, Write};
+    use super::{ByRef, SharedStream, Write};
 
     /// One positional read into a buffer, then a write of all of it. The read is a
     /// synchronous call, which is what `sendfile` costs on a page-cache miss too.
@@ -621,30 +727,5 @@ pub(crate) mod copy {
         chunk.truncate(n);
         let BufResult(res, _) = ByRef(stream).write_all(chunk).await;
         BufResult(res.map(|()| n), file)
-    }
-
-    /// [`Write`] over a shared reference, so the fallback reuses
-    /// [`Write::write_all`].
-    struct ByRef<'a, S>(&'a S);
-
-    impl<S: SharedStream> Write for ByRef<'_, S> {
-        fn write<B: IoBuf>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
-            self.0.write(buf)
-        }
-
-        fn write_vectored<B: IoVectoredBuf>(
-            &mut self,
-            buf: B,
-        ) -> impl Future<Output = BufResult<usize, B>> {
-            self.0.write_vectored(buf)
-        }
-
-        async fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn shutdown(&mut self) -> impl Future<Output = io::Result<()>> {
-            self.0.shutdown()
-        }
     }
 }

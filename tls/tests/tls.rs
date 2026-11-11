@@ -1352,7 +1352,7 @@ mod compio {
             .block_on(future)
     }
 
-    suite!(http_kit_io::compio::Compio, run);
+    suite!(http_kit_io::compio::Compio::default(), run);
 }
 
 mod tokio {

@@ -63,8 +63,9 @@
 //! let identity = Identity::from_pem(std::fs::read("cert.pem")?, std::fs::read("key.pem")?);
 //! let config = ServerConfig::new(identity, 64 * 1024);
 //! compio::runtime::Runtime::new()?.block_on(async {
-//!     let socket = Compio.bind_udp("[::]:443".parse().unwrap()).await?;
-//!     let server = Server::new(socket, Compio, &config)?;
+//!     let io = Compio::default();
+//!     let socket = io.bind_udp("[::]:443".parse().unwrap()).await?;
+//!     let server = Server::new(socket, io, &config)?;
 //!     let service = |request: Request| async move {
 //!         Response::new(Body::from_bytes(request.uri().path().to_owned()))
 //!     };

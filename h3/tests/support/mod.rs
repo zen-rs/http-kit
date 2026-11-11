@@ -163,7 +163,7 @@ pub async fn within<I: Timer, F: Future>(io: &I, limit: Duration, test: F) -> F:
 pub fn on_compio<F: Future>(test: impl FnOnce(http_kit_io::compio::Compio) -> F) -> F::Output {
     compio::runtime::Runtime::new()
         .unwrap()
-        .block_on(test(http_kit_io::compio::Compio))
+        .block_on(test(http_kit_io::compio::Compio::default()))
 }
 
 /// Runs a test body on a current-thread tokio runtime.
