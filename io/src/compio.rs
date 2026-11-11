@@ -1033,7 +1033,7 @@ mod files {
         io,
         os::fd::{AsRawFd as _, RawFd},
         rc::Rc,
-        task::Poll,
+        task::{Poll, Waker},
     };
 
     use ::compio::{
@@ -1171,14 +1171,23 @@ mod files {
 
     /// A stream's hold on its slot.
     pub(super) struct File {
-        state: Rc<Cell<State>>,
+        slot: Rc<Slot>,
         /// The socket's descriptor, which the slot replaces in an entry.
         fd: RawFd,
     }
 
+    /// What a stream and its slot's keeper share.
+    #[derive(Default)]
+    struct Slot {
+        state: Cell<State>,
+        /// The keeper, waiting for the stream to go once it holds the slot.
+        keeper: Cell<Option<Waker>>,
+    }
+
     #[derive(Default)]
     enum State {
-        /// The installer has not finished; operations name the descriptor.
+        /// The keeper has not taken the slot yet; operations name the
+        /// descriptor.
         Installing,
         /// The socket holds this slot.
         Fixed(u32),
@@ -1188,41 +1197,46 @@ mod files {
         /// Taking a slot failed other than for want of room: the next
         /// operation reports it, and the rest name the descriptor.
         Failed(io::Error),
-        /// The stream is gone: the installer gives back the slot it takes.
+        /// The stream is gone: the keeper gives back the slot it holds or
+        /// takes.
         Dropped,
     }
 
     impl File {
-        /// Starts taking a slot for `socket`, on a task of the runtime, so
-        /// that no operation of the stream waits for it and none abandoned
-        /// midway loses the slot (and with it the socket, which the slot
-        /// keeps open).
+        /// Starts the keeper of a slot for `socket`, a task of the runtime
+        /// that takes the slot, so that no operation of the stream waits for
+        /// it and none abandoned midway loses the slot (and with it the
+        /// socket, which the slot keeps open), and gives it back once the
+        /// stream is gone, so that dropping a stream starts no task: a
+        /// runtime being dropped drops its tasks, and may be handed no new
+        /// one meanwhile.
         pub(super) fn new(socket: SharedFd<socket2::Socket>, table: &super::FileTable) -> Self {
             let fd = socket.as_raw_fd();
-            let state = Rc::new(Cell::new(State::Descriptor));
+            let slot = Rc::new(Slot::default());
             let slots = table.slots();
             if slots > 0 {
                 Runtime::with_current(|runtime| {
                     if runtime.driver_type().is_iouring() {
-                        state.set(State::Installing);
+                        slot.state.set(State::Installing);
                         runtime
-                            .spawn(install(Rc::clone(&state), socket, slots))
+                            .spawn(keep(Rc::clone(&slot), socket, slots))
                             .detach();
                     }
                 });
             }
-            Self { state, fd }
+            Self { slot, fd }
         }
 
         fn slot(&self) -> io::Result<Option<u32>> {
-            match self.state.take() {
+            let state = &self.slot.state;
+            match state.take() {
                 State::Fixed(index) => {
-                    self.state.set(State::Fixed(index));
+                    state.set(State::Fixed(index));
                     Ok(Some(index))
                 }
                 State::Failed(error) => Err(error),
-                state => {
-                    self.state.set(state);
+                other => {
+                    state.set(other);
                     Ok(None)
                 }
             }
@@ -1269,28 +1283,50 @@ mod files {
 
     impl Drop for File {
         fn drop(&mut self) {
-            if let State::Fixed(index) = self.state.replace(State::Dropped) {
-                // Without a runtime the ring is gone, and its table with it.
-                let _ = Runtime::try_with_current(|runtime| runtime.spawn(remove(index)).detach());
+            self.slot.state.set(State::Dropped);
+            if let Some(keeper) = self.slot.keeper.take() {
+                keeper.wake();
             }
         }
     }
 
-    /// Takes a slot for `socket` and leaves the outcome in `state`, or gives
-    /// the slot back at once when the stream is gone by then.
-    async fn install(state: Rc<Cell<State>>, socket: SharedFd<socket2::Socket>, slots: u32) {
+    /// Takes a slot for `socket` and leaves the outcome in `slot`; while
+    /// the stream holds the slot, waits for the stream to go, and gives the
+    /// slot back then, or at once when the stream is gone by the time the
+    /// slot is taken.
+    ///
+    /// A keeper dropped with its runtime leaves the slot taken, which is
+    /// right: the ring goes with the runtime, and its table with it.
+    async fn keep(slot: Rc<Slot>, socket: SharedFd<socket2::Socket>, slots: u32) {
         let taken = take_slot(socket, slots).await;
-        if let State::Dropped = state.take() {
+        if let State::Dropped = slot.state.take() {
             if let Ok(Some(index)) = taken {
                 remove(index).await;
             }
             return;
         }
-        state.set(match taken {
-            Ok(Some(index)) => State::Fixed(index),
-            Ok(None) => State::Descriptor,
-            Err(error) => State::Failed(error),
-        });
+        let index = match taken {
+            Ok(Some(index)) => index,
+            Ok(None) => {
+                slot.state.set(State::Descriptor);
+                return;
+            }
+            Err(error) => {
+                slot.state.set(State::Failed(error));
+                return;
+            }
+        };
+        slot.state.set(State::Fixed(index));
+        std::future::poll_fn(|cx| match slot.state.take() {
+            State::Dropped => Poll::Ready(()),
+            held => {
+                slot.state.set(held);
+                slot.keeper.set(Some(cx.waker().clone()));
+                Poll::Pending
+            }
+        })
+        .await;
+        remove(index).await;
     }
 
     /// The slot the kernel allocates for `socket`, registering the ring's
@@ -1327,7 +1363,7 @@ mod files {
     fn register(slots: u32) -> io::Result<()> {
         let table = vec![-1; slots as usize];
         match Runtime::with_current(|runtime| runtime.register_files(&table)) {
-            // Another stream's installer registered it meanwhile.
+            // Another stream's keeper registered it meanwhile.
             Err(error) if error.raw_os_error() == Some(libc::EBUSY) => Ok(()),
             res => res.map_err(|error| {
                 io::Error::new(

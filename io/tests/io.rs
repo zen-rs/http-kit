@@ -1621,6 +1621,32 @@ mod compio {
         super::assert_bytes(&peer.join().expect("peer thread"), &expected);
     }
 
+    /// A runtime dropped while a task still holds a stream with a slot tears
+    /// down cleanly: dropping the stream with the task hands the runtime no
+    /// new task while it is clearing its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runtime_drops_while_a_task_holds_a_stream_with_a_slot() {
+        use std::io::Read as _;
+
+        let peer = run(async {
+            let (stream, peer) = accept_one(|mut client| {
+                // The connection ends with the runtime, which drops the
+                // stream with the task holding it.
+                let _ = client.read_to_end(&mut Vec::new());
+            })
+            .await;
+            until_held(&socket_name(&stream), 1).await;
+            ::compio::runtime::spawn(async move {
+                let _stream = stream;
+                std::future::pending::<()>().await;
+            })
+            .detach();
+            peer
+        });
+        peer.join().expect("peer thread");
+    }
+
     /// A socket the ring's table has no room for stays on its descriptor and
     /// works as any other.
     #[cfg(target_os = "linux")]
@@ -1668,8 +1694,8 @@ mod compio {
                 },
             )
             .await;
-            // Both installers have run by now; the one that came second found
-            // the table full.
+            // Both keepers have asked for a slot by now; the one that came
+            // second found the table full.
             ::compio::time::sleep(std::time::Duration::from_millis(20)).await;
             let held = names.each_ref().map(|name| slots_holding(name));
             assert_eq!(held.iter().sum::<usize>(), 1, "slots held: {held:?}");
