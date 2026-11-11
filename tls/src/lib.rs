@@ -95,23 +95,24 @@
 //! let connector = TlsConnector::new(Arc::new(client));
 //!
 //! compio::runtime::Runtime::new()?.block_on(async {
-//!     let listener = Compio.bind_tcp("127.0.0.1:0".parse().unwrap())?;
+//!     let io = Compio::default();
+//!     let listener = io.bind_tcp("127.0.0.1:0".parse().unwrap())?;
 //!     let addr = listener.local_addr()?;
 //!     let service = |request: Request| async move {
 //!         Response::new(Body::from_bytes(request.uri().path().to_owned()))
 //!     };
 //!     let server = async {
 //!         let (stream, _) = listener.accept().await?;
-//!         let stream = acceptor.accept(stream, &Compio).await.map_err(std::io::Error::other)?;
+//!         let stream = acceptor.accept(stream, &io).await.map_err(std::io::Error::other)?;
 //!         assert_eq!(stream.alpn_protocol(), Some(&b"http/1.1"[..]));
-//!         let connection = ServerConnection::from_stream(stream, Compio, ServerConfig::default());
+//!         let connection = ServerConnection::from_stream(stream, io.clone(), ServerConfig::default());
 //!         connection.serve(&service).await.map_err(std::io::Error::other)
 //!     };
 //!     let client = async {
-//!         let stream = Compio.connect(addr).await?;
+//!         let stream = io.connect(addr).await?;
 //!         let name = "localhost".try_into().unwrap();
-//!         let stream = connector.connect(name, stream, &Compio).await.map_err(std::io::Error::other)?;
-//!         let (send, connection) = handshake_stream(stream, Compio, ClientConfig::default());
+//!         let stream = connector.connect(name, stream, &io).await.map_err(std::io::Error::other)?;
+//!         let (send, connection) = handshake_stream(stream, io.clone(), ClientConfig::default());
 //!         let request = async move {
 //!             let mut request = Request::new(Body::empty());
 //!             *request.uri_mut() = format!("https://localhost:{}/hello", addr.port()).parse().unwrap();

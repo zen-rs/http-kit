@@ -872,13 +872,13 @@ mod compio {
             .block_on(future)
     }
 
-    suite!(http_kit_io::compio::Compio, run);
+    suite!(http_kit_io::compio::Compio::default(), run);
 
     /// A connection accepted by a plain std listener on one thread is adopted
     /// by a compio runtime on another and serves both directions there.
     #[test]
     fn a_std_stream_accepted_elsewhere_is_adopted() {
-        use http_kit_io::{Read as _, Write as _, compio::TcpStream};
+        use http_kit_io::{Read as _, Write as _, compio::Compio};
         use std::io::{Read as _, Write as _};
 
         let listener = std::net::TcpListener::bind(super::loopback()).expect("bind");
@@ -888,8 +888,8 @@ mod compio {
         let accepted = accepted.join().expect("accept thread");
         let server = std::thread::spawn(move || {
             run(async move {
-                let mut stream =
-                    TcpStream::from(::compio::net::TcpStream::from_std(accepted).expect("adopt"));
+                let mut stream = Compio::default()
+                    .tcp_stream(::compio::net::TcpStream::from_std(accepted).expect("adopt"));
                 let http_kit_io::BufResult(read, buf) = stream.read(Vec::with_capacity(64)).await;
                 read.expect("read");
                 let http_kit_io::BufResult(written, _) = stream.write(buf).await;
@@ -943,9 +943,10 @@ mod compio {
         run(async {
             // The driver arms a poll on its own wake-up eventfd the first time
             // it parks; park it once so that submission is not counted.
-            Compio.sleep(std::time::Duration::from_millis(1)).await;
+            let io = Compio::default();
+            io.sleep(std::time::Duration::from_millis(1)).await;
 
-            let listener = Compio.bind_tcp(super::loopback()).expect("bind");
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
             let addr = listener.local_addr().expect("local address");
             let before = submitted();
             // Submits the accept, then drops the call that submitted it.
@@ -1012,7 +1013,7 @@ mod compio {
     ) -> (http_kit_io::compio::TcpStream, std::thread::JoinHandle<()>) {
         use http_kit_io::{Listen as _, Listener as _, compio::Compio};
 
-        let listener = Compio.bind_tcp(super::loopback()).expect("bind");
+        let listener = Compio::default().bind_tcp(super::loopback()).expect("bind");
         let addr = listener.local_addr().expect("local address");
         let peer =
             std::thread::spawn(move || peer(std::net::TcpStream::connect(addr).expect("connect")));
@@ -1041,7 +1042,9 @@ mod compio {
         run_with_ring(BUFFERS, BUFFER_LEN, async move {
             // The driver arms a poll on its own wake-up eventfd the first time
             // it parks; park it once so that submission is not counted.
-            Compio.sleep(std::time::Duration::from_millis(1)).await;
+            Compio::default()
+                .sleep(std::time::Duration::from_millis(1))
+                .await;
             // Each message waits for the one before it to be read, so the
             // receive always finds a free buffer.
             let (mut stream, peer) = accept_one(move |mut client| {
@@ -1225,7 +1228,7 @@ mod compio {
         });
 
         let (busy, bytes) = run(async {
-            let io = http_kit_io::compio::Compio;
+            let io = http_kit_io::compio::Compio::default();
             let listener = io.bind_tcp(super::loopback()).expect("bind");
             addr_tx
                 .send(listener.local_addr().expect("local address"))
@@ -1292,7 +1295,7 @@ mod compio {
         });
 
         let busy = run(async {
-            let io = http_kit_io::compio::Compio;
+            let io = http_kit_io::compio::Compio::default();
             let listener = io.bind_tcp(super::loopback()).expect("bind");
             addr_tx
                 .send(listener.local_addr().expect("local address"))
@@ -1323,6 +1326,180 @@ mod compio {
             busy.is_empty(),
             "kernel workers held during the stall: {busy:?}"
         );
+    }
+
+    /// A buffer that records when it is dropped.
+    #[cfg(target_os = "linux")]
+    struct Tracked {
+        bytes: Vec<u8>,
+        dropped: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl http_kit_io::IoBuf for Tracked {
+        fn as_init(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+
+    /// Runs `future`, failing the test if it takes longer than `limit`.
+    #[cfg(target_os = "linux")]
+    async fn within<F: Future>(limit: std::time::Duration, what: &str, future: F) -> F::Output {
+        let expired = async {
+            ::compio::time::sleep(limit).await;
+            panic!("{what} took longer than {limit:?}");
+        };
+        futures_lite::future::or(future, expired).await
+    }
+
+    /// A zero-copy write returns while the kernel still reads the caller's
+    /// buffer: a peer that reads nothing leaves most of it unsent. The stream
+    /// keeps the buffer, and the kernel's notification, which comes once the
+    /// peer has read every byte, drops it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_notification_releases_a_zero_copy_buffer() {
+        use std::{cell::Cell, io::Read as _, rc::Rc, sync::mpsc, time::Duration};
+
+        use http_kit_io::{BufResult, Listen as _, Listener as _, Write as _, compio::Compio};
+
+        /// What the peer's receive buffer is asked to hold: far less than
+        /// the write, so the rest waits in the sender's queue.
+        const PEER_BUFFER: usize = 16 * 1024;
+        /// Above the default threshold, and within the sender's send buffer
+        /// (which zero-copy pages count against) once raised.
+        const LEN: usize = 256 * 1024;
+
+        let data = super::payload()[..LEN].to_vec();
+        let (release, released) = mpsc::channel::<()>();
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let addr = addr_rx.recv().expect("listener address");
+            let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                .expect("peer socket");
+            socket
+                .set_recv_buffer_size(PEER_BUFFER)
+                .expect("peer receive buffer");
+            socket
+                .connect(&socket2::SockAddr::from(addr))
+                .expect("connect");
+            let mut stream = std::net::TcpStream::from(socket);
+            released.recv().expect("release");
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).expect("read");
+            received
+        });
+
+        let sent = data.clone();
+        run(async move {
+            let io = Compio::default();
+            assert!(LEN >= io.zero_copy().threshold());
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
+            addr_tx
+                .send(listener.local_addr().expect("local address"))
+                .expect("send address");
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            socket2::SockRef::from(&stream)
+                .set_send_buffer_size(4 * LEN)
+                .expect("send buffer");
+
+            let dropped = Rc::new(Cell::new(false));
+            let buf = Tracked {
+                bytes: sent,
+                dropped: Rc::clone(&dropped),
+            };
+            let BufResult(res, kept) = within(
+                Duration::from_secs(10),
+                "the zero-copy write",
+                stream.write_all_owned([buf]),
+            )
+            .await;
+            res.expect("zero-copy write");
+            assert!(
+                kept.is_none(),
+                "the stream handed back a buffer the kernel may still read"
+            );
+            assert!(
+                !dropped.get(),
+                "the buffer was dropped while the peer had read nothing"
+            );
+
+            release.send(()).expect("release the peer");
+            within(Duration::from_secs(10), "the notification", async {
+                while !dropped.get() {
+                    ::compio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            http_kit_io::Write::shutdown(&mut stream)
+                .await
+                .expect("shutdown");
+        });
+        super::assert_bytes(&peer.join().expect("peer thread"), &data);
+    }
+
+    /// A write below the threshold copies and hands its buffer back, and so
+    /// does any write once the threshold is raised on a clone of the setting
+    /// the stream already holds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_zero_copy_threshold_is_a_runtime_setting() {
+        use std::io::Read as _;
+
+        use http_kit_io::{
+            BufResult, Listen as _, Listener as _, Write as _,
+            compio::{Compio, ZeroCopySend},
+        };
+
+        let data = super::payload()[..64 * 1024].to_vec();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let addr = addr_rx.recv().expect("listener address");
+            let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).expect("read");
+            received
+        });
+
+        let sent = data.clone();
+        run(async move {
+            let setting = ZeroCopySend::new(sent.len() + 1);
+            let io = Compio::with_zero_copy(setting.clone());
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
+            addr_tx
+                .send(listener.local_addr().expect("local address"))
+                .expect("send address");
+            let (mut stream, _) = listener.accept().await.expect("accept");
+
+            let BufResult(res, kept) = stream.write_all_owned([sent]).await;
+            res.expect("write below the threshold");
+            let [sent] = kept.expect("a copying write hands the buffer back");
+
+            setting.set_threshold(0);
+            let BufResult(res, kept) = stream.write_all_owned([sent]).await;
+            res.expect("zero-copy write");
+            assert!(kept.is_none(), "the lowered threshold did not apply");
+
+            setting.set_threshold(usize::MAX);
+            let BufResult(res, kept) = stream.write_all_owned([vec![0; 64 * 1024]]).await;
+            res.expect("write with zero-copy off");
+            assert!(kept.is_some(), "the raised threshold did not apply");
+            http_kit_io::Write::shutdown(&mut stream)
+                .await
+                .expect("shutdown");
+        });
+        let received = peer.join().expect("peer thread");
+        let mut expected = data.clone();
+        expected.extend_from_slice(&data);
+        expected.extend_from_slice(&[0; 64 * 1024]);
+        super::assert_bytes(&received, &expected);
     }
 }
 
