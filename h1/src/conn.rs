@@ -10,10 +10,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use futures_lite::{
-    Stream,
-    future::{or, poll_once},
-};
+use futures_lite::future::{or, poll_once};
 use http_kit::{Body, BodyError, BodyFrame, PipeOffer};
 use http_kit_io::{
     BufResult, IntoInner as _, IoBuf as _, ReadOwned, Received, SendFile, SpliceRead, SpliceWrite,
@@ -250,11 +247,7 @@ async fn next_sent_frame(
     body: &mut Body,
     mut offer: Option<&mut PipeOffer>,
 ) -> Option<Result<BodyFrame, BodyError>> {
-    poll_fn(|cx| match offer.as_deref_mut() {
-        Some(offer) => Pin::new(&mut *body).poll_frame_offering(cx, offer),
-        None => Pin::new(&mut *body).poll_next(cx),
-    })
-    .await
+    poll_fn(|cx| Pin::new(&mut *body).poll_frame_offering(cx, offer.as_deref_mut())).await
 }
 
 /// Sends a frame that is neither data, trailers nor a pipe: a file region,

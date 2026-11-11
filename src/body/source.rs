@@ -210,7 +210,7 @@ mod tests {
         assert_eq!(plain.as_data().unwrap(), CJK_TEXT);
 
         let mut offer = PipeOffer::new(64 * 1024);
-        let offered = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, &mut offer))
+        let offered = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer)))
             .await
             .unwrap()
             .unwrap();
@@ -242,7 +242,7 @@ mod tests {
 
         let mut frames = Vec::new();
         while let Some(frame) =
-            poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, &mut offer)).await
+            poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer))).await
         {
             frames.push(frame.unwrap());
         }
@@ -261,7 +261,7 @@ mod tests {
             Body::from_bytes(CJK_TEXT),
             Body::from_stream(stream::iter(vec![Ok::<_, Error>(Bytes::from(CJK_TEXT))])),
         ] {
-            let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, &mut offer))
+            let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer)))
                 .await
                 .unwrap()
                 .unwrap();
@@ -430,7 +430,7 @@ mod pipe_tests {
     async fn an_offered_pipe_is_answered_with_a_pipe_frame() {
         let mut body = Body::from_source(Taking(Some(filled_pipe(CJK_TEXT).await)));
         let mut offer = PipeOffer::with_pipe(64 * 1024, Pipe::new().unwrap());
-        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, &mut offer))
+        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer)))
             .await
             .unwrap()
             .unwrap();
@@ -473,7 +473,7 @@ mod pipe_tests {
             Bytes::from(CJK_TEXT),
         ))]));
         let mut offer = PipeOffer::with_pipe(4096, Pipe::new().unwrap());
-        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, &mut offer))
+        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer)))
             .await
             .unwrap()
             .unwrap();

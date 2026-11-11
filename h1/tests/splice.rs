@@ -274,7 +274,7 @@ async fn collect_offering(mut body: Body, max: usize) -> Seen {
     let mut seen = Seen::default();
     let mut offer = PipeOffer::with_pipe(max, Pipe::new().expect("pipe"));
     while let Some(frame) =
-        poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, &mut offer)).await
+        poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer))).await
     {
         match frame.expect("body frame") {
             BodyFrame::Pipe(filled) => {
@@ -518,10 +518,11 @@ async fn a_dropped_request_body_closes_the_connection<I: Listen + Timer + Clone>
             async move {
                 let mut body = request.into_body();
                 let mut offer = PipeOffer::with_pipe(OFFER, Pipe::new().expect("pipe"));
-                let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, &mut offer))
-                    .await
-                    .expect("a frame")
-                    .expect("body frame");
+                let frame =
+                    poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer)))
+                        .await
+                        .expect("a frame")
+                        .expect("body frame");
                 let BodyFrame::Pipe(filled) = frame else {
                     panic!("expected a pipe frame, got {frame:?}");
                 };
@@ -730,7 +731,7 @@ async fn a_dropped_response_body_closes_the_connection<I: Dial + Timer + Clone>(
         |response| async move {
             let mut body = response.into_body();
             let mut offer = PipeOffer::with_pipe(OFFER, Pipe::new().expect("pipe"));
-            let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, &mut offer))
+            let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer)))
                 .await
                 .expect("a frame")
                 .expect("body frame");
@@ -866,7 +867,7 @@ async fn pipes_forward_from_request_to_response<I: Listen + Timer + Clone>(io: I
         let mut offer = PipeOffer::with_pipe(OFFER, Pipe::new().expect("pipe"));
         let mut frames = Vec::new();
         while let Some(frame) =
-            poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, &mut offer)).await
+            poll_fn(|cx| Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer))).await
         {
             frames.push(Ok::<_, io::Error>(frame.expect("body frame")));
         }
@@ -915,10 +916,7 @@ impl FrameSource for Forwarded {
         if let Some(first) = this.first.take() {
             return Poll::Ready(Some(Ok(first)));
         }
-        match offer {
-            Some(offer) => Pin::new(&mut this.rest).poll_frame_offering(cx, offer),
-            None => Pin::new(&mut this.rest).poll_next(cx),
-        }
+        Pin::new(&mut this.rest).poll_frame_offering(cx, offer)
     }
 }
 
