@@ -357,7 +357,12 @@ async fn next_frame<R: Read + SpliceRead, T: Timer>(
     read_timeout: Option<Duration>,
     offer: &mut Option<PipeOffer>,
 ) -> Result<Option<BodyFrame>, Error> {
-    loop {
+    let decoded = loop {
+        if let Some(decoded) = decoder.decode(&mut recv.buf, limits)? {
+            break decoded;
+        }
+        // The decoder needs bytes, possibly after consuming framing from the
+        // buffer just now; the socket goes to the pipe before any read.
         if let Some(offer) = offer {
             match try_splice(recv, decoder, limits, timer, read_timeout, offer).await? {
                 Attempt::Skip => {}
@@ -367,24 +372,18 @@ async fn next_frame<R: Read + SpliceRead, T: Timer>(
                 Attempt::End => return Ok(None),
             }
         }
-        let decoded = match decoder.decode(&mut recv.buf, limits)? {
-            Some(decoded) => decoded,
-            None => {
-                let read = until(timer, deadline_after(read_timeout), recv.fill())
-                    .await
-                    .ok_or(Error::Timeout(Timeout::BodyRead))??;
-                if read > 0 {
-                    continue;
-                }
-                decoder.decode_eof(&mut recv.buf, limits)?
-            }
-        };
-        return Ok(match decoded {
-            Decoded::Data(data) => Some(BodyFrame::Data(data)),
-            Decoded::Trailers(trailers) => Some(BodyFrame::Trailers(trailers)),
-            Decoded::End => None,
-        });
-    }
+        let read = until(timer, deadline_after(read_timeout), recv.fill())
+            .await
+            .ok_or(Error::Timeout(Timeout::BodyRead))??;
+        if read == 0 {
+            break decoder.decode_eof(&mut recv.buf, limits)?;
+        }
+    };
+    Ok(match decoded {
+        Decoded::Data(data) => Some(BodyFrame::Data(data)),
+        Decoded::Trailers(trailers) => Some(BodyFrame::Trailers(trailers)),
+        Decoded::End => None,
+    })
 }
 
 /// Drives `main` to completion while also driving `side` for as long as it

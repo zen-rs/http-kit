@@ -1054,7 +1054,7 @@ mod in_memory {
         block_on(async {
             let ends = connection();
             let (reader, writer) = ends.server;
-            let (mut client_in, mut client_out) = ends.client;
+            let (mut client_in, client_out) = ends.client;
             let service = |_: Request| async { response_with_pipe(CJK.as_bytes(), None) };
             client_out.send(b"GET /pipe HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
             let mut config = ServerConfig::default();
