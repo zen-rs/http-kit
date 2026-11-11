@@ -409,6 +409,16 @@ impl<E, M> WithMiddleware<E, M> {
             middleware,
         }
     }
+
+    /// The wrapped endpoint.
+    pub const fn endpoint(&self) -> &E {
+        &self.endpoint
+    }
+
+    /// The middleware applied to the endpoint.
+    pub const fn middleware(&self) -> &M {
+        &self.middleware
+    }
 }
 
 impl<F: Flavor, E: Endpoint<F>, M: Middleware<F>> Endpoint<F> for WithMiddleware<E, M> {
