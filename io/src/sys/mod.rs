@@ -6,6 +6,9 @@
 ))]
 pub(crate) mod linux;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod pipe;
+
 #[cfg(all(
     target_vendor = "apple",
     any(feature = "compio", feature = "tokio", feature = "async-io")

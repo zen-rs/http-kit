@@ -244,7 +244,7 @@ impl<T: Ready> SharedStream for Stream<T> {
         // empty socket reports `WouldBlock` and waits for readability.
         match self
             .0
-            .read_io(|sock| crate::sys::linux::splice(sock.as_fd(), pipe.write_fd(), len))
+            .read_io(|sock| crate::sys::pipe::splice(sock.as_fd(), pipe.write_fd(), len))
             .await
         {
             Ok(0) => Ok(Spliced::End(pipe)),
@@ -262,7 +262,7 @@ impl<T: Ready> SharedStream for Stream<T> {
             let moved = self
                 .0
                 .write_io(|sock| {
-                    crate::sys::linux::splice(filled.pipe().read_fd(), sock.as_fd(), left)
+                    crate::sys::pipe::splice(filled.pipe().read_fd(), sock.as_fd(), left)
                 })
                 .await?;
             if moved == 0 {

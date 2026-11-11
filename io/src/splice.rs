@@ -52,7 +52,7 @@ impl Pipe {
     ///
     /// Fails if the process is out of descriptors or pipe memory.
     pub fn new() -> io::Result<Self> {
-        let (read, write, capacity) = crate::sys::linux::pipe()?;
+        let (read, write, capacity) = crate::sys::pipe::pipe()?;
         Ok(Self {
             read,
             write,
@@ -116,7 +116,7 @@ impl FilledPipe {
         let mut bytes = vec![0; self.len];
         let mut read = 0;
         while read < bytes.len() {
-            match crate::sys::linux::read_pipe(self.pipe.read_fd(), &mut bytes[read..])? {
+            match crate::sys::pipe::read_pipe(self.pipe.read_fd(), &mut bytes[read..])? {
                 0 => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,

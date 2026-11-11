@@ -415,7 +415,7 @@ mod splice {
 
     impl Pipe {
         fn new() -> io::Result<Self> {
-            let (read, write, capacity) = crate::sys::linux::pipe()?;
+            let (read, write, capacity) = crate::sys::pipe::pipe()?;
             Ok(Self {
                 read: PipeEnd(Rc::new(read)),
                 write: PipeEnd(Rc::new(write)),
@@ -497,7 +497,7 @@ mod splice {
 
         let mut drained = 0;
         while drained < filled {
-            match crate::sys::linux::splice(
+            match crate::sys::pipe::splice(
                 pipe.read.as_fd(),
                 stream.inner.as_fd(),
                 filled - drained,
@@ -528,7 +528,7 @@ mod splice {
     /// Makes the socket `O_NONBLOCK`, once.
     fn nonblocking<S: Socket + AsFd>(stream: &Stream<S>) -> io::Result<()> {
         if !stream.nonblocking.get() {
-            crate::sys::linux::set_nonblocking(stream.inner.as_fd())?;
+            crate::sys::pipe::set_nonblocking(stream.inner.as_fd())?;
             stream.nonblocking.set(true);
         }
         Ok(())
@@ -562,7 +562,7 @@ mod splice {
         }
         let len = max.min(pipe.capacity());
         loop {
-            match crate::sys::linux::splice(stream.inner.as_fd(), pipe.write_fd(), len) {
+            match crate::sys::pipe::splice(stream.inner.as_fd(), pipe.write_fd(), len) {
                 Ok(0) => return Ok(Spliced::End(pipe)),
                 Ok(n) => return Ok(Spliced::Filled(FilledPipe::new(pipe, n))),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -583,7 +583,7 @@ mod splice {
         nonblocking(stream)?;
         let mut left = filled.len();
         while left > 0 {
-            match crate::sys::linux::splice(filled.pipe().read_fd(), stream.inner.as_fd(), left) {
+            match crate::sys::pipe::splice(filled.pipe().read_fd(), stream.inner.as_fd(), left) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
