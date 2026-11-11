@@ -33,8 +33,8 @@ use std::{
 };
 
 use http_kit_io::{
-    BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, SpliceRead, SpliceWrite, Write,
-    WriteControl,
+    BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, ReadAhead, SendFile, SpliceRead, SpliceWrite,
+    Write, WriteControl,
     splice::{FilledPipe, Pipe, Spliced},
 };
 use ktls_sys::bindings as uapi;
@@ -47,7 +47,7 @@ use crate::{
     engine::{Engine, copy_into, tls_error},
     record::{self, Boundary, CLOSE_NOTIFY, Cipher, Control, KEY_UPDATE, MAX_FRAGMENT, Message},
     side::Side,
-    stream::{KernelRead, KernelWrite},
+    stream::{KernelRead, KernelWrite, TransportRead},
 };
 
 /// What the halves share: rustls's key schedule, which both directions
@@ -73,10 +73,10 @@ pub(crate) enum Switched<D: Side> {
 /// kernel supports its suite.
 ///
 /// The kernel must start at a record boundary: everything buffered is
-/// decrypted here first, and a record that only partly arrived is read to
-/// its end, no further. The plaintext comes back to be read before the
-/// socket.
-pub(crate) async fn switch<D: Side, R: Read, W: Write + AsFd>(
+/// decrypted here first, what the transport received ahead of its reader
+/// included, and a record that only partly arrived is read to its end, no
+/// further. The plaintext comes back to be read before the socket.
+pub(crate) async fn switch<D: Side, R: TransportRead, W: Write + AsFd>(
     mut engine: Engine<D>,
     reader: &mut R,
     writer: &mut W,
@@ -120,6 +120,11 @@ pub(crate) async fn switch<D: Side, R: Read, W: Write + AsFd>(
             )));
         }
     }
+    // The kernel decrypts only what is still in the socket. Ciphertext the
+    // transport already received goes to rustls with the rest, and from here
+    // on the socket is read only as far as the boundary below asks.
+    let ahead = <R::Kernel<D> as KernelRead<R, D>>::stop_read_ahead(reader).await;
+    engine.incoming.extend_from_slice(&ahead);
     loop {
         engine.pump()?;
         if engine.peer_closed {
@@ -809,11 +814,15 @@ impl<W: SpliceWrite + SendFile + WriteControl + AsFd, D: Side> Writer<W, D> {
     }
 }
 
-impl<R: SpliceRead + AsFd, D: Side> KernelRead<R, D> for Reader<R, D> {
+impl<R: SpliceRead + ReadAhead + AsFd, D: Side> KernelRead<R, D> for Reader<R, D> {
     const SOCKET: bool = true;
 
     fn adopt(reader: Self) -> Self {
         reader
+    }
+
+    fn stop_read_ahead(reader: &mut R) -> impl Future<Output = Vec<u8>> {
+        reader.stop_read_ahead()
     }
 
     fn get_ref(&self) -> &R {

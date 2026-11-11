@@ -1,6 +1,6 @@
 //! Stream sockets.
 
-use std::{borrow::Borrow, fmt, fs::File, future::Future, io, rc::Rc};
+use std::{borrow::Borrow, fmt, fs::File, future::Future, io, ops::Deref, rc::Rc};
 
 use compio_buf::{BufResult, IntoInner, IoBuf, IoBufMut, IoVectoredBuf};
 
@@ -12,7 +12,66 @@ pub trait Read {
     /// spare capacity (`buf.slice(buf.buf_len()..)`).
     ///
     /// `Ok(0)` into a buffer with spare capacity means end of stream.
+    ///
+    /// A stream that receives ahead of its reader ([`ReadOwned`]) copies what
+    /// it already received first, and keeps what does not fit for the next
+    /// read.
     fn read<B: IoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
+}
+
+/// What [`ReadOwned::read_owned`] came back with.
+#[derive(Debug)]
+pub enum Received<B> {
+    /// Received bytes in a buffer the stream owns. Dropping it hands the
+    /// buffer back to the stream.
+    Lent(B),
+    /// The end of the stream.
+    End,
+    /// The stream has no buffer of its own to lend now: read into one of the
+    /// caller's with [`Read::read`].
+    ReadInstead,
+}
+
+/// Reads that lend the stream's own receive buffer, so a reader waiting for
+/// bytes holds no buffer of its own.
+///
+/// The compio implementation on Linux receives with a multishot receive into
+/// the provided buffer ring of the thread's runtime: one submission serves
+/// many receives, and a connection pins a buffer only from the moment bytes
+/// arrive until its reader is done with them. Every other implementation
+/// answers [`Received::ReadInstead`], and so does the compio one whenever no
+/// ring buffer is free.
+pub trait ReadOwned: Read {
+    /// The received bytes as lent out.
+    type Buf: Deref<Target = [u8]>;
+
+    /// Waits for received bytes and lends them out.
+    fn read_owned(&mut self) -> impl Future<Output = io::Result<Received<Self::Buf>>>;
+}
+
+/// The [`ReadOwned::Buf`] of a stream that never lends a buffer: there is
+/// none.
+#[derive(Debug, Clone, Copy)]
+pub enum NoBuf {}
+
+impl Deref for NoBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match *self {}
+    }
+}
+
+/// A stream that may receive ahead of its reader, and can stop.
+///
+/// Whoever hands the socket's receive side to the kernel (kernel TLS) needs
+/// every byte not yet received to still be in the socket.
+pub trait ReadAhead {
+    /// Stops receiving ahead of the reader, for good: from now on the socket
+    /// is read only when the reader asks. Returns the bytes received ahead
+    /// and not yet read, in order; the end of the stream or an error the
+    /// receive ended with is reported by the next read.
+    fn stop_read_ahead(&mut self) -> impl Future<Output = Vec<u8>>;
 }
 
 /// Writes from owned buffers.
@@ -201,7 +260,11 @@ pub(crate) mod sealed {
     /// halves can drive one socket concurrently. Every socket this crate
     /// implements is one.
     pub trait SharedStream: 'static {
+        type Buf: std::ops::Deref<Target = [u8]>;
+
         fn read<B: IoBufMut>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
+        fn read_owned(&self) -> impl Future<Output = io::Result<crate::Received<Self::Buf>>>;
+        fn stop_read_ahead(&self) -> impl Future<Output = Vec<u8>>;
         fn write<B: IoBuf>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
         fn write_vectored<B: IoVectoredBuf>(
             &self,
@@ -247,6 +310,26 @@ macro_rules! impl_stream {
                 buf: B,
             ) -> impl ::std::future::Future<Output = ::compio_buf::BufResult<usize, B>> {
                 $crate::stream::sealed::SharedStream::read(&*self, buf)
+            }
+        }
+
+        impl<$($generics)*> $crate::stream::ReadOwned for $ty {
+            type Buf = <$ty as $crate::stream::sealed::SharedStream>::Buf;
+
+            fn read_owned(
+                &mut self,
+            ) -> impl ::std::future::Future<
+                Output = ::std::io::Result<$crate::stream::Received<Self::Buf>>,
+            > {
+                $crate::stream::sealed::SharedStream::read_owned(&*self)
+            }
+        }
+
+        impl<$($generics)*> $crate::stream::ReadAhead for $ty {
+            fn stop_read_ahead(
+                &mut self,
+            ) -> impl ::std::future::Future<Output = ::std::vec::Vec<u8>> {
+                $crate::stream::sealed::SharedStream::stop_read_ahead(&*self)
             }
         }
 
@@ -403,6 +486,20 @@ impl<S: fmt::Debug> fmt::Debug for WriteHalf<S> {
 impl<S: SharedStream> Read for ReadHalf<S> {
     fn read<B: IoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
         self.0.read(buf)
+    }
+}
+
+impl<S: SharedStream> ReadOwned for ReadHalf<S> {
+    type Buf = S::Buf;
+
+    fn read_owned(&mut self) -> impl Future<Output = io::Result<Received<S::Buf>>> {
+        self.0.read_owned()
+    }
+}
+
+impl<S: SharedStream> ReadAhead for ReadHalf<S> {
+    fn stop_read_ahead(&mut self) -> impl Future<Output = Vec<u8>> {
+        self.0.stop_read_ahead()
     }
 }
 

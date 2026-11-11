@@ -15,7 +15,7 @@ use async_channel::{Receiver, Sender};
 use bytes::BytesMut;
 use http::{Method, StatusCode};
 use http_kit::{Body, Deadlines, Request, Response};
-use http_kit_io::{Read, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write};
+use http_kit_io::{ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write};
 
 use crate::{
     ClientConfig, Error, ParseError, Timeout, Upgraded, body,
@@ -270,7 +270,7 @@ pub fn handshake<R, W, T>(
     config: ClientConfig,
 ) -> (SendRequest, Connection<R, W, T>)
 where
-    R: Read + SpliceRead,
+    R: ReadOwned + SpliceRead,
     W: Write + SendFile + SpliceWrite,
     T: Timer,
 {
@@ -296,7 +296,7 @@ pub fn handshake_stream<S, T>(
 ) -> (SendRequest, Connection<S::ReadHalf, S::WriteHalf, T>)
 where
     S: Split,
-    S::ReadHalf: SpliceRead,
+    S::ReadHalf: ReadOwned + SpliceRead,
     S::WriteHalf: SendFile + SpliceWrite,
     T: Timer,
 {
@@ -312,7 +312,7 @@ enum Next {
 
 impl<R, W, T> Connection<R, W, T>
 where
-    R: Read + SpliceRead,
+    R: ReadOwned + SpliceRead,
     W: Write + SendFile + SpliceWrite,
     T: Timer,
 {
@@ -499,7 +499,7 @@ enum Received {
 
 /// Reads one response head, every wait for bytes bounded by the same
 /// `deadline`, so a head that dribbles in cannot extend it.
-async fn read_head<R: Read, T: Timer>(
+async fn read_head<R: ReadOwned, T: Timer>(
     recv: &mut Recv<R>,
     limits: &crate::Limits,
     method: &Method,
