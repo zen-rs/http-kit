@@ -67,7 +67,7 @@
 //! use futures_lite::future::zip;
 //! use http_kit::{Body, Request, Response};
 //! use http_kit_h1::{ClientConfig, ServerConfig, ServerConnection, handshake_stream};
-//! use http_kit_io::{Io as _, Listener as _, compio::Compio};
+//! use http_kit_io::{Dial as _, Listen as _, Listener as _, compio::Compio};
 //! use http_kit_tls::{TlsAcceptor, TlsConnector, rustls};
 //!
 //! # fn main() -> std::io::Result<()> {

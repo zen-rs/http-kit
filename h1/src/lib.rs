@@ -44,8 +44,8 @@
 //! # Timeouts
 //!
 //! Deadlines are driven by a [`Timer`](http_kit_io::Timer) handed to
-//! [`ServerConnection`] and [`handshake`] (every [`Io`](http_kit_io::Io)
-//! implementation is one). A server bounds the time to receive a request
+//! [`ServerConnection`] and [`handshake`] (every
+//! `http_kit_io` implementation is one). A server bounds the time to receive a request
 //! head, the idle time between keep-alive requests and each read of a
 //! request body; a client bounds its wait for `100 Continue`. The durations
 //! are fields of [`ServerConfig`] and [`ClientConfig`].
@@ -64,7 +64,7 @@
 //! use futures_lite::future::zip;
 //! use http_kit::{Body, Request, Response};
 //! use http_kit_h1::{ClientConfig, ServerConfig, ServerConnection, handshake_stream};
-//! use http_kit_io::{Io as _, Listener as _, compio::Compio};
+//! use http_kit_io::{Dial as _, Listen as _, Listener as _, compio::Compio};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! compio::runtime::Runtime::new()?.block_on(async {

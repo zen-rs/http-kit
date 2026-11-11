@@ -21,12 +21,14 @@ use ::async_io::Async;
 use socket2::SockRef;
 
 use crate::{
-    Io,
+    Datagram, Dial, FromStd, Listen,
     poll::IntoPoll,
     readiness::{self, sealed::Ready},
     stream::Listener,
     time::Timer,
 };
+#[cfg(unix)]
+use crate::{DialUnix, FromStdUnix, ListenUnix};
 
 /// The async-io implementation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -51,37 +53,64 @@ impl Timer for AsyncIo {
     }
 }
 
-impl Io for AsyncIo {
-    type TcpStream = TcpStream;
-    type TcpListener = TcpListener;
-    #[cfg(unix)]
-    type UnixStream = UnixStream;
-    #[cfg(unix)]
-    type UnixListener = UnixListener;
-    type UdpSocket = UdpSocket;
+impl Dial for AsyncIo {
+    type Connection = TcpStream;
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         Async::<std::net::TcpStream>::connect(addr)
             .await
             .map(readiness::Stream::new)
     }
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+impl DialUnix for AsyncIo {
+    type UnixConnection = UnixStream;
+
     async fn connect_unix(&self, path: &std::path::Path) -> io::Result<UnixStream> {
         Async::<std::os::unix::net::UnixStream>::connect(path)
             .await
             .map(readiness::Stream::new)
     }
+}
 
-    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
-        Async::new(listener).map(readiness::Listener::new)
+impl Listen for AsyncIo {
+    type Listener = TcpListener;
+
+    fn bind_tcp(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+        self.tcp_listener(std::net::TcpListener::bind(addr)?)
     }
+}
 
-    #[cfg(unix)]
+#[cfg(unix)]
+impl ListenUnix for AsyncIo {
+    type UnixListener = UnixListener;
+
+    fn bind_unix(&self, path: &std::path::Path) -> io::Result<UnixListener> {
+        self.unix_listener(std::os::unix::net::UnixListener::bind(path)?)
+    }
+}
+
+impl Datagram for AsyncIo {
+    type UdpSocket = UdpSocket;
+
+    async fn bind_udp(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
+        self.udp_socket(std::net::UdpSocket::bind(addr)?)
+    }
+}
+
+#[cfg(unix)]
+impl FromStdUnix for AsyncIo {
     fn unix_listener(
         &self,
         listener: std::os::unix::net::UnixListener,
     ) -> io::Result<UnixListener> {
+        Async::new(listener).map(readiness::Listener::new)
+    }
+}
+
+impl FromStd for AsyncIo {
+    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
         Async::new(listener).map(readiness::Listener::new)
     }
 

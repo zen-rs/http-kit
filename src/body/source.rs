@@ -303,7 +303,7 @@ mod pipe_tests {
     use http_kit_io::{
         splice::{FilledPipe, Pipe, Spliced},
         tokio::Tokio,
-        Io, Listener, SpliceRead,
+        Listen, Listener, SpliceRead,
     };
     use std::io::Write as _;
 

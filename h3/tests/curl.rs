@@ -12,7 +12,7 @@ use std::{path::PathBuf, process::Command, time::Duration};
 use futures_lite::future::zip;
 use http_kit::{Body, Method, Request, Response};
 use http_kit_h3::Server;
-use http_kit_io::{DatagramSocket as _, Io as _};
+use http_kit_io::{Datagram as _, DatagramSocket as _};
 use support::{CJK, loopback, on_compio, pki, server_config, within};
 
 fn curl() -> Option<PathBuf> {
@@ -52,7 +52,7 @@ fn answers_curl_http3() {
     let output = download.clone();
 
     on_compio(|io| async move {
-        let socket = io.bind_udp(loopback()).unwrap();
+        let socket = io.bind_udp(loopback()).await.unwrap();
         let port = socket.local_addr().unwrap().port();
         let server = Server::new(socket, io, &server_config(&pki)).unwrap();
         let (stop, stopped) = async_channel::bounded::<()>(1);

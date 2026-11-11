@@ -22,6 +22,7 @@ async-io = ["dep:async-io", "dep:socket2", "dep:libc", "dep:windows-sys"]
 
 [dependencies]
 compio-buf = { version = "0.8.3", default-features = false, features = ["bytes"] }
+futures-core = { version = "0.3.34", default-features = false }
 futures-io = { version = "0.3.34", default-features = false, features = ["std"] }
 
 compio = { version = "0.19.2", default-features = false, features = ["runtime", "net", "time", "io-uring", "polling"], optional = true }

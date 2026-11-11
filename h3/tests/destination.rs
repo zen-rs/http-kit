@@ -23,7 +23,7 @@ use std::{
 use futures_lite::future::zip;
 use http_kit::{Body, Request, Response, StatusCode};
 use http_kit_h3::{Client, ConnectionInfo, Server};
-use http_kit_io::{DatagramSocket as _, Io};
+use http_kit_io::{DatagramSocket as _, FromStd, Timer};
 use support::{CJK, client_config, on_compio, on_tokio, pki, server_config, within};
 
 const LIMIT: Duration = Duration::from_secs(30);
@@ -54,7 +54,7 @@ fn dual_stack() -> std::net::UdpSocket {
     socket.into()
 }
 
-async fn wildcard_server<I: Io>(io: I) {
+async fn wildcard_server<I: FromStd + Timer + Clone>(io: I) {
     let pki = pki();
     let io = &io;
     let socket = io.udp_socket(dual_stack()).unwrap();
@@ -72,6 +72,7 @@ async fn wildcard_server<I: Io>(io: I) {
             let mut client = Client::new(&client_config(&pki)).unwrap();
             let socket = io
                 .bind_udp(SocketAddr::new(reached.ip(), 0))
+                .await
                 .expect("bind client");
             let (send, connection) = client
                 .connect(socket, io.clone(), "localhost", reached)

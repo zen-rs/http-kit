@@ -12,7 +12,7 @@ use std::{
 
 use http_kit::{Body, Request, Response};
 use http_kit_h1::{ServerConfig, ServerConnection, ServerOutcome};
-use http_kit_io::{Io, Listener as _, SendFile, SpliceRead, SpliceWrite, Split};
+use http_kit_io::{FromStdUnix, Listener as _, Split, Timer};
 
 const CJK: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
 
@@ -58,9 +58,7 @@ fn split_response(response: &[u8]) -> (String, &[u8]) {
 /// Serves one connection with `service`.
 async fn serve<I, S>(io: I, name: &str, target: &str, service: S) -> Vec<u8>
 where
-    I: Io,
-    <I::UnixStream as Split>::ReadHalf: SpliceRead,
-    <I::UnixStream as Split>::WriteHalf: SendFile + SpliceWrite,
+    I: FromStdUnix + Timer + Clone,
     S: http_kit_h1::Service,
 {
     let (dir, path) = socket_dir(name);
@@ -83,11 +81,7 @@ where
     response
 }
 
-async fn text_response<I: Io>(io: I, name: &str)
-where
-    <I::UnixStream as Split>::ReadHalf: SpliceRead,
-    <I::UnixStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn text_response<I: FromStdUnix + Timer + Clone>(io: I, name: &str) {
     let service = |_: Request| async { Response::new(Body::from_bytes(CJK)) };
     let response = serve(io, name, "/hello", service).await;
     let (head, body) = split_response(&response);
@@ -96,11 +90,7 @@ where
 }
 
 #[cfg(feature = "fs")]
-async fn file_region_response<I: Io>(io: I, name: &str)
-where
-    <I::UnixStream as Split>::ReadHalf: SpliceRead,
-    <I::UnixStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn file_region_response<I: FromStdUnix + Timer + Clone>(io: I, name: &str) {
     let file_path = std::env::temp_dir().join(format!("hk1-{}-{}.bin", std::process::id(), name));
     let mut contents = include_bytes!("unix.rs").repeat(48);
     contents.extend(CJK.as_bytes());
