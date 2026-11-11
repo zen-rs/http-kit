@@ -250,6 +250,8 @@ pub struct Connection<R, W, T> {
     timer: T,
     exchanges: Queue,
     config: ClientConfig,
+    /// Queued writes, and the pipe request bodies reuse.
+    outbox: Outbox,
 }
 
 impl<R, W, T> fmt::Debug for Connection<R, W, T> {
@@ -283,6 +285,7 @@ where
             timer,
             exchanges: Queue(exchanges),
             config,
+            outbox: Outbox::default(),
         },
     )
 }
@@ -388,9 +391,9 @@ where
         let delivered = Cell::new(false);
 
         let writer = &mut self.writer;
+        let outbox = &mut self.outbox;
         let send = async {
             let _written = written_tx;
-            let mut outbox = Outbox::default();
             outbox.push(head.freeze());
             if expect_continue {
                 outbox.flush(writer).await?;
@@ -403,7 +406,7 @@ where
                     None => tracing::debug!("no 100 Continue in time, sending the body"),
                 }
             }
-            send_message(writer, &mut outbox, Some(body), &mut plan.encoder).await?;
+            send_message(writer, outbox, Some(body), &mut plan.encoder).await?;
             Ok::<_, Error>(true)
         };
 

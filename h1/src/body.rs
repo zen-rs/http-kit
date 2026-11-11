@@ -15,7 +15,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use async_channel::{Receiver, Sender, TrySendError};
+use async_channel::{Receiver, Sender};
 use futures_lite::Stream;
 use http_kit::{BodyError, BodyFrame, FrameSource, PipeOffer};
 
@@ -25,7 +25,9 @@ pub(crate) enum Message {
     /// A frame, with the consumer's offer when the driver did not use its
     /// pipe.
     Frame(BodyFrame, Option<PipeOffer>),
-    End,
+    /// The end, with the consumer's offer when it answers a demand that
+    /// carried one.
+    End(Option<PipeOffer>),
     Error(Error),
 }
 
@@ -37,11 +39,12 @@ pub(crate) fn channel() -> (BodySender, IncomingBody) {
     (
         BodySender {
             frames: frames_tx,
-            demand: demand_rx,
+            demand: demand_rx.clone(),
         },
         IncomingBody {
             frames: Box::pin(frames_rx),
             demand: demand_tx,
+            unanswered: Box::new(demand_rx),
             waiting: false,
             done: false,
         },
@@ -72,6 +75,11 @@ pub(crate) struct IncomingBody {
     // Pinned: the receiver's stream keeps a listener that must not move.
     frames: Pin<Box<Receiver<Message>>>,
     demand: Sender<Option<PipeOffer>>,
+    /// The demand channel's other end, to take back a demand the driver never
+    /// received: the end of a body is queued behind its last frame, so the
+    /// demand that finds it went unread, offer and pipe with it. Boxed, since
+    /// a receiver is not `Unpin`; only `try_recv` is called on it.
+    unanswered: Box<Receiver<Option<PipeOffer>>>,
     waiting: bool,
     done: bool,
 }
@@ -88,40 +96,50 @@ impl FrameSource for IncomingBody {
         }
         if !this.waiting {
             let demand = offer.as_deref_mut().map(PipeOffer::detach);
-            match this.demand.try_send(demand) {
-                // A closed demand channel means the driver is gone; the frame
-                // channel reports how it ended.
-                Ok(()) | Err(TrySendError::Closed(_)) => this.waiting = true,
-                Err(TrySendError::Full(_)) => {
-                    unreachable!("one demand is outstanding at a time")
-                }
+            // The channel stays open while this end holds `unanswered`, also
+            // once the driver is gone; the frame channel reports how it ended.
+            if this.demand.try_send(demand).is_err() {
+                unreachable!("one demand is outstanding at a time");
             }
+            this.waiting = true;
         }
         let message = ready!(this.frames.as_mut().poll_next(cx));
         this.waiting = false;
-        Poll::Ready(match message {
+        let (polled, detached) = match message {
             Some(Message::Frame(frame, detached)) => {
-                let offered = offer.is_some();
-                if let (Some(offer), Some(detached)) = (offer, detached) {
-                    offer.reattach(detached);
-                }
-                Some(if offered { Ok(frame) } else { read_out(frame) })
+                let frame = if offer.is_some() {
+                    Ok(frame)
+                } else {
+                    read_out(frame)
+                };
+                (Some(frame), detached)
             }
-            Some(Message::End) => {
+            Some(Message::End(detached)) => {
                 this.done = true;
-                None
+                (None, detached)
             }
             Some(Message::Error(error)) => {
                 this.done = true;
-                Some(Err(error.into()))
+                (Some(Err(error.into())), None)
             }
             None => {
                 // The driver stopped without ending the body: never pass a
                 // truncated body off as a complete one.
                 this.done = true;
-                Some(Err(Error::Parse(ParseError::Incomplete).into()))
+                (Some(Err(Error::Parse(ParseError::Incomplete).into())), None)
             }
-        })
+        };
+        if let Some(offer) = offer {
+            if let Some(detached) = detached {
+                offer.reattach(detached);
+            }
+            if this.done
+                && let Ok(Some(detached)) = this.unanswered.try_recv()
+            {
+                offer.reattach(detached);
+            }
+        }
+        Poll::Ready(polled)
     }
 }
 

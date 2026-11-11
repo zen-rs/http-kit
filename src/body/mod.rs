@@ -1209,8 +1209,10 @@ impl<F: Flavor> GenericBody<F> {
             .map(|frame| frame.map(|frame| frame.map(into_http_frame)))
     }
 
-    /// Polls the next frame, telling the source the consumer would take a
-    /// pipe frame of up to [`PipeOffer::max`] bytes.
+    /// Polls the next frame, telling the source, when `offer` is `Some`, that
+    /// the consumer would take a pipe frame of up to [`PipeOffer::max`] bytes;
+    /// with `None` it is [`poll_next`](Stream::poll_next), so a forwarder
+    /// passes its own consumer's offer, or its absence, straight through.
     ///
     /// The frame is a `BodyFrame::Pipe` only if the source holds bytes in
     /// the kernel and accepted the offer; otherwise it is whatever
@@ -1223,9 +1225,9 @@ impl<F: Flavor> GenericBody<F> {
     pub fn poll_frame_offering(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        offer: &mut PipeOffer,
+        offer: Option<&mut PipeOffer>,
     ) -> Poll<Option<Result<BodyFrame, Error>>> {
-        self.get_mut().poll_frames(cx, Some(offer))
+        self.get_mut().poll_frames(cx, offer)
     }
 
     fn poll_frames(
