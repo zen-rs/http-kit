@@ -15,7 +15,7 @@ use async_channel::{Receiver, Sender};
 use bytes::BytesMut;
 use http::{Method, StatusCode};
 use http_kit::{Body, Request, Response};
-use http_kit_io::{Read, SendFile, Split, Timer, Write};
+use http_kit_io::{Read, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write};
 
 use crate::{
     ClientConfig, Error, ParseError, Timeout, Upgraded, body,
@@ -270,8 +270,8 @@ pub fn handshake<R, W, T>(
     config: ClientConfig,
 ) -> (SendRequest, Connection<R, W, T>)
 where
-    R: Read,
-    W: Write + SendFile,
+    R: Read + SpliceRead,
+    W: Write + SendFile + SpliceWrite,
     T: Timer,
 {
     let (send, exchanges) = async_channel::bounded(1);
@@ -296,7 +296,8 @@ pub fn handshake_stream<S, T>(
 ) -> (SendRequest, Connection<S::ReadHalf, S::WriteHalf, T>)
 where
     S: Split,
-    S::WriteHalf: SendFile,
+    S::ReadHalf: SpliceRead,
+    S::WriteHalf: SendFile + SpliceWrite,
     T: Timer,
 {
     let (reader, writer) = stream.split();
@@ -311,8 +312,8 @@ enum Next {
 
 impl<R, W, T> Connection<R, W, T>
 where
-    R: Read,
-    W: Write + SendFile,
+    R: Read + SpliceRead,
+    W: Write + SendFile + SpliceWrite,
     T: Timer,
 {
     /// Answers requests until every [`SendRequest`] is dropped, the
@@ -419,7 +420,7 @@ where
                 kind => {
                     let (sender, incoming) = body::channel();
                     (
-                        Response::from_parts(head.parts, Body::from_frames(incoming)),
+                        Response::from_parts(head.parts, Body::from_source(incoming)),
                         Some((sender, BodyDecoder::new(kind))),
                     )
                 }

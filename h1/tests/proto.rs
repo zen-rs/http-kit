@@ -898,3 +898,84 @@ fn response_with_a_final_coding_other_than_chunked_is_close_delimited() {
         assert!(parse_response_head(&mut BytesMut::from(raw), &limits(), &Method::GET).is_err());
     }
 }
+
+#[test]
+fn a_content_length_body_is_a_raw_run_to_its_end() {
+    let mut decoder = BodyDecoder::new(BodyKind::Length(10));
+    assert_eq!(decoder.raw_run(), Some(10));
+    // A caller moved four bytes itself; the decoder carries on after them.
+    decoder.consume_raw(4);
+    assert_eq!(decoder.raw_run(), Some(6));
+    let mut buf = BytesMut::from(&b"abcdef"[..]);
+    assert_eq!(
+        decoder.decode(&mut buf, &limits()).unwrap(),
+        Some(Decoded::Data(Bytes::from_static(b"abcdef")))
+    );
+    assert!(decoder.is_done());
+    assert_eq!(decoder.raw_run(), None);
+
+    let mut decoder = BodyDecoder::new(BodyKind::Length(3));
+    decoder.consume_raw(3);
+    assert!(decoder.is_done(), "the run was the whole body");
+    assert_eq!(
+        decoder.decode(&mut BytesMut::new(), &limits()).unwrap(),
+        Some(Decoded::End)
+    );
+}
+
+#[test]
+fn a_chunk_is_a_raw_run_between_its_size_line_and_its_crlf() {
+    let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+    assert_eq!(decoder.raw_run(), None, "a chunk-size line is framing");
+    let mut buf = BytesMut::from(&b"a\r\n"[..]);
+    assert_eq!(decoder.decode(&mut buf, &limits()).unwrap(), None);
+    assert_eq!(decoder.raw_run(), Some(10));
+    decoder.consume_raw(7);
+    assert_eq!(decoder.raw_run(), Some(3));
+    decoder.consume_raw(3);
+    assert_eq!(
+        decoder.raw_run(),
+        None,
+        "the CRLF after the data is framing"
+    );
+
+    // The framing, the next chunk and the trailers still decode exactly.
+    let mut buf = BytesMut::from(&b"\r\n2\r\nxy\r\n0\r\nx-sum: 1\r\n\r\n"[..]);
+    let mut data = Vec::new();
+    let mut trailers = None;
+    loop {
+        match decoder.decode(&mut buf, &limits()).unwrap().unwrap() {
+            Decoded::Data(chunk) => data.push(chunk),
+            Decoded::Trailers(fields) => trailers = Some(fields),
+            Decoded::End => break,
+        }
+    }
+    assert_eq!(data, [Bytes::from_static(b"xy")]);
+    assert_eq!(trailers.unwrap()["x-sum"], "1");
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn a_close_delimited_body_is_a_raw_run_that_never_ends_by_itself() {
+    let mut decoder = BodyDecoder::new(BodyKind::CloseDelimited);
+    assert_eq!(decoder.raw_run(), Some(u64::MAX));
+    decoder.consume_raw(1 << 20);
+    assert_eq!(decoder.raw_run(), Some(u64::MAX));
+    assert!(!decoder.is_done());
+    assert_eq!(
+        decoder.decode_eof(&mut BytesMut::new(), &limits()).unwrap(),
+        Decoded::End
+    );
+}
+
+#[test]
+#[should_panic(expected = "consumed past the end of the body")]
+fn consuming_past_the_end_of_a_body_is_a_bug() {
+    BodyDecoder::new(BodyKind::Length(3)).consume_raw(4);
+}
+
+#[test]
+fn only_a_body_in_a_raw_run_has_one() {
+    assert_eq!(BodyDecoder::new(BodyKind::Empty).raw_run(), None);
+    assert_eq!(BodyDecoder::new(BodyKind::Length(0)).raw_run(), None);
+}

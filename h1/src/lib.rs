@@ -20,6 +20,16 @@
 //! [`SendFile`](http_kit_io::SendFile), which is `sendfile`/`splice` where
 //! the platform has them.
 //!
+//! With the `pipe` feature, on Linux and Android, a received body goes through
+//! the kernel as well. A consumer that polls it with a
+//! [`PipeOffer`](http_kit::PipeOffer) gets `BodyFrame::Pipe` frames for the
+//! runs of raw body bytes (the rest of the `Content-Length`, the rest of a
+//! chunk, a close-delimited body) that are still in a socket that can splice,
+//! with nothing buffered ahead of them; framing, trailers and everything else
+//! stay data and trailers frames, and a consumer that offers nothing receives
+//! only those. A pipe frame in a body being sent is spliced into the socket
+//! like a file region, with the chunk framing written around it.
+//!
 //! # Request smuggling
 //!
 //! Framing follows RFC 9112 §6.3 strictly: `Content-Length` together with
@@ -96,6 +106,7 @@ mod body;
 mod config;
 mod conn;
 mod error;
+mod splice;
 
 use std::fmt;
 
