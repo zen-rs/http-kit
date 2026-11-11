@@ -57,13 +57,13 @@
 //! ```no_run
 //! use http_kit::{Body, Request, Response};
 //! use http_kit_h3::{Identity, Server, ServerConfig};
-//! use http_kit_io::{Io as _, compio::Compio};
+//! use http_kit_io::{Datagram as _, compio::Compio};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let identity = Identity::from_pem(std::fs::read("cert.pem")?, std::fs::read("key.pem")?);
 //! let config = ServerConfig::new(identity, 64 * 1024);
 //! compio::runtime::Runtime::new()?.block_on(async {
-//!     let socket = Compio.bind_udp("[::]:443".parse().unwrap())?;
+//!     let socket = Compio.bind_udp("[::]:443".parse().unwrap()).await?;
 //!     let server = Server::new(socket, Compio, &config)?;
 //!     let service = |request: Request| async move {
 //!         Response::new(Body::from_bytes(request.uri().path().to_owned()))

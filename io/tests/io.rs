@@ -12,9 +12,17 @@ use std::{
 
 use futures_lite::{AsyncReadExt as _, AsyncWriteExt as _, future::zip};
 use http_kit_io::{
-    BufResult, DatagramSocket, IntoPoll, Io, Listener, Read, SendFile, SpliceRead, SpliceWrite,
-    Split, TcpOptions, Write, datagram::MAX_COALESCED_BYTES,
+    BufResult, Datagram, DatagramSocket, Dial, FromStd, IntoPoll, Listen, Listener, Read, SendFile,
+    SpliceRead, SpliceWrite, Split, TcpOptions, Timer, Write, datagram::MAX_COALESCED_BYTES,
 };
+#[cfg(unix)]
+use http_kit_io::{DialUnix, FromStdUnix, ListenUnix};
+
+/// The stream a TCP listener of `I` accepts.
+type Accepted<I> = <<I as Listen>::Listener as Listener>::Stream;
+/// The stream a Unix-domain listener of `I` accepts.
+#[cfg(unix)]
+type AcceptedUnix<I> = <<I as ListenUnix>::UnixListener as Listener>::Stream;
 
 /// Compares two byte strings without printing kilobytes of them.
 #[track_caller]
@@ -51,7 +59,7 @@ async fn read_to_end(reader: &mut impl Read) -> Vec<u8> {
     }
 }
 
-async fn tcp_echo<I: Io>(io: I) {
+async fn tcp_echo<I: Dial + Listen>(io: I) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let addr = listener.local_addr().expect("local address");
     let data = payload();
@@ -84,7 +92,7 @@ async fn tcp_echo<I: Io>(io: I) {
     assert_bytes(&echoed, &data);
 }
 
-async fn tcp_vectored<I: Io>(io: I) {
+async fn tcp_vectored<I: Dial + Listen>(io: I) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let addr = listener.local_addr().expect("local address");
     let head = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n".to_vec();
@@ -106,9 +114,9 @@ async fn tcp_vectored<I: Io>(io: I) {
     assert_bytes(&received, &[head, body].concat());
 }
 
-async fn udp_echo<I: Io>(io: I) {
-    let server = io.bind_udp(loopback()).expect("bind server");
-    let client = io.bind_udp(loopback()).expect("bind client");
+async fn udp_echo<I: Datagram>(io: I) {
+    let server = io.bind_udp(loopback()).await.expect("bind server");
+    let client = io.bind_udp(loopback()).await.expect("bind client");
     let server_addr = server.local_addr().expect("server address");
     let client_addr = client.local_addr().expect("client address");
     let message = include_bytes!("io.rs")[..1200].to_vec();
@@ -136,9 +144,9 @@ async fn udp_echo<I: Io>(io: I) {
     assert_bytes(&echoed, &message);
 }
 
-async fn udp_segments<I: Io>(io: I) {
-    let receiver = io.bind_udp(loopback()).expect("bind receiver");
-    let sender = io.bind_udp(loopback()).expect("bind sender");
+async fn udp_segments<I: Datagram>(io: I) {
+    let receiver = io.bind_udp(loopback()).await.expect("bind receiver");
+    let sender = io.bind_udp(loopback()).await.expect("bind sender");
     let target = receiver.local_addr().expect("receiver address");
     if cfg!(target_os = "linux") {
         assert_eq!(sender.max_send_segments(), 64, "Linux offers UDP GSO");
@@ -185,7 +193,7 @@ async fn udp_segments<I: Io>(io: I) {
     target_vendor = "apple",
     windows
 ))]
-async fn udp_destination<I: Io>(io: &I, server: std::net::UdpSocket, destinations: &[IpAddr]) {
+async fn udp_destination<I: FromStd>(io: &I, server: std::net::UdpSocket, destinations: &[IpAddr]) {
     let server = io.udp_socket(server).expect("adopt wildcard server");
     let port = server.local_addr().expect("server address").port();
     let question = include_bytes!("io.rs")[..300].to_vec();
@@ -193,6 +201,7 @@ async fn udp_destination<I: Io>(io: &I, server: std::net::UdpSocket, destination
     for &destination in destinations {
         let client = io
             .bind_udp(SocketAddr::new(loopback_for(destination), 0))
+            .await
             .expect("bind client");
         let target = SocketAddr::new(destination, port);
 
@@ -246,7 +255,7 @@ fn loopback_for(ip: IpAddr) -> IpAddr {
     target_vendor = "apple",
     windows
 ))]
-async fn udp_destination_dual_stack<I: Io>(io: I) {
+async fn udp_destination_dual_stack<I: FromStd>(io: I) {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
@@ -267,7 +276,7 @@ async fn udp_destination_dual_stack<I: Io>(io: I) {
 
 /// Linux answers for all of 127/8; other platforms have only 127.0.0.1.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-async fn udp_destination_v4<I: Io>(io: I) {
+async fn udp_destination_v4<I: FromStd>(io: I) {
     udp_destination(
         &io,
         std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind wildcard server"),
@@ -281,7 +290,10 @@ async fn udp_destination_v4<I: Io>(io: I) {
 
 /// A file larger than a pipe, so a splice-based transfer takes several
 /// rounds, sent from an offset that is not page-aligned.
-async fn send_file<I: Io>(io: I, name: &str) {
+async fn send_file<I: Dial + Listen>(io: I, name: &str)
+where
+    Accepted<I>: SendFile,
+{
     // `name` comes from `module_path!`, and Windows forbids `:` in file names.
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name.replace("::", "-"));
     let contents = payload();
@@ -361,7 +373,10 @@ fn cjk_payload(len: usize) -> Vec<u8> {
 
 /// 16 MiB goes from one stream socket through a pipe into another.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-async fn splice_socket_to_socket<I: Io>(io: I) {
+async fn splice_socket_to_socket<I: Listen>(io: I)
+where
+    Accepted<I>: SpliceRead + SpliceWrite,
+{
     use http_kit_io::splice::{Pipe, Spliced};
     use std::io::{Read as _, Write as _};
 
@@ -413,11 +428,7 @@ async fn splice_socket_to_socket<I: Io>(io: I) {
 /// half-close of one peer reaches the other while the reverse direction stays
 /// open.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-async fn splice_duplex_join<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SpliceWrite,
-{
+async fn splice_duplex_join<I: Listen>(io: I) {
     use http_kit_io::splice::SpliceDuplex;
     use std::io::{Read as _, Write as _};
 
@@ -477,7 +488,11 @@ where
     assert_bytes(&received_by_left, &expected_left);
 }
 
-async fn poll_echo<I: Io>(io: I) {
+async fn poll_echo<I: Dial + Listen>(io: I)
+where
+    I::Connection: IntoPoll,
+    Accepted<I>: IntoPoll,
+{
     let listener = io.bind_tcp(loopback()).expect("bind");
     let addr = listener.local_addr().expect("local address");
     let data = payload();
@@ -541,7 +556,7 @@ fn unix_client(path: std::path::PathBuf, data: Vec<u8>) -> std::thread::JoinHand
 }
 
 #[cfg(unix)]
-async fn unix_echo<I: Io>(io: I, name: &str) {
+async fn unix_echo<I: FromStdUnix>(io: I, name: &str) {
     let (dir, path) = unix_socket_dir(name);
     let listener = io
         .unix_listener(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
@@ -572,7 +587,7 @@ async fn unix_echo<I: Io>(io: I, name: &str) {
 /// Both halves of a split stream at once: the server reads the whole request
 /// while it writes the whole reply.
 #[cfg(unix)]
-async fn unix_split<I: Io>(io: I, name: &str) {
+async fn unix_split<I: FromStdUnix>(io: I, name: &str) {
     let (dir, path) = unix_socket_dir(name);
     let listener = io
         .unix_listener(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
@@ -597,7 +612,10 @@ async fn unix_split<I: Io>(io: I, name: &str) {
 }
 
 #[cfg(unix)]
-async fn unix_send_file<I: Io>(io: I, name: &str) {
+async fn unix_send_file<I: FromStdUnix>(io: I, name: &str)
+where
+    AcceptedUnix<I>: SendFile,
+{
     let (dir, path) = unix_socket_dir(name);
     let contents = payload();
     let file_path = dir.join("f");
@@ -622,7 +640,10 @@ async fn unix_send_file<I: Io>(io: I, name: &str) {
 }
 
 #[cfg(unix)]
-async fn unix_poll_echo<I: Io>(io: I, name: &str) {
+async fn unix_poll_echo<I: FromStdUnix>(io: I, name: &str)
+where
+    AcceptedUnix<I>: IntoPoll,
+{
     let (dir, path) = unix_socket_dir(name);
     let listener = io
         .unix_listener(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
@@ -647,7 +668,7 @@ async fn unix_poll_echo<I: Io>(io: I, name: &str) {
 /// `connect_unix` reaches a listener of the same implementation, and bytes
 /// round-trip.
 #[cfg(unix)]
-async fn unix_connect<I: Io>(io: I, name: &str) {
+async fn unix_connect<I: DialUnix + FromStdUnix>(io: I, name: &str) {
     let (dir, path) = unix_socket_dir(name);
     let listener = io
         .unix_listener(std::os::unix::net::UnixListener::bind(&path).expect("bind"))
@@ -691,7 +712,7 @@ async fn unix_connect<I: Io>(io: I, name: &str) {
 
 /// A path with nothing listening is refused, not hung.
 #[cfg(unix)]
-async fn unix_connect_refused<I: Io>(io: I, name: &str) {
+async fn unix_connect_refused<I: DialUnix>(io: I, name: &str) {
     let (dir, path) = unix_socket_dir(name);
     let Err(err) = io.connect_unix(&path).await else {
         panic!("nothing listens");
@@ -706,7 +727,7 @@ async fn unix_connect_refused<I: Io>(io: I, name: &str) {
     );
 }
 
-async fn tcp_nodelay<I: Io>(io: I) {
+async fn tcp_nodelay<I: Dial + Listen>(io: I) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let addr = listener.local_addr().expect("local address");
     let (accepted, stream) = zip(listener.accept(), io.connect(addr)).await;
@@ -718,7 +739,7 @@ async fn tcp_nodelay<I: Io>(io: I) {
     assert!(!stream.nodelay().expect("read TCP_NODELAY"));
 }
 
-async fn timer<I: Io>(io: I) {
+async fn timer<I: Timer>(io: I) {
     let start = Instant::now();
     io.sleep(Duration::from_millis(20)).await;
     assert!(start.elapsed() >= Duration::from_millis(20));
@@ -911,7 +932,7 @@ mod compio {
         use std::{io::Write as _, sync::mpsc, time::Duration};
 
         use http_kit_io::{
-            Io as _, Listener as _, SpliceRead as _,
+            Listen as _, Listener as _, SpliceRead as _,
             splice::{Pipe, Spliced},
         };
 
@@ -964,7 +985,7 @@ mod compio {
     fn send_file_to_a_stalled_peer_holds_no_kernel_worker() {
         use std::{io::Read as _, sync::mpsc, time::Duration};
 
-        use http_kit_io::{BufResult, Io as _, Listener as _, SendFile as _};
+        use http_kit_io::{BufResult, Listen as _, Listener as _, SendFile as _};
 
         const BUFFER: usize = 16 * 1024;
 

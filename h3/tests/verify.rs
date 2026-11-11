@@ -16,7 +16,7 @@ use std::{
 use futures_lite::future::zip;
 use http_kit::{Body, Method, Request, Response, StatusCode};
 use http_kit_h3::{Client, ClientConfig, Error, Rejection, Server, Verifier};
-use http_kit_io::{DatagramSocket as _, Io};
+use http_kit_io::{Datagram, DatagramSocket as _, Timer};
 use support::{
     CJK, MAX_FIELD_SECTION, Pki, loopback, on_compio, on_tokio, pki, server_config, within,
 };
@@ -57,13 +57,13 @@ fn get(port: u16) -> Request {
 
 /// Starts a server counting the requests it answers, and a client with
 /// `config`, and hands both ends to `test`.
-async fn exchange<I: Io, F: Future>(
+async fn exchange<I: Datagram + Timer + Clone, F: Future>(
     io: I,
     pki: &Pki,
     config: ClientConfig,
     test: impl FnOnce(http_kit_h3::SendRequest, u16, Arc<AtomicUsize>) -> F,
 ) -> (F::Output, Result<(), Error>) {
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let port = socket.local_addr().unwrap().port();
     let server = Server::new(socket, io.clone(), &server_config(pki)).unwrap();
     let (stop, stopped) = async_channel::bounded::<()>(1);
@@ -80,7 +80,7 @@ async fn exchange<I: Io, F: Future>(
     });
 
     let mut client = Client::new(&config).unwrap();
-    let socket = io.bind_udp(loopback()).unwrap();
+    let socket = io.bind_udp(loopback()).await.unwrap();
     let peer = ([127, 0, 0, 1], port).into();
     let (send, connection) = client
         .connect(socket, io.clone(), "localhost", peer)
@@ -98,7 +98,7 @@ async fn exchange<I: Io, F: Future>(
 /// A verifier that allows the chain decides the handshake: the client sees
 /// it complete before it sends anything, from every clone of the handle,
 /// and then a request is answered.
-async fn allowed_chain<I: Io>(io: I) {
+async fn allowed_chain<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
     let seen = Seen::default();
     let config = ClientConfig::with_verifier(recording(&seen, Ok(())), MAX_FIELD_SECTION);
@@ -140,7 +140,7 @@ fn allowed_chain_on_tokio() {
 
 /// A chain the verifier refuses fails the handshake with the alert it chose:
 /// readiness and the request both report it, and the server answers nothing.
-async fn refused_chain<I: Io>(io: I) {
+async fn refused_chain<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
     let seen = Seen::default();
     let config = ClientConfig::with_verifier(
@@ -183,7 +183,7 @@ fn refused_chain_on_tokio() {
 
 /// A pinned certificate: the verifier compares the leaf the server sent with
 /// the one it expects, as a real verifier compares what it is shown.
-async fn pinned_leaf<I: Io>(io: I) {
+async fn pinned_leaf<I: Datagram + Timer + Clone>(io: I) {
     let pki = pki();
     let other = support::pki();
     for (pinned, accepted) in [(pki.leaf.clone(), true), (other.leaf, false)] {
@@ -235,7 +235,7 @@ fn stapled() -> Vec<u8> {
 
 /// A response the server staples reaches the verifier byte for byte, and the
 /// handshake goes on when the verifier accepts it.
-async fn stapled_response<I: Io>(io: I) {
+async fn stapled_response<I: Datagram + Timer + Clone>(io: I) {
     let mut pki = pki();
     pki.identity = pki.identity.clone().with_ocsp_response(stapled());
     let seen = Seen::default();
@@ -264,7 +264,7 @@ fn stapled_response_on_tokio() {
 
 /// A verifier that reads a revoked status out of the stapled response fails
 /// the handshake with `certificate_revoked`, and nothing is sent.
-async fn revoked_status<I: Io>(io: I) {
+async fn revoked_status<I: Datagram + Timer + Clone>(io: I) {
     let mut pki = pki();
     let revoked = stapled();
     pki.identity = pki.identity.clone().with_ocsp_response(revoked.clone());

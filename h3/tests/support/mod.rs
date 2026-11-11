@@ -22,7 +22,7 @@ use boring::{
 };
 use futures_lite::future::or;
 use http_kit_h3::{ClientConfig, Identity, Roots, ServerConfig};
-use http_kit_io::Io;
+use http_kit_io::Timer;
 
 /// Greetings in Chinese, Japanese and Korean, for bodies and fields.
 pub const CJK: [&str; 3] = ["你好，世界。", "こんにちは、世界。", "안녕하세요, 세계."];
@@ -151,7 +151,7 @@ pub fn client_config(pki: &Pki) -> ClientConfig {
 }
 
 /// Runs `test` to completion, failing it if it takes longer than `limit`.
-pub async fn within<I: Io, F: Future>(io: &I, limit: Duration, test: F) -> F::Output {
+pub async fn within<I: Timer, F: Future>(io: &I, limit: Duration, test: F) -> F::Output {
     let expired = async {
         io.sleep(limit).await;
         panic!("test did not finish within {limit:?}");

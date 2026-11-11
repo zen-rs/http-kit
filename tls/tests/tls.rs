@@ -17,8 +17,8 @@ use http::Method;
 use http_kit::{Body, BodyFrame, Request, Response};
 use http_kit_h1::{ClientConfig, ServerConfig, ServerConnection, handshake_stream};
 use http_kit_io::{
-    BufResult, Io, IoBuf, IoVectoredBuf, Listener as _, Read, SendFile, SpliceRead, SpliceWrite,
-    Split, Write,
+    BufResult, Dial, IoBuf, IoVectoredBuf, Listen, Listener, Read, SendFile, SpliceRead,
+    SpliceWrite, Split, Timer, Write,
 };
 use http_kit_tls::{
     Client, Mode, Server, TlsAcceptor, TlsConnector, TlsStream, Transport,
@@ -147,6 +147,9 @@ fn loopback() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
+/// The stream a listener of `I` accepts.
+type Accepted<I> = <<I as Listen>::Listener as Listener>::Stream;
+
 /// Accepts one TLS connection and dials it, handing each end to its task.
 async fn tls_pair<I, S, C, SF, CF>(
     io: I,
@@ -156,10 +159,11 @@ async fn tls_pair<I, S, C, SF, CF>(
     client: C,
 ) -> (SF::Output, CF::Output)
 where
-    I: Io,
-    I::TcpStream: Transport,
-    S: FnOnce(TlsStream<I::TcpStream, Server>) -> SF,
-    C: FnOnce(TlsStream<I::TcpStream, Client>) -> CF,
+    I: Dial + Listen + Timer,
+    I::Connection: Transport,
+    Accepted<I>: Transport,
+    S: FnOnce(TlsStream<Accepted<I>, Server>) -> SF,
+    C: FnOnce(TlsStream<I::Connection, Client>) -> CF,
     SF: Future,
     CF: Future,
 {
@@ -200,9 +204,10 @@ async fn read_to_end(reader: &mut impl Read) -> io::Result<Vec<u8>> {
 /// ALPN picks the server's preference among what the client offers, and a
 /// large body crosses in both directions at once: the server echoes from
 /// its reading half to its writing half while the client is still writing.
-async fn alpn_and_full_duplex_echo<I: Io>(io: I)
+async fn alpn_and_full_duplex_echo<I: Dial + Listen + Timer>(io: I)
 where
-    I::TcpStream: Transport,
+    I::Connection: Transport,
+    Accepted<I>: Transport,
 {
     let identity = Identity::new();
     let body = cjk_body(40_000);
@@ -252,9 +257,10 @@ where
 
 /// Every suite kernel TLS can take, on TLS 1.3 and TLS 1.2: the handshake
 /// settles on it, and data crosses both ways.
-async fn every_kernel_suite<I: Io>(io: I)
+async fn every_kernel_suite<I: Dial + Listen + Timer + Clone>(io: I)
 where
-    I::TcpStream: Transport,
+    I::Connection: Transport,
+    Accepted<I>: Transport,
 {
     let identity = Identity::new();
     let tls12 = &rustls::version::TLS12;
@@ -455,12 +461,12 @@ fn request(method: Method, path: &str, body: Body) -> Request {
 /// HTTP/1.1 over TLS: a large CJK request body echoed back on a kept-alive
 /// connection, then a file region, which in kernel mode leaves through the
 /// socket's `send_file` and in user mode is read and encrypted.
-async fn http1_over_tls<I: Io>(io: I, name: &str)
+async fn http1_over_tls<I: Dial + Listen + Timer + Clone>(io: I, name: &str)
 where
-    I::TcpStream: Transport,
+    I::Connection: Transport,
     // The counting wrapper is a socket only where its halves are: kernel TLS
     // needs the descriptor, which `Transport` alone no longer implies.
-    Counted<I::TcpStream>: Transport,
+    Counted<Accepted<I>>: Transport,
 {
     let identity = Identity::new();
     let (path, contents) = payload_file(name);
@@ -579,9 +585,9 @@ where
 }
 
 /// A peer that connects and never speaks is refused at the deadline.
-async fn handshake_deadline<I: Io>(io: I)
+async fn handshake_deadline<I: Dial + Listen + Timer>(io: I)
 where
-    I::TcpStream: Transport,
+    Accepted<I>: Transport,
 {
     let identity = Identity::new();
     let acceptor = acceptor(&identity, TLS13_AES_128, &[])
@@ -599,9 +605,10 @@ where
 }
 
 /// A connection closed without `close_notify` is cut short, not ended.
-async fn truncation_is_an_error<I: Io>(io: I)
+async fn truncation_is_an_error<I: Dial + Listen + Timer>(io: I)
 where
-    I::TcpStream: Transport,
+    I::Connection: Transport,
+    Accepted<I>: Transport,
 {
     let identity = Identity::new();
     // No session tickets: a client that closes with tickets still unread in
@@ -642,9 +649,10 @@ where
 /// proxy runs: the outer session over the socket (in the kernel where it
 /// can be), the inner one over the outer stream, which only user space can
 /// serve. Data crosses both ways through both layers.
-async fn tls_in_tls<I: Io>(io: I)
+async fn tls_in_tls<I: Dial + Listen + Timer + Clone>(io: I)
 where
-    I::TcpStream: Transport,
+    I::Connection: Transport,
+    Accepted<I>: Transport,
 {
     let proxy = Identity::new();
     let origin = Identity::new();
@@ -721,9 +729,10 @@ impl<R: Read + 'static, W: Write + 'static> Split for Joined<R, W> {
 
 /// A TLS session over a stream joined from a TLS connection's two halves is a
 /// [`Transport`] whatever the features, and stays in user space.
-async fn tls_over_joined_halves<I: Io>(io: I)
+async fn tls_over_joined_halves<I: Dial + Listen + Timer + Clone>(io: I)
 where
-    I::TcpStream: Transport,
+    I::Connection: Transport,
+    Accepted<I>: Transport,
 {
     let proxy = Identity::new();
     let origin = Identity::new();
@@ -798,16 +807,17 @@ fn tls_stream_and_halves_implement_the_splice_traits() {
         assert_read_splice::<<TlsStream<S, Server> as Split>::ReadHalf>();
         assert_write_splice::<<TlsStream<S, Client> as Split>::WriteHalf>();
     }
-    check::<<http_kit_io::tokio::Tokio as Io>::TcpStream>();
-    check::<<http_kit_io::compio::Compio as Io>::TcpStream>();
+    check::<<http_kit_io::tokio::Tokio as Dial>::Connection>();
+    check::<<http_kit_io::compio::Compio as Dial>::Connection>();
 }
 
 /// A connection encrypted in user space reports that it cannot splice, on
 /// the stream and on both halves, and refuses a splice with the pipe back.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-async fn user_mode_cannot_splice<I: Io>(io: I)
+async fn user_mode_cannot_splice<I: Dial + Listen + Timer>(io: I)
 where
-    I::TcpStream: Transport,
+    I::Connection: Transport,
+    Accepted<I>: Transport,
 {
     use http_kit_io::splice::Pipe;
 
@@ -877,11 +887,13 @@ mod forward {
         thread::{self, JoinHandle},
     };
 
-    use http_kit_io::{BufResult, Io, Listener as _, SpliceRead, SpliceWrite, Split, Write};
+    use http_kit_io::{
+        BufResult, Dial, Listen, Listener as _, SpliceRead, SpliceWrite, Split, Timer, Write,
+    };
     use http_kit_tls::{Transport, rustls};
 
     use super::{
-        CJK, EXPECTED, Identity, Mode, TLS13_AES_128, acceptor, assert_bytes, cjk_body,
+        Accepted, CJK, EXPECTED, Identity, Mode, TLS13_AES_128, acceptor, assert_bytes, cjk_body,
         client_config, connector, localhost, loopback, server_config,
     };
 
@@ -1052,9 +1064,9 @@ mod forward {
     /// peer's key update. In kernel mode its receiving half takes the
     /// `KeyUpdate` out of the splice, and its writing half, asked for a key
     /// in return, sends its own before splicing the next round out.
-    pub(super) async fn echo_as_server<I: Io>(io: I)
+    pub(super) async fn echo_as_server<I: Listen + Timer>(io: I)
     where
-        I::TcpStream: Transport,
+        Accepted<I>: Transport,
     {
         let identity = Identity::new();
         let payload = cjk_body(4_000);
@@ -1089,9 +1101,9 @@ mod forward {
     /// peer sends session tickets after the handshake, which in kernel mode
     /// the client's kernel hands back from the splice, and then changes
     /// keys.
-    pub(super) async fn echo_as_client<I: Io>(io: I)
+    pub(super) async fn echo_as_client<I: Dial + Timer>(io: I)
     where
-        I::TcpStream: Transport,
+        I::Connection: Transport,
     {
         let identity = Identity::new();
         let payload = cjk_body(4_000);
@@ -1121,9 +1133,9 @@ mod forward {
     /// Bytes the peer sends right after its handshake are forwarded first,
     /// whether rustls decrypted them before the kernel took the connection
     /// (they come out of memory) or the kernel did (out of the socket).
-    pub(super) async fn early_bytes_come_first<I: Io>(io: I)
+    pub(super) async fn early_bytes_come_first<I: Listen + Timer>(io: I)
     where
-        I::TcpStream: Transport,
+        Accepted<I>: Transport,
     {
         let identity = Identity::new();
         let later = cjk_body(3_000);

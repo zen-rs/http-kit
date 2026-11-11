@@ -31,8 +31,8 @@ use http_kit_h1::{
     ClientConfig, ClientOutcome, ServerConfig, ServerConnection, ServerOutcome, Service, handshake,
 };
 use http_kit_io::{
-    BufResult, Io, IoBuf, IoBufMut, IoVectoredBuf, Listener as _, Read, SendFile, SpliceRead,
-    SpliceWrite, Split, Write,
+    BufResult, Dial, IoBuf, IoBufMut, IoVectoredBuf, Listen, Listener as _, Read, SendFile,
+    SpliceRead, SpliceWrite, Split, Timer, Write,
     splice::{FilledPipe, Pipe, Spliced},
 };
 
@@ -285,9 +285,7 @@ async fn serve_peer<I, S, T>(
     run: impl FnOnce(TcpStream) -> T + Send + 'static,
 ) -> (Spy, T)
 where
-    I: Io,
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
+    I: Listen + Timer + Clone,
     S: Service,
     T: Send + 'static,
 {
@@ -340,11 +338,7 @@ fn recording_service(
     }
 }
 
-async fn content_length_request<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn content_length_request<I: Listen + Timer + Clone>(io: I) {
     // Larger than one pipe holds, so the body takes several frames.
     let body = payload(4000);
     let sent = body.clone();
@@ -366,11 +360,7 @@ where
     assert_eq!(counts.spliced_in.get(), body.len());
 }
 
-async fn chunked_request_with_trailers<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn chunked_request_with_trailers<I: Listen + Timer + Clone>(io: I) {
     let body = payload(300);
     let sent = body.clone();
     let seen = Rc::default();
@@ -407,11 +397,7 @@ where
     assert_eq!(counts.spliced_in.get(), body.len());
 }
 
-async fn pipelined_request_stays_in_the_socket<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn pipelined_request_stays_in_the_socket<I: Listen + Timer + Clone>(io: I) {
     let body = payload(200);
     let sent = body.clone();
     let seen = Rc::default();
@@ -438,11 +424,7 @@ where
     assert_eq!(counts.spliced_in.get(), body.len(), "nothing past the body");
 }
 
-async fn pipelined_requests_in_one_write_are_read_as_data<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn pipelined_requests_in_one_write_are_read_as_data<I: Listen + Timer + Clone>(io: I) {
     // The whole of both requests is buffered with the head, so there is
     // nothing to splice: the bodies come as data, offer or not.
     let seen = Rc::default();
@@ -466,11 +448,7 @@ where
     assert_eq!(counts.spliced_in.get(), 0);
 }
 
-async fn a_consumer_that_offers_nothing_gets_data<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn a_consumer_that_offers_nothing_gets_data<I: Listen + Timer + Clone>(io: I) {
     let body = payload(300);
     let sent = body.clone();
     let seen = Rc::default();
@@ -489,11 +467,7 @@ where
     assert_eq!(counts.spliced_in.get(), 0, "the socket was never spliced");
 }
 
-async fn a_dropped_request_body_closes_the_connection<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn a_dropped_request_body_closes_the_connection<I: Listen + Timer + Clone>(io: I) {
     let first = payload(100);
     let announced = first.len() + 50_000;
     let sent = first.clone();
@@ -534,14 +508,12 @@ where
 }
 
 /// What a response body looked like to the client that read it.
-async fn fetch<I: Io, F, Fut>(
+async fn fetch<I: Dial + Timer + Clone, F, Fut>(
     io: I,
     serve: impl FnOnce(TcpStream) + Send + 'static,
     read: F,
 ) -> (Spy, Fut::Output)
 where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
     F: FnOnce(Response) -> Fut,
     Fut: Future,
 {
@@ -592,11 +564,7 @@ fn read_request(stream: &mut TcpStream) {
     read_until(stream, b"\r\n\r\n");
 }
 
-async fn close_delimited_response<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn close_delimited_response<I: Dial + Timer + Clone>(io: I) {
     let body = payload(300);
     let sent = body.clone();
     let (counts, seen) = fetch(
@@ -622,11 +590,7 @@ where
     assert_eq!(counts.spliced_in.get(), body.len());
 }
 
-async fn content_length_response<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn content_length_response<I: Dial + Timer + Clone>(io: I) {
     let body = payload(300);
     let sent = body.clone();
     let (counts, seen) = fetch(
@@ -652,11 +616,7 @@ where
     assert_eq!(counts.spliced_in.get(), body.len());
 }
 
-async fn chunked_response_with_trailers<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn chunked_response_with_trailers<I: Dial + Timer + Clone>(io: I) {
     let body = payload(300);
     let sent = body.clone();
     let (counts, seen) = fetch(
@@ -685,11 +645,7 @@ where
     assert_eq!(counts.spliced_in.get(), body.len());
 }
 
-async fn a_response_that_is_read_without_an_offer_is_data<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn a_response_that_is_read_without_an_offer_is_data<I: Dial + Timer + Clone>(io: I) {
     let body = payload(300);
     let sent = body.clone();
     let (counts, seen) = fetch(
@@ -714,11 +670,7 @@ where
     assert_eq!(counts.spliced_in.get(), 0, "the socket was never spliced");
 }
 
-async fn a_dropped_response_body_closes_the_connection<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn a_dropped_response_body_closes_the_connection<I: Dial + Timer + Clone>(io: I) {
     let first = payload(100);
     let announced = first.len() + 50_000;
     let sent = first.clone();
@@ -784,11 +736,7 @@ fn response_with_pipe(payload: &[u8], declared: Option<usize>) -> Response {
     response
 }
 
-async fn pipe_frames_are_sent_with_splice<I: Io>(io: I, chunked: bool)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn pipe_frames_are_sent_with_splice<I: Dial + Listen + Timer + Clone>(io: I, chunked: bool) {
     // Small enough for one pipe, large enough to tell from the framing.
     let payload = payload(200);
     let declared = (!chunked).then(|| "head:".len() + payload.len() + ":tail".len());
@@ -870,11 +818,7 @@ where
 }
 
 /// What a proxy does: the request body's pipes become the response body.
-async fn pipes_forward_from_request_to_response<I: Io>(io: I)
-where
-    <I::TcpStream as Split>::ReadHalf: SpliceRead,
-    <I::TcpStream as Split>::WriteHalf: SendFile + SpliceWrite,
-{
+async fn pipes_forward_from_request_to_response<I: Listen + Timer + Clone>(io: I) {
     let body = payload(200);
     let sent = body.clone();
     let service = |request: Request| async move {
