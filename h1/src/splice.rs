@@ -31,7 +31,7 @@ pub(crate) async fn try_splice<R: SpliceRead, T: Timer>(
     decoder: &mut BodyDecoder,
     limits: &Limits,
     timer: &T,
-    read_timeout: Option<Duration>,
+    body_idle: Option<Duration>,
     offer: &mut PipeOffer,
 ) -> Result<Attempt, Error> {
     use http_kit_io::splice::{Pipe, Spliced};
@@ -54,7 +54,7 @@ pub(crate) async fn try_splice<R: SpliceRead, T: Timer>(
     };
     let spliced = until(
         timer,
-        deadline_after(read_timeout),
+        deadline_after(body_idle),
         recv.reader.splice_to_pipe(pipe, max),
     )
     .await
@@ -82,7 +82,7 @@ pub(crate) async fn try_splice<R: SpliceRead, T: Timer>(
     _decoder: &mut BodyDecoder,
     _limits: &Limits,
     _timer: &T,
-    _read_timeout: Option<Duration>,
+    _body_idle: Option<Duration>,
     _offer: &mut PipeOffer,
 ) -> Result<Attempt, Error> {
     Ok(Attempt::Skip)

@@ -47,8 +47,12 @@
 //! [`ServerConnection`] and [`handshake`] (every
 //! `http_kit_io` implementation is one). A server bounds the time to receive a request
 //! head, the idle time between keep-alive requests and each read of a
-//! request body; a client bounds its wait for `100 Continue`. The durations
-//! are fields of [`ServerConfig`] and [`ClientConfig`].
+//! request body; a client bounds its wait for `100 Continue`. Those durations
+//! are fields of [`ServerConfig`] and [`ClientConfig`]. A client's receive
+//! deadlines belong to the exchange, not the connection: each request carries
+//! [`http_kit::Deadlines`] in its extensions, bounding the whole final
+//! response head from the moment the connection takes the request and each
+//! wait for body bytes.
 //!
 //! # Threads
 //!

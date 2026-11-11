@@ -300,7 +300,7 @@ pub(crate) enum Pumped {
 ///
 /// `before_first_read` runs once, when the consumer first asks for data and
 /// before anything is read (a server sends `100 Continue` there). Each read
-/// of the socket is bounded by `read_timeout`, if any.
+/// of the socket is bounded by `body_idle`, if any.
 ///
 /// A demand that carries a [`PipeOffer`] is answered with a pipe frame when
 /// the socket can splice, nothing is buffered and the decoder is in a raw
@@ -311,7 +311,7 @@ pub(crate) async fn pump_body<R: Read + SpliceRead, T: Timer, F: Future<Output =
     limits: &Limits,
     sender: BodySender,
     timer: &T,
-    read_timeout: Option<Duration>,
+    body_idle: Option<Duration>,
     before_first_read: F,
 ) -> Result<Pumped, Error> {
     let mut before_first_read = Some(before_first_read);
@@ -322,14 +322,14 @@ pub(crate) async fn pump_body<R: Read + SpliceRead, T: Timer, F: Future<Output =
         if let Some(first) = before_first_read.take() {
             first.await;
         }
-        let frame =
-            match next_frame(recv, &mut decoder, limits, timer, read_timeout, &mut offer).await {
-                Ok(frame) => frame,
-                Err(error) => {
-                    sender.send(Message::Error(error.clone())).await;
-                    return Err(error);
-                }
-            };
+        let frame = match next_frame(recv, &mut decoder, limits, timer, body_idle, &mut offer).await
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                sender.send(Message::Error(error.clone())).await;
+                return Err(error);
+            }
+        };
         // A send to a dropped body fails; the next demand then reports it.
         if let Some(frame) = frame {
             sender.send(Message::Frame(frame, offer)).await;
@@ -354,7 +354,7 @@ async fn next_frame<R: Read + SpliceRead, T: Timer>(
     decoder: &mut BodyDecoder,
     limits: &Limits,
     timer: &T,
-    read_timeout: Option<Duration>,
+    body_idle: Option<Duration>,
     offer: &mut Option<PipeOffer>,
 ) -> Result<Option<BodyFrame>, Error> {
     let decoded = loop {
@@ -364,7 +364,7 @@ async fn next_frame<R: Read + SpliceRead, T: Timer>(
         // The decoder needs bytes, possibly after consuming framing from the
         // buffer just now; the socket goes to the pipe before any read.
         if let Some(offer) = offer {
-            match try_splice(recv, decoder, limits, timer, read_timeout, offer).await? {
+            match try_splice(recv, decoder, limits, timer, body_idle, offer).await? {
                 Attempt::Skip => {}
                 #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
                 Attempt::Frame(frame) => return Ok(Some(frame)),
@@ -372,7 +372,7 @@ async fn next_frame<R: Read + SpliceRead, T: Timer>(
                 Attempt::End => return Ok(None),
             }
         }
-        let read = until(timer, deadline_after(read_timeout), recv.fill())
+        let read = until(timer, deadline_after(body_idle), recv.fill())
             .await
             .ok_or(Error::Timeout(Timeout::BodyRead))??;
         if read == 0 {

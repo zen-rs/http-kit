@@ -83,7 +83,7 @@ pub(crate) mod into_bytes;
 pub(crate) mod source;
 use crate::flavor::{Flavor, Holds, Local, Shared};
 use crate::sse::{Event, SseStream};
-pub use error_type::Error;
+pub use error_type::{Error, ReceiveError};
 pub use frame::BodyFrame;
 #[cfg(feature = "fs")]
 pub use frame::{FileRegion, FileRegionStream};

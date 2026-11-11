@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures_lite::future::zip;
 use http::{HeaderValue, Method, StatusCode, header};
-use http_kit::{Body, Request, Response};
+use http_kit::{Body, BodyError, Deadlines, ReceiveError, Request, Response};
 use http_kit_h1::{
     ClientConfig, ClientOutcome, Error, ServerConfig, ServerConnection, ServerOutcome, Timeout,
     handshake,
@@ -206,16 +206,37 @@ async fn unanswered_continue<T: Timer>(timer: T) {
     assert!(matches!(ran.unwrap(), ClientOutcome::Closed));
 }
 
-fn client_config() -> ClientConfig {
-    let mut config = ClientConfig::default();
-    config.read_timeout = Some(DEADLINE);
-    config
+/// Both receive deadlines at `DEADLINE`.
+fn deadlines() -> Deadlines {
+    Deadlines::default()
+        .with_response_head(DEADLINE)
+        .with_body_idle(DEADLINE)
+}
+
+/// A request that carries `deadlines` the way a client states them.
+fn with(mut request: Request, deadlines: Deadlines) -> Request {
+    request.extensions_mut().insert(deadlines);
+    request
+}
+
+fn get_with(uri: &str, deadlines: Deadlines) -> Request {
+    let mut request = Request::new(Body::empty());
+    *request.uri_mut() = uri.parse().unwrap();
+    with(request, deadlines)
 }
 
 fn get(uri: &str) -> Request {
-    let mut request = Request::new(Body::empty());
-    *request.uri_mut() = uri.parse().unwrap();
+    get_with(uri, deadlines())
+}
+
+fn put_expecting_continue() -> Request {
+    let mut request = Request::new(Body::from_bytes(CJK));
+    *request.method_mut() = Method::PUT;
+    *request.uri_mut() = "http://example.com/upload".parse().unwrap();
     request
+        .headers_mut()
+        .insert(header::EXPECT, HeaderValue::from_static("100-continue"));
+    with(request, deadlines())
 }
 
 /// The response head never arrives: the exchange fails at the read deadline.
@@ -223,7 +244,7 @@ async fn client_stalled_head<T: Timer>(timer: T) {
     let ends = connection();
     let (mut server_in, server_out) = ends.server;
     let (client_in, client_out) = ends.client;
-    let (send, conn) = handshake(client_in, client_out, timer, client_config());
+    let (send, conn) = handshake(client_in, client_out, timer, ClientConfig::default());
     let started = Instant::now();
     let peer = async move {
         server_in.until(b"\r\n\r\n").await;
@@ -236,37 +257,180 @@ async fn client_stalled_head<T: Timer>(timer: T) {
     assert_at_deadline(started);
 }
 
-/// An interim response restarts the wait; the final head then never comes.
-async fn client_stalled_head_after_interim<T: Timer + Clone>(timer: T) {
+/// An interim response does not restart the head deadline: the final head,
+/// which would still be in time had the interim response restarted the wait,
+/// finds the exchange already failed.
+async fn client_interim_does_not_extend_head<T: Timer + Clone>(timer: T) {
     let ends = connection();
     let (mut server_in, server_out) = ends.server;
     let (client_in, client_out) = ends.client;
-    let (send, conn) = handshake(client_in, client_out, timer.clone(), client_config());
+    let (send, conn) = handshake(
+        client_in,
+        client_out,
+        timer.clone(),
+        ClientConfig::default(),
+    );
     let started = Instant::now();
     let peer = async move {
         server_in.until(b"\r\n\r\n").await;
-        timer.sleep(DEADLINE / 2).await;
+        timer.sleep(DEADLINE * 2 / 5).await;
         server_out.send(b"HTTP/1.1 100 Continue\r\n\r\n");
         // The body is sent once the interim response arrived.
         server_in.until(CJK.as_bytes()).await;
+        timer
+            .sleep((DEADLINE * 13 / 10).saturating_sub(started.elapsed()))
+            .await;
+        let delivered = server_out.send_if_open(b"HTTP/1.1 204 No Content\r\n\r\n");
+        (server_in, server_out, delivered)
+    };
+    let client = async move { send.send(put_expecting_continue()).await };
+    let ((_in, _out, delivered), (ran, sent)) = zip(peer, zip(conn.run(), client)).await;
+    assert!(matches!(ran, Err(Error::Timeout(Timeout::HeadRead))));
+    assert!(matches!(sent, Err(Error::Timeout(Timeout::HeadRead))));
+    assert!(
+        !delivered,
+        "the connection must be gone before the final head"
+    );
+    assert_at_deadline(started);
+}
+
+/// A head that dribbles in, each piece well inside the deadline, still
+/// expires with the deadline: it bounds the whole head, not each read.
+async fn client_dribbled_head_expires<T: Timer + Clone>(timer: T) {
+    let ends = connection();
+    let (mut server_in, server_out) = ends.server;
+    let (client_in, client_out) = ends.client;
+    let (send, conn) = handshake(
+        client_in,
+        client_out,
+        timer.clone(),
+        ClientConfig::default(),
+    );
+    let started = Instant::now();
+    let peer = async move {
+        server_in.until(b"\r\n\r\n").await;
+        let pieces: [&[u8]; 4] = [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Length: 0\r\n",
+            b"X-Greeting: \xe4\xbd\xa0\xe5\xa5\xbd\r\n",
+            b"\r\n",
+        ];
+        let mut delivered = 0;
+        for piece in pieces {
+            timer.sleep(DEADLINE * 2 / 5).await;
+            delivered += usize::from(server_out.send_if_open(piece));
+        }
+        (server_in, server_out, delivered)
+    };
+    let client = async move { send.send(get("http://example.com/")).await };
+    let ((_in, _out, delivered), (ran, sent)) = zip(peer, zip(conn.run(), client)).await;
+    assert!(matches!(ran, Err(Error::Timeout(Timeout::HeadRead))));
+    assert!(matches!(sent, Err(Error::Timeout(Timeout::HeadRead))));
+    // Every wait was shorter than the deadline, so only a bound on the whole
+    // head can have fired; the head was still incomplete when it did.
+    assert!(
+        delivered < 4,
+        "the last piece must find the connection gone"
+    );
+    assert_at_deadline(started);
+}
+
+/// A request whose upload stalls is bounded by the head deadline too.
+async fn client_stalled_upload_exhausts_head<T: Timer>(timer: T) {
+    let ends = connection();
+    let (mut server_in, server_out) = ends.server;
+    let (client_in, client_out) = ends.client;
+    let (send, conn) = handshake(client_in, client_out, timer, ClientConfig::default());
+    let started = Instant::now();
+    let peer = async move {
+        // The head arrives; the body never does, and no response follows.
+        server_in.until(b"\r\n\r\n").await;
         (server_in, server_out)
     };
     let client = async move {
-        let mut request = Request::new(Body::from_bytes(CJK));
-        *request.method_mut() = Method::PUT;
+        let upload = futures_lite::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let mut request = Request::new(Body::from_stream(upload));
+        *request.method_mut() = Method::POST;
         *request.uri_mut() = "http://example.com/upload".parse().unwrap();
-        request
-            .headers_mut()
-            .insert(header::EXPECT, HeaderValue::from_static("100-continue"));
-        send.send(request).await
+        send.send(with(request, deadlines())).await
     };
     let (_peer, (ran, sent)) = zip(peer, zip(conn.run(), client)).await;
     assert!(matches!(ran, Err(Error::Timeout(Timeout::HeadRead))));
     assert!(matches!(sent, Err(Error::Timeout(Timeout::HeadRead))));
-    let elapsed = started.elapsed();
+    assert_at_deadline(started);
+}
+
+/// Two exchanges on one connection each keep their own deadlines: the first
+/// waits longer than the second's head deadline and succeeds, the second
+/// expires at its own.
+async fn client_deadlines_are_per_exchange<T: Timer + Clone>(timer: T) {
+    let ends = connection();
+    let (mut server_in, server_out) = ends.server;
+    let (client_in, client_out) = ends.client;
+    let (send, conn) = handshake(
+        client_in,
+        client_out,
+        timer.clone(),
+        ClientConfig::default(),
+    );
+    let patient = Deadlines::default().with_response_head(DEADLINE * 20);
+    let impatient = Deadlines::default().with_response_head(DEADLINE);
+    let peer = async move {
+        server_in.until(b"\r\n\r\n").await;
+        timer.sleep(DEADLINE * 2).await;
+        server_out.send(b"HTTP/1.1 204 No Content\r\n\r\n");
+        // The second request is never answered.
+        server_in.until(b"\r\n\r\n").await;
+        (server_in, server_out)
+    };
+    let client = async move {
+        let first_started = Instant::now();
+        let first = send.send(get_with("http://example.com/", patient)).await;
+        let first_elapsed = first_started.elapsed();
+        let second_started = Instant::now();
+        let second = send.send(get_with("http://example.com/", impatient)).await;
+        (first, first_elapsed, second, second_started)
+    };
+    let (_peer, (ran, (first, first_elapsed, second, second_started))) =
+        zip(peer, zip(conn.run(), client)).await;
+    assert_eq!(first.unwrap().status(), StatusCode::NO_CONTENT);
     assert!(
-        (DEADLINE + DEADLINE / 2..DEADLINE * 2 + SLACK).contains(&elapsed),
-        "the interim response must restart the wait; failed after {elapsed:?}"
+        first_elapsed >= DEADLINE * 2,
+        "the first exchange answered after {first_elapsed:?}"
+    );
+    assert!(matches!(second, Err(Error::Timeout(Timeout::HeadRead))));
+    assert!(matches!(ran, Err(Error::Timeout(Timeout::HeadRead))));
+    assert_at_deadline(second_started);
+}
+
+/// A body that ends before its length fails with `Receive(Incomplete)`.
+async fn client_truncated_body_is_incomplete<T: Timer>(timer: T) {
+    let ends = connection();
+    let (mut server_in, server_out) = ends.server;
+    let (client_in, client_out) = ends.client;
+    let (send, conn) = handshake(client_in, client_out, timer, ClientConfig::default());
+    let peer = async move {
+        server_in.until(b"\r\n\r\n").await;
+        server_out.send(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                CJK.len() * 2
+            )
+            .as_bytes(),
+        );
+        server_out.send(CJK.as_bytes());
+        // Dropping the writer ends the stream mid-body.
+        drop(server_out);
+        server_in
+    };
+    let client = async move {
+        let response = send.send(get("http://example.com/")).await.unwrap();
+        response.into_body().into_bytes().await.unwrap_err()
+    };
+    let (_peer, (_ran, error)) = zip(peer, zip(conn.run(), client)).await;
+    assert!(
+        matches!(error, BodyError::Receive(ReceiveError::Incomplete)),
+        "{error:?}"
     );
 }
 
@@ -275,7 +439,7 @@ async fn client_stalled_body<T: Timer>(timer: T) {
     let ends = connection();
     let (mut server_in, server_out) = ends.server;
     let (client_in, client_out) = ends.client;
-    let (send, conn) = handshake(client_in, client_out, timer, client_config());
+    let (send, conn) = handshake(client_in, client_out, timer, ClientConfig::default());
     let started = Instant::now();
     let peer = async move {
         server_in.until(b"\r\n\r\n").await;
@@ -293,7 +457,10 @@ async fn client_stalled_body<T: Timer>(timer: T) {
         let response = send.send(get("http://example.com/")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let error = response.into_body().into_bytes().await.unwrap_err();
-        assert!(error.to_string().contains("stalled"), "{error}");
+        assert!(
+            matches!(error, BodyError::Receive(ReceiveError::Stalled)),
+            "{error:?}"
+        );
     };
     let (_peer, (ran, ())) = zip(peer, zip(conn.run(), client)).await;
     assert!(matches!(ran, Err(Error::Timeout(Timeout::BodyRead))));
@@ -306,7 +473,12 @@ async fn client_slow_body_progresses<T: Timer + Clone>(timer: T) {
     let ends = connection();
     let (mut server_in, server_out) = ends.server;
     let (client_in, client_out) = ends.client;
-    let (send, conn) = handshake(client_in, client_out, timer.clone(), client_config());
+    let (send, conn) = handshake(
+        client_in,
+        client_out,
+        timer.clone(),
+        ClientConfig::default(),
+    );
     let started = Instant::now();
     let peer = async move {
         server_in.until(b"\r\n\r\n").await;
@@ -338,7 +510,12 @@ async fn client_idle_connection_is_reused<T: Timer + Clone>(timer: T) {
     let ends = connection();
     let (mut server_in, server_out) = ends.server;
     let (client_in, client_out) = ends.client;
-    let (send, conn) = handshake(client_in, client_out, timer.clone(), client_config());
+    let (send, conn) = handshake(
+        client_in,
+        client_out,
+        timer.clone(),
+        ClientConfig::default(),
+    );
     let peer = async move {
         for _ in 0..2 {
             server_in.until(b"\r\n\r\n").await;
@@ -372,7 +549,12 @@ async fn client_switched_stream_is_not_bounded<T: Timer + Clone>(timer: T) {
     let ends = connection();
     let (mut server_in, server_out) = ends.server;
     let (client_in, client_out) = ends.client;
-    let (send, conn) = handshake(client_in, client_out, timer.clone(), client_config());
+    let (send, conn) = handshake(
+        client_in,
+        client_out,
+        timer.clone(),
+        ClientConfig::default(),
+    );
     let peer = async move {
         server_in.until(b"\r\n\r\n").await;
         server_out
@@ -409,8 +591,28 @@ macro_rules! suite {
         }
 
         #[test]
-        fn client_stalled_head_after_interim() {
-            $run(super::client_stalled_head_after_interim($timer));
+        fn client_interim_does_not_extend_head() {
+            $run(super::client_interim_does_not_extend_head($timer));
+        }
+
+        #[test]
+        fn client_dribbled_head_expires() {
+            $run(super::client_dribbled_head_expires($timer));
+        }
+
+        #[test]
+        fn client_stalled_upload_exhausts_head() {
+            $run(super::client_stalled_upload_exhausts_head($timer));
+        }
+
+        #[test]
+        fn client_deadlines_are_per_exchange() {
+            $run(super::client_deadlines_are_per_exchange($timer));
+        }
+
+        #[test]
+        fn client_truncated_body_is_incomplete() {
+            $run(super::client_truncated_body_is_incomplete($timer));
         }
 
         #[test]

@@ -22,7 +22,7 @@ use std::{
 use async_channel::{Receiver, Sender};
 use futures_lite::Stream as _;
 use http::{Method, StatusCode};
-use http_kit::{Body, Request, Response};
+use http_kit::{Body, Deadlines, Request, Response};
 use http_kit_io::{BufResult, DatagramSocket, Timer, datagram::MAX_COALESCED_BYTES};
 use quiche::h3::{self, Header, WireErrorCode};
 
@@ -30,7 +30,7 @@ use crate::{
     ClientConfig, Error, TrySendError,
     body::{self, Command},
     config::H3Settings,
-    conn::{Conn, Outgoing, Recv, Send, Stream, StreamRef, code},
+    conn::{Bounds, Conn, Outgoing, Recv, Send, Stream, StreamRef, code},
     driver::{Sources, Transmit, peer_error},
     fields,
 };
@@ -279,6 +279,8 @@ struct Queued {
     fin: bool,
     declared: Option<u64>,
     head: bool,
+    /// The request's receive deadlines, applied once a stream opens.
+    deadlines: Deadlines,
     /// The request, until a stream took it. Dropped queued, it goes back to
     /// the caller: nothing of it was sent.
     request: Option<(http::request::Parts, Body)>,
@@ -290,6 +292,11 @@ impl Queued {
         let (request, respond) = exchange.take();
         let (parts, body) = request.into_parts();
         let len = body.len().map(|len| len as u64);
+        let deadlines = parts
+            .extensions
+            .get::<Deadlines>()
+            .copied()
+            .unwrap_or_default();
         match fields::encode_request(&parts, len) {
             Ok(fields) => {
                 let fin = body.is_empty() == Some(true);
@@ -300,6 +307,7 @@ impl Queued {
                         .then(|| fields::declared_length(&parts.headers).or(len))
                         .flatten(),
                     head: parts.method == Method::HEAD,
+                    deadlines,
                     request: Some((parts, body)),
                     respond,
                 })
@@ -432,6 +440,7 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
             }
 
             conn.on_timer(Instant::now());
+            conn.expire(Instant::now());
             if conn.quic.is_established() {
                 ready.report(Ok(()));
             }
@@ -482,7 +491,13 @@ impl<S: DatagramSocket, T: Timer> Connection<S, T> {
                 }
                 return outcome;
             }
-            sources.arm_timer(conn.next_deadline(), |at| timer.sleep_until(at));
+            sources.arm_timer(
+                [conn.next_deadline(), conn.stream_deadline()]
+                    .into_iter()
+                    .flatten()
+                    .min(),
+                |at| timer.sleep_until(at),
+            );
         }
     }
 }
@@ -527,6 +542,14 @@ fn open_next(
                     respond: Some(queued.respond.clone()),
                     unsent,
                     head_request: queued.head,
+                    bounds: Bounds {
+                        // Counted from when the stream opens.
+                        head_at: queued
+                            .deadlines
+                            .response_head
+                            .and_then(|head| Instant::now().checked_add(head)),
+                        body_idle: queued.deadlines.body_idle,
+                    },
                 },
             );
             let Some(body) = body else {
@@ -619,7 +642,9 @@ fn headers(
     let expected = expected.filter(|_| !bodiless);
     let body = if more_frames {
         let (frames, body) = body::incoming(key, mailbox.clone());
-        stream.recv = Some(Recv::new(frames, expected));
+        let mut recv = Recv::new(frames, expected);
+        recv.idle = stream.bounds.body_idle;
+        stream.recv = Some(recv);
         body
     } else {
         Body::empty()

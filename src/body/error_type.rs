@@ -3,6 +3,8 @@ extern crate std;
 
 use super::BodyFrozen;
 use alloc::boxed::Box;
+#[cfg(feature = "std")]
+use alloc::sync::Arc;
 use core::fmt::Display;
 use core::str::Utf8Error;
 
@@ -68,6 +70,68 @@ pub enum Error {
     /// This is a catch-all for any other error that can occur during body operations,
     /// typically errors from underlying libraries or custom implementations.
     Other(Box<dyn core::error::Error + Send + Sync + 'static>),
+    /// A body read off a connection ended before its end.
+    Receive(ReceiveError),
+}
+
+/// Why a body a peer was sending ended early, whatever protocol carried it.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ReceiveError {
+    /// No byte arrived within the body-idle deadline (a client's
+    /// [`Deadlines::body_idle`](crate::Deadlines::body_idle), a server's body
+    /// read timeout).
+    Stalled,
+    /// The connection or stream ended before the body did.
+    Incomplete,
+    /// The body's framing is invalid (chunk-size line, chunk terminator,
+    /// trailer syntax). `detail` names the violation.
+    Framing {
+        /// The violation.
+        detail: &'static str,
+    },
+    /// The trailer section exceeds `limit` bytes.
+    TrailersTooLarge {
+        /// The configured limit.
+        limit: usize,
+    },
+    /// The trailer section has more than `limit` fields.
+    TooManyTrailers {
+        /// The configured limit.
+        limit: usize,
+    },
+    /// The connection failed under the body. The error keeps its kind; on a
+    /// TLS connection a TLS-layer failure is `InvalidData`.
+    #[cfg(feature = "std")]
+    Connection(Arc<std::io::Error>),
+}
+
+impl Display for ReceiveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Stalled => f.write_str("body stalled: no data within the idle deadline"),
+            Self::Incomplete => f.write_str("body ended before its end"),
+            Self::Framing { detail } => write!(f, "invalid body framing: {detail}"),
+            Self::TrailersTooLarge { limit } => {
+                write!(f, "trailer section exceeds {limit} bytes")
+            }
+            Self::TooManyTrailers { limit } => {
+                write!(f, "trailer section has more than {limit} fields")
+            }
+            #[cfg(feature = "std")]
+            Self::Connection(error) => write!(f, "connection failed under the body: {error}"),
+        }
+    }
+}
+
+impl core::error::Error for ReceiveError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "std")]
+            Self::Connection(error) => Some(&**error),
+            _ => None,
+        }
+    }
 }
 
 macro_rules! impl_body_error {
@@ -112,6 +176,7 @@ macro_rules! impl_body_error {
 impl_body_error![
     (Io, std::io::Error),
     (Utf8, Utf8Error),
+    (Receive, ReceiveError),
     (Other, Box<dyn core::error::Error + Send + Sync + 'static>),
     (JsonError, serde_json::Error, "json"),
     (SerializeForm, serde_urlencoded::ser::Error, "form"),
@@ -121,6 +186,7 @@ impl_body_error![
 #[cfg(not(feature = "std"))]
 impl_body_error![
     (Utf8, Utf8Error),
+    (Receive, ReceiveError),
     (Other, Box<dyn core::error::Error + Send + Sync + 'static>),
     (JsonError, serde_json::Error, "json"),
     (SerializeForm, serde_urlencoded::ser::Error, "form"),

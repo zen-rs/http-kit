@@ -149,6 +149,16 @@ impl PipeWriter {
             .expect("reader is open");
     }
 
+    /// Sends raw bytes to a peer that may already be gone; whether it was
+    /// still there.
+    pub fn send_if_open(&self, bytes: &[u8]) -> bool {
+        self.chunks
+            .as_ref()
+            .expect("writer is open")
+            .try_send(bytes.to_vec())
+            .is_ok()
+    }
+
     /// Shuts down the write direction.
     pub fn close(&mut self) {
         self.chunks = None;

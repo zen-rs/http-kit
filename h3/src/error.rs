@@ -3,7 +3,7 @@
 use std::{fmt, io, sync::Arc};
 
 use http::StatusCode;
-use http_kit::BodyError;
+use http_kit::{BodyError, ReceiveError};
 
 /// A received message that violates HTTP/3 (RFC 9114 §4.1.2).
 ///
@@ -48,6 +48,21 @@ pub enum Malformed {
     /// The body is longer or shorter than its `Content-Length`.
     #[error("body length differs from its Content-Length")]
     ContentLengthMismatch,
+}
+
+/// Which of a request's [`Deadlines`](http_kit::Deadlines) passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Timeout {
+    /// The final response head did not arrive within
+    /// [`Deadlines::response_head`](http_kit::Deadlines::response_head),
+    /// counted from when the request's stream opened.
+    #[error("response head not received in time")]
+    ResponseHead,
+    /// A wait for body bytes delivered nothing within
+    /// [`Deadlines::body_idle`](http_kit::Deadlines::body_idle).
+    #[error("response body stalled")]
+    BodyIdle,
 }
 
 /// An error on an HTTP/3 endpoint, connection or stream.
@@ -97,6 +112,10 @@ pub enum Error {
     /// An outgoing request has no authority, in its URI or a `Host` field.
     #[error("request has neither an authority nor a Host field")]
     MissingAuthority,
+    /// A deadline from the request's [`Deadlines`](http_kit::Deadlines)
+    /// passed. The stream was reset with `H3_REQUEST_CANCELLED`.
+    #[error("timed out: {0}")]
+    Timeout(Timeout),
     /// The peer reset the stream with this HTTP/3 error code.
     #[error("stream reset by peer with code {0:#x}")]
     StreamReset(u64),
@@ -160,8 +179,39 @@ impl From<BodyError> for Error {
 }
 
 impl From<Error> for BodyError {
+    /// A failure of a body being received is classified into
+    /// [`BodyError::Receive`]; anything else stays boxed.
     fn from(error: Error) -> Self {
-        Self::Other(Box::new(error))
+        match error {
+            Error::Timeout(Timeout::BodyIdle) => ReceiveError::Stalled.into(),
+            Error::StreamReset(_) | Error::PeerClosed { .. } | Error::ConnectionClosed => {
+                ReceiveError::Incomplete.into()
+            }
+            Error::Malformed(malformed) => ReceiveError::Framing {
+                detail: malformed.detail(),
+            }
+            .into(),
+            Error::Io(error) => ReceiveError::Connection(error).into(),
+            other => Self::Other(Box::new(other)),
+        }
+    }
+}
+
+impl Malformed {
+    /// What the violation is, as the `detail` of [`ReceiveError::Framing`].
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::MissingPseudoHeader(_) => "missing or empty pseudo-header field",
+            Self::InvalidPseudoHeader => "misplaced, repeated or unknown pseudo-header field",
+            Self::InvalidField => "invalid field",
+            Self::ConnectionSpecificField => "connection-specific field",
+            Self::InvalidMethod => "invalid method",
+            Self::InvalidTarget => "invalid request target",
+            Self::InvalidAuthority => "missing or conflicting authority",
+            Self::InvalidStatus => "invalid status",
+            Self::InvalidContentLength => "invalid Content-Length",
+            Self::ContentLengthMismatch => "body length differs from its Content-Length",
+        }
     }
 }
 

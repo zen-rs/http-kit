@@ -108,7 +108,7 @@ pub use crate::{
         TransportConfig, Trust, Verifier,
     },
     conn::ConnectionInfo,
-    error::{Error, Malformed, TrySendError},
+    error::{Error, Malformed, Timeout, TrySendError},
     retry::{RetryConfig, RetryWhen, TokenKey},
     server::{Server, ServerStats, Service},
 };
