@@ -312,6 +312,9 @@ async fn send_region<W: Write + SendFile>(
     tracing::trace!(offset, len, "sending a file region");
     let BufResult(result, _file) = writer.send_file_all(file, offset, size).await;
     result?;
+    // With the record above, a log tells a region the socket took whole
+    // from one that never finished.
+    tracing::trace!(offset, len, "sent a file region");
     outbox.extend(encoder.region_end());
     Ok(())
 }
