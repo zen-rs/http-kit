@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/zen-rs/http-kit/compare/io/v0.6.0...io/v0.6.1) - 2026-11-11
+
+### Fixed
+
+- *(io)* start no task when a stream with a file slot drops
+
 ## [0.6.0](https://github.com/zen-rs/http-kit/compare/io/v0.5.0...io/v0.6.0) - 2026-11-11
 
 ### Added
