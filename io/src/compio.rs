@@ -477,8 +477,10 @@ impl<S: Socket> Stream<S> {
         let _ = io;
         Self {
             #[cfg(all(unix, debug_assertions))]
-            identity: crate::sys::unix::Identity::of(inner.as_fd())
-                .expect("a stream's socket is open when the stream is made"),
+            identity: crate::sys::unix::Identity::of(std::os::fd::AsRawFd::as_raw_fd(
+                &inner.as_fd(),
+            ))
+            .expect("a stream's socket is open when the stream is made"),
             #[cfg(target_os = "linux")]
             file: files::File::new(inner.shared_fd(), io.file_table()),
             inner,
@@ -501,7 +503,7 @@ impl<S: Socket> Stream<S> {
     async fn submit<T: ::compio::driver::OpCode + 'static>(&self, op: T) -> BufResult<usize, T> {
         #[cfg(target_os = "linux")]
         {
-            self.file().submit(op).await
+            self.file.submit(op).await
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -519,18 +521,8 @@ impl<S: Socket> Stream<S> {
     fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
         let fd = self.inner.as_fd();
         #[cfg(debug_assertions)]
-        self.identity.check(fd);
+        self.identity.check(std::os::fd::AsRawFd::as_raw_fd(&fd));
         fd
-    }
-
-    /// The socket's hold on its slot, through which every operation is
-    /// submitted: one naming the descriptor while the socket has no slot is
-    /// a use of its number, checked as [`fd`](Self::fd) checks it.
-    #[cfg(target_os = "linux")]
-    #[track_caller]
-    fn file(&self) -> &files::File {
-        self.fd();
-        &self.file
     }
 }
 
@@ -564,7 +556,7 @@ impl<S: Socket> Stream<S> {
         if self.recv_empty.get() {
             op.poll_first();
         }
-        let (BufResult(res, op), extra) = self.file().submit_with_extra(op).await;
+        let (BufResult(res, op), extra) = self.file.submit_with_extra(op).await;
         if let Some(Ok(nonempty)) = extra.map(|extra| extra.sock_nonempty()) {
             self.recv_empty.set(!nonempty);
         }
@@ -581,7 +573,7 @@ impl<S: Socket> Stream<S> {
         use compio_buf::IntoInner as _;
 
         let op = Send::new(self.inner.shared_fd(), buf, SendFlags::empty());
-        let BufResult(res, op) = self.file().submit(op).await;
+        let BufResult(res, op) = self.file.submit(op).await;
         BufResult(res, op.into_inner())
     }
 
@@ -590,7 +582,7 @@ impl<S: Socket> Stream<S> {
         use compio_buf::IntoInner as _;
 
         let op = SendVectored::new(self.inner.shared_fd(), buf, SendFlags::empty());
-        let BufResult(res, op) = self.file().submit(op).await;
+        let BufResult(res, op) = self.file.submit(op).await;
         BufResult(res, op.into_inner())
     }
 
@@ -598,7 +590,7 @@ impl<S: Socket> Stream<S> {
         use ::compio::driver::op::ShutdownSocket;
 
         let op = ShutdownSocket::new(self.inner.shared_fd(), std::net::Shutdown::Write);
-        match self.file().submit(op).await.0 {
+        match self.file.submit(op).await.0 {
             // A socket that is not connected has nothing to shut down, as
             // compio's stream has it.
             Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
@@ -671,7 +663,7 @@ impl<S: std::os::fd::AsFd> std::os::fd::AsFd for Stream<S> {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         let fd = self.inner.as_fd();
         #[cfg(debug_assertions)]
-        self.identity.check(fd);
+        self.identity.check(std::os::fd::AsRawFd::as_raw_fd(&fd));
         fd
     }
 }
@@ -685,7 +677,7 @@ impl<S: Socket> SharedStream for Stream<S> {
     async fn read<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
         #[cfg(target_os = "linux")]
         {
-            let buf = match self.recv.read_ahead(&self.inner, self.file(), buf).await {
+            let buf = match self.recv.read_ahead(&self.inner, &self.file, buf).await {
                 recv::Copied::Done(result) => return result,
                 recv::Copied::ReadInstead(buf) => buf,
             };
@@ -700,7 +692,7 @@ impl<S: Socket> SharedStream for Stream<S> {
     async fn read_owned(&self) -> io::Result<crate::Received<Self::Buf>> {
         #[cfg(target_os = "linux")]
         {
-            self.recv.read_owned(&self.inner, self.file()).await
+            self.recv.read_owned(&self.inner, &self.file).await
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1218,6 +1210,10 @@ mod files {
         slot: Rc<Slot>,
         /// The socket's descriptor, which the slot replaces in an entry.
         fd: RawFd,
+        /// The socket `fd` names, which an operation naming the descriptor
+        /// checks it still does (debug builds, zen-rs/http-kit#159).
+        #[cfg(debug_assertions)]
+        identity: crate::sys::unix::Identity,
     }
 
     /// What a stream and its slot's keeper share.
@@ -1268,7 +1264,13 @@ mod files {
                     }
                 });
             }
-            Self { slot, fd }
+            Self {
+                slot,
+                fd,
+                #[cfg(debug_assertions)]
+                identity: crate::sys::unix::Identity::of(fd)
+                    .expect("a stream's socket is open when the stream is made"),
+            }
         }
 
         fn slot(&self) -> io::Result<Option<u32>> {
@@ -1288,12 +1290,22 @@ mod files {
 
         /// `op`, naming the socket by its slot when it has one; or, with
         /// `op` back, the error taking a slot failed with.
+        ///
+        /// Without a slot `op` names the descriptor's number, which debug
+        /// builds check still names the socket.
+        #[track_caller]
         pub(super) fn address<T>(&self, op: T) -> Result<Addressed<T>, (io::Error, T)> {
             match self.slot() {
-                Ok(slot) => Ok(Addressed {
-                    op,
-                    slot: slot.map(|index| (index, self.fd)),
-                }),
+                Ok(slot) => {
+                    #[cfg(debug_assertions)]
+                    if slot.is_none() {
+                        self.identity.check(self.fd);
+                    }
+                    Ok(Addressed {
+                        op,
+                        slot: slot.map(|index| (index, self.fd)),
+                    })
+                }
                 Err(error) => Err((error, op)),
             }
         }
@@ -1545,7 +1557,7 @@ mod zero_copy {
             let rest = Shared(Rc::clone(&buf)).slice(written);
             let res = if zero_copy {
                 let op = SendVectoredZc::new(stream.inner.shared_fd(), rest, flags);
-                match stream.file().address(op) {
+                match stream.file.address(op) {
                     Ok(op) => send(op).await,
                     Err((e, _)) => Err(e),
                 }

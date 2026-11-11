@@ -54,14 +54,13 @@ pub(crate) struct Identity {
 
 #[cfg(all(feature = "compio", debug_assertions))]
 impl Identity {
-    /// The identity of the file `fd` names.
-    pub(crate) fn of(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<Self> {
-        use std::os::fd::AsRawFd as _;
-
+    /// The identity of the file `fd` names. A number is all `fstat` needs:
+    /// one that names nothing is reported as `EBADF`.
+    pub(crate) fn of(fd: std::os::fd::RawFd) -> io::Result<Self> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `stat` is valid for the write of one `struct stat`, and
-        // `fd` is borrowed, so the call reads a descriptor that is open.
-        if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        // SAFETY: `stat` is valid for the write of one `struct stat`; the
+        // kernel reads nothing through `fd` but its number.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `fstat` succeeded, so it filled `stat`.
@@ -75,21 +74,17 @@ impl Identity {
 
     /// Panics unless `fd` still names the file `self` identifies.
     #[track_caller]
-    pub(crate) fn check(self, fd: std::os::fd::BorrowedFd<'_>) {
-        use std::os::fd::AsRawFd as _;
-
+    pub(crate) fn check(self, fd: std::os::fd::RawFd) {
         match Self::of(fd) {
             Ok(now) if now == self => {}
             Ok(now) => panic!(
-                "descriptor {} no longer names the stream's socket ({self:?}): it names a {} \
+                "descriptor {fd} no longer names the stream's socket ({self:?}): it names a {} \
                  ({now:?}), so the number was closed and reused while the stream held it",
-                fd.as_raw_fd(),
                 now.kind_name(),
             ),
             Err(error) => panic!(
-                "descriptor {} no longer names the stream's socket ({self:?}): {error}, so the \
+                "descriptor {fd} no longer names the stream's socket ({self:?}): {error}, so the \
                  number was closed while the stream held it",
-                fd.as_raw_fd(),
             ),
         }
     }
