@@ -88,7 +88,6 @@ pub(crate) fn sendfile(
 
 /// A pipe for `splice(2)`, with its capacity: a splice from a file into it
 /// moves at most that many bytes.
-#[cfg(feature = "compio")]
 pub(crate) fn pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd, usize)> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
@@ -106,7 +105,6 @@ pub(crate) fn pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd, 
 }
 
 /// Sets `O_NONBLOCK` on `fd`'s open file description.
-#[cfg(feature = "compio")]
 pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     let mut on: libc::c_int = 1;
     // SAFETY: `FIONBIO` reads one `c_int` through the pointer passed.
@@ -120,19 +118,48 @@ pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
 /// which has an offset (a pipe or a socket), that never waits: `SPLICE_F_NONBLOCK` covers the pipe end,
 /// and a socket end must itself be `O_NONBLOCK`, since a socket's wait is
 /// decided by its own flag alone (`splice_to_socket` and `tcp_splice_read`).
-#[cfg(feature = "compio")]
+/// A call interrupted by a signal is repeated.
 pub(crate) fn splice(from: BorrowedFd<'_>, to: BorrowedFd<'_>, len: usize) -> io::Result<usize> {
-    // SAFETY: both descriptors are open for the duration of the call, and
-    // the offsets are null, so the kernel writes through neither.
-    let moved = unsafe {
-        libc::splice(
-            from.as_raw_fd(),
-            std::ptr::null_mut(),
-            to.as_raw_fd(),
-            std::ptr::null_mut(),
-            len,
-            libc::SPLICE_F_NONBLOCK,
-        )
-    };
-    usize::try_from(moved).map_err(|_| io::Error::last_os_error())
+    loop {
+        // SAFETY: both descriptors are open for the duration of the call, and
+        // the offsets are null, so the kernel writes through neither.
+        let moved = unsafe {
+            libc::splice(
+                from.as_raw_fd(),
+                std::ptr::null_mut(),
+                to.as_raw_fd(),
+                std::ptr::null_mut(),
+                len,
+                libc::SPLICE_F_NONBLOCK,
+            )
+        };
+        match usize::try_from(moved) {
+            Ok(moved) => return Ok(moved),
+            Err(_) => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+/// `read(2)` into `buf` from the read end of a pipe that holds at least
+/// `buf.len()` bytes, so it never waits.
+pub(crate) fn read_pipe(pipe: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        // SAFETY: `buf` is valid for writes of its length and the descriptor
+        // is open for the duration of the call.
+        let read = unsafe { libc::read(pipe.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        match usize::try_from(read) {
+            Ok(read) => return Ok(read),
+            Err(_) => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
 }

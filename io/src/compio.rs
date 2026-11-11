@@ -206,10 +206,13 @@ pub struct Stream<S> {
     /// The pipe file transfers splice through, kept between transfers. A
     /// transfer takes it out while data may sit in it, so one that fails or
     /// is cancelled midway drops it instead of leaving stale bytes behind.
-    /// A stream that has held one has an `O_NONBLOCK` socket, which compio's
-    /// own operations on io_uring still wait on inside the kernel.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pipe: std::cell::Cell<Option<splice::Pipe>>,
+    /// Whether the socket is `O_NONBLOCK`, which every splice through a pipe
+    /// requires and which compio's own operations on io_uring still wait on
+    /// inside the kernel.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    nonblocking: std::cell::Cell<bool>,
 }
 
 impl<S> Stream<S> {
@@ -218,6 +221,8 @@ impl<S> Stream<S> {
             inner,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             pipe: std::cell::Cell::new(None),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            nonblocking: std::cell::Cell::new(false),
         }
     }
 
@@ -333,6 +338,23 @@ impl<S: Socket> SharedStream for Stream<S> {
         self.inner.write_control(buf, control).await
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_to_pipe(
+        &self,
+        pipe: crate::splice::Pipe,
+        max: usize,
+    ) -> Result<crate::splice::Spliced, (io::Error, crate::splice::Pipe)> {
+        splice::to_pipe(self, pipe, max).await
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_from_pipe(
+        &self,
+        filled: crate::splice::FilledPipe,
+    ) -> io::Result<crate::splice::Pipe> {
+        splice::from_pipe(self, filled).await
+    }
+
     async fn send_file<F: Borrow<File> + 'static>(
         &self,
         file: F,
@@ -382,6 +404,7 @@ mod splice {
     use compio_buf::{BufResult, IntoInner};
 
     use super::{Socket, Stream};
+    use crate::splice::{FilledPipe, Spliced};
 
     /// A pipe and how many bytes it holds before a writer would block.
     pub(super) struct Pipe {
@@ -447,9 +470,7 @@ mod splice {
         };
         let pipe = match stream.pipe.take() {
             Some(pipe) => pipe,
-            None => match crate::sys::linux::set_nonblocking(stream.inner.as_fd())
-                .and_then(|()| Pipe::new())
-            {
+            None => match nonblocking(stream).and_then(|()| Pipe::new()) {
                 Ok(pipe) => pipe,
                 Err(e) => return BufResult(Err(e), file),
             },
@@ -497,12 +518,86 @@ mod splice {
                         return BufResult(Err(e), file);
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return BufResult(Err(e), file),
             }
         }
         stream.pipe.set(Some(pipe));
         BufResult(Ok(filled), file)
+    }
+
+    /// Makes the socket `O_NONBLOCK`, once.
+    fn nonblocking<S: Socket + AsFd>(stream: &Stream<S>) -> io::Result<()> {
+        if !stream.nonblocking.get() {
+            crate::sys::linux::set_nonblocking(stream.inner.as_fd())?;
+            stream.nonblocking.set(true);
+        }
+        Ok(())
+    }
+
+    /// Waits for the socket to be ready for `interest` with a poll the
+    /// driver arms, which holds no thread.
+    async fn ready<S: Socket + AsFd>(stream: &Stream<S>, interest: Interest) -> io::Result<()> {
+        ::compio::runtime::submit(PollOnce::new(stream.inner.clone(), interest))
+            .await
+            .0
+            .map(drop)
+    }
+
+    /// Socket to pipe: waits for readability, then one non-blocking
+    /// `splice(2)`. io_uring would run the splice on an io-wq worker, which
+    /// an idle peer would hold.
+    pub(super) async fn to_pipe<S: Socket + AsFd>(
+        stream: &Stream<S>,
+        pipe: crate::splice::Pipe,
+        max: usize,
+    ) -> Result<Spliced, (io::Error, crate::splice::Pipe)> {
+        if max == 0 {
+            return Err((
+                io::Error::new(io::ErrorKind::InvalidInput, "splice of zero bytes"),
+                pipe,
+            ));
+        }
+        if let Err(e) = nonblocking(stream) {
+            return Err((e, pipe));
+        }
+        let len = max.min(pipe.capacity());
+        loop {
+            match crate::sys::linux::splice(stream.inner.as_fd(), pipe.write_fd(), len) {
+                Ok(0) => return Ok(Spliced::End(pipe)),
+                Ok(n) => return Ok(Spliced::Filled(FilledPipe::new(pipe, n))),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Err(e) = ready(stream, Interest::Readable).await {
+                        return Err((e, pipe));
+                    }
+                }
+                Err(e) => return Err((e, pipe)),
+            }
+        }
+    }
+
+    /// Pipe to socket, as [`send_file`] does it.
+    pub(super) async fn from_pipe<S: Socket + AsFd>(
+        stream: &Stream<S>,
+        filled: FilledPipe,
+    ) -> io::Result<crate::splice::Pipe> {
+        nonblocking(stream)?;
+        let mut left = filled.len();
+        while left > 0 {
+            match crate::sys::linux::splice(filled.pipe().read_fd(), stream.inner.as_fd(), left) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "stream accepted no bytes",
+                    ));
+                }
+                Ok(n) => left -= n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready(stream, Interest::Writable).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(filled.into_pipe())
     }
 }
 

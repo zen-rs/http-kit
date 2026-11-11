@@ -12,8 +12,8 @@ use std::{
 
 use futures_lite::{AsyncReadExt as _, AsyncWriteExt as _, future::zip};
 use http_kit_io::{
-    BufResult, DatagramSocket, IntoPoll, Io, Listener, Read, SendFile, Split, TcpOptions, Write,
-    datagram::MAX_COALESCED_BYTES,
+    BufResult, DatagramSocket, IntoPoll, Io, Listener, Read, SendFile, SpliceRead, SpliceWrite,
+    Split, TcpOptions, Write, datagram::MAX_COALESCED_BYTES,
 };
 
 /// Compares two byte strings without printing kilobytes of them.
@@ -306,6 +306,175 @@ async fn send_file<I: Io>(io: I, name: &str) {
     let ((), received) = zip(server, client).await;
     std::fs::remove_file(&path).expect("remove the sent file");
     assert_bytes(&received, &contents[offset as usize..offset as usize + len]);
+}
+
+/// Every stream and half implements the splice traits on every platform,
+/// whether or not the platform has the methods.
+#[test]
+fn every_stream_and_half_is_spliceable() {
+    fn stream<S: SpliceRead + SpliceWrite>() {}
+    fn halves<S: Split>()
+    where
+        S::ReadHalf: SpliceRead,
+        S::WriteHalf: SpliceWrite,
+    {
+    }
+
+    #[cfg(feature = "compio")]
+    {
+        stream::<http_kit_io::compio::TcpStream>();
+        halves::<http_kit_io::compio::TcpStream>();
+        #[cfg(unix)]
+        {
+            stream::<http_kit_io::compio::UnixStream>();
+            halves::<http_kit_io::compio::UnixStream>();
+        }
+    }
+    #[cfg(feature = "tokio")]
+    {
+        stream::<http_kit_io::tokio::TcpStream>();
+        halves::<http_kit_io::tokio::TcpStream>();
+        #[cfg(unix)]
+        {
+            stream::<http_kit_io::tokio::UnixStream>();
+            halves::<http_kit_io::tokio::UnixStream>();
+        }
+    }
+    #[cfg(feature = "async-io")]
+    {
+        stream::<http_kit_io::async_io::TcpStream>();
+        halves::<http_kit_io::async_io::TcpStream>();
+        #[cfg(unix)]
+        {
+            stream::<http_kit_io::async_io::UnixStream>();
+            halves::<http_kit_io::async_io::UnixStream>();
+        }
+    }
+}
+
+/// CJK text of exactly `len` bytes (the last character may be cut).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn cjk_payload(len: usize) -> Vec<u8> {
+    let unit = "世界 せかい 세계 — 通过管道转发 パイプ経由 파이프 전달\n".as_bytes();
+    unit.iter().copied().cycle().take(len).collect()
+}
+
+/// 16 MiB goes from one stream socket through a pipe into another.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn splice_socket_to_socket<I: Io>(io: I) {
+    use http_kit_io::splice::{Pipe, Spliced};
+    use std::io::{Read as _, Write as _};
+
+    const LEN: usize = 16 * 1024 * 1024;
+
+    let source = io.bind_tcp(loopback()).expect("bind source");
+    let sink = io.bind_tcp(loopback()).expect("bind sink");
+    let (source_addr, sink_addr) = (
+        source.local_addr().expect("source address"),
+        sink.local_addr().expect("sink address"),
+    );
+    let data = cjk_payload(LEN);
+    let sender = std::thread::spawn({
+        let data = data.clone();
+        move || {
+            let mut stream = std::net::TcpStream::connect(source_addr).expect("sender connect");
+            stream.write_all(&data).expect("send");
+        }
+    });
+    let receiver = std::thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(sink_addr).expect("receiver connect");
+        let mut received = Vec::with_capacity(LEN);
+        stream.read_to_end(&mut received).expect("receive");
+        received
+    });
+
+    let (mut from, _) = source.accept().await.expect("accept source");
+    let (mut to, _) = sink.accept().await.expect("accept sink");
+    let mut pipe = Pipe::new().expect("pipe");
+    let mut spliced = 0;
+    loop {
+        match from.splice_to_pipe(pipe, usize::MAX).await {
+            Ok(Spliced::Filled(filled)) => {
+                spliced += filled.len();
+                pipe = to.splice_from_pipe(filled).await.expect("splice out");
+            }
+            Ok(Spliced::End(_)) => break,
+            Err((e, _)) => panic!("splice in: {e}"),
+        }
+    }
+    Write::shutdown(&mut to).await.expect("shutdown");
+    sender.join().expect("sender thread");
+    let received = receiver.join().expect("receiver thread");
+    assert_eq!(spliced, LEN);
+    assert_bytes(&received, &data);
+}
+
+/// Two tunnel ends joined: replay bytes go first, data goes both ways, and a
+/// half-close of one peer reaches the other while the reverse direction stays
+/// open.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn splice_duplex_join<I: Io>(io: I)
+where
+    <I::TcpStream as Split>::ReadHalf: SpliceRead,
+    <I::TcpStream as Split>::WriteHalf: SpliceWrite,
+{
+    use http_kit_io::splice::SpliceDuplex;
+    use std::io::{Read as _, Write as _};
+
+    let left = io.bind_tcp(loopback()).expect("bind left");
+    let right = io.bind_tcp(loopback()).expect("bind right");
+    let (left_addr, right_addr) = (
+        left.local_addr().expect("left address"),
+        right.local_addr().expect("right address"),
+    );
+    let left_replay = "左 replay: 世界 せかい 세계\n";
+    let right_replay = "右 replay: 你好 こんにちは 안녕\n";
+    let from_left = cjk_payload(300_000);
+    let from_right = cjk_payload(200_000);
+
+    let left_peer = std::thread::spawn({
+        let from_left = from_left.clone();
+        move || {
+            let mut stream = std::net::TcpStream::connect(left_addr).expect("left connect");
+            stream.write_all(&from_left).expect("left send");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("left half-close");
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).expect("left receive");
+            received
+        }
+    });
+    // The right peer writes only after it has seen the left peer's half-close.
+    let right_peer = std::thread::spawn({
+        let from_right = from_right.clone();
+        move || {
+            let mut stream = std::net::TcpStream::connect(right_addr).expect("right connect");
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).expect("right receive");
+            stream.write_all(&from_right).expect("right send");
+            received
+        }
+    });
+
+    let (left_stream, _) = left.accept().await.expect("accept left");
+    let (right_stream, _) = right.accept().await.expect("accept right");
+    let (left_read, left_write) = left_stream.split();
+    let (right_read, right_write) = right_stream.split();
+    let left_end = SpliceDuplex::new(left_replay.into(), left_read, left_write);
+    let right_end = SpliceDuplex::new(right_replay.into(), right_read, right_write);
+    assert!(left_end.can_splice() && right_end.can_splice());
+
+    let (to_right, to_left) = left_end.join(right_end).await.expect("join");
+    let received_by_right = right_peer.join().expect("right thread");
+    let received_by_left = left_peer.join().expect("left thread");
+
+    assert_eq!(to_right, (left_replay.len() + from_left.len()) as u64);
+    assert_eq!(to_left, (right_replay.len() + from_right.len()) as u64);
+    let expected_right = [left_replay.as_bytes(), &from_left].concat();
+    let expected_left = [right_replay.as_bytes(), &from_right].concat();
+    assert_bytes(&received_by_right, &expected_right);
+    assert_bytes(&received_by_left, &expected_left);
 }
 
 async fn poll_echo<I: Io>(io: I) {
@@ -601,6 +770,18 @@ macro_rules! suite {
             $run(super::send_file($io, concat!(module_path!(), "-send_file")));
         }
 
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[test]
+        fn splice_socket_to_socket() {
+            $run(super::splice_socket_to_socket($io));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[test]
+        fn splice_duplex_join() {
+            $run(super::splice_duplex_join($io));
+        }
+
         #[test]
         fn poll_echo() {
             $run(super::poll_echo($io));
@@ -720,6 +901,60 @@ mod compio {
             }
         }
         busy
+    }
+
+    /// A splice waiting for a peer that sends nothing holds no io-wq worker,
+    /// and moves the bytes once they come.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_idle_splice_holds_no_kernel_worker() {
+        use std::{io::Write as _, sync::mpsc, time::Duration};
+
+        use http_kit_io::{
+            Io as _, Listener as _, SpliceRead as _,
+            splice::{Pipe, Spliced},
+        };
+
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let addr = addr_rx.recv().expect("listener address");
+            let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+            std::thread::sleep(Duration::from_millis(1000));
+            stream
+                .write_all("世界 せかい 세계".as_bytes())
+                .expect("send");
+        });
+
+        let (busy, bytes) = run(async {
+            let io = http_kit_io::compio::Compio;
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
+            addr_tx
+                .send(listener.local_addr().expect("local address"))
+                .expect("send address");
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let splice = async {
+                match stream
+                    .splice_to_pipe(Pipe::new().expect("pipe"), usize::MAX)
+                    .await
+                {
+                    Ok(Spliced::Filled(filled)) => filled.read_out().expect("read out").0,
+                    Ok(Spliced::End(_)) => panic!("the peer ended without sending"),
+                    Err((e, _)) => panic!("splice: {e}"),
+                }
+            };
+            let watch = async {
+                ::compio::time::sleep(Duration::from_millis(500)).await;
+                busy_kernel_workers()
+            };
+            let (bytes, busy) = futures_lite::future::zip(splice, watch).await;
+            (busy, bytes)
+        });
+        peer.join().expect("peer thread");
+        assert_eq!(&bytes[..], "世界 せかい 세계".as_bytes());
+        assert!(
+            busy.is_empty(),
+            "kernel workers held by the idle splice: {busy:?}"
+        );
     }
 
     /// A region larger than both socket buffers, sent to a peer that stops
