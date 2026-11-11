@@ -4,17 +4,17 @@
 use std::{
     future::{Future, pending, poll_fn},
     io, mem,
-    pin::pin,
+    pin::{Pin, pin},
     task::Poll,
     time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures_lite::{
-    StreamExt as _,
+    Stream,
     future::{or, poll_once},
 };
-use http_kit::{Body, BodyFrame, PipeOffer};
+use http_kit::{Body, BodyError, BodyFrame, PipeOffer};
 use http_kit_io::{
     BufResult, IntoInner as _, IoBuf as _, ReadOwned, Received, SendFile, SpliceRead, SpliceWrite,
     Timer, Write,
@@ -117,10 +117,13 @@ pub(crate) async fn until<T: Timer, F: Future>(
     or(done, expired).await
 }
 
-/// Buffers queued for one vectored write.
+/// Buffers queued for one vectored write, and the empty pipe the last pipe
+/// frame sent left behind, which the next body sent is offered.
 #[derive(Default)]
 pub(crate) struct Outbox {
     bufs: Vec<Bytes>,
+    #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+    pipe: Option<http_kit_io::splice::Pipe>,
 }
 
 impl Outbox {
@@ -168,6 +171,10 @@ impl Outbox {
 /// frame ready, what is queued goes out first, so a slow body never holds
 /// back its head. A file region goes to [`SendFile`] untouched, and a pipe
 /// to [`SpliceWrite`], each framed on the writer side.
+///
+/// A writer that can splice polls the body with a [`PipeOffer`] carrying the
+/// pipe the last pipe frame left, so a body forwarded from a socket comes as
+/// pipe frames that all reuse the one pipe the connection keeps.
 pub(crate) async fn send_message<W: Write + SendFile + SpliceWrite>(
     writer: &mut W,
     outbox: &mut Outbox,
@@ -175,12 +182,13 @@ pub(crate) async fn send_message<W: Write + SendFile + SpliceWrite>(
     encoder: &mut BodyEncoder,
 ) -> Result<(), Error> {
     if let Some(mut body) = body.filter(|_| encoder.sends_body()) {
+        let mut offer = writer_offer(writer, outbox);
         loop {
-            let frame = match poll_once(body.next()).await {
+            let frame = match poll_once(next_sent_frame(&mut body, offer.as_mut())).await {
                 Some(frame) => frame,
                 None => {
                     outbox.flush(writer).await?;
-                    body.next().await
+                    next_sent_frame(&mut body, offer.as_mut()).await
                 }
             };
             match frame {
@@ -190,11 +198,25 @@ pub(crate) async fn send_message<W: Write + SendFile + SpliceWrite>(
                 Some(Ok(BodyFrame::Trailers(trailers))) => {
                     outbox.push(encoder.trailers(&trailers)?);
                 }
+                #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+                Some(Ok(BodyFrame::Pipe(filled))) => {
+                    let pipe = send_pipe(writer, outbox, encoder, filled).await?;
+                    // The emptied pipe is offered for the next frame, unless
+                    // the offer still holds the one it had: the frame was a
+                    // pipe its source made without taking the offered one.
+                    if let Some(offer) = &mut offer {
+                        offer.reattach(PipeOffer::with_pipe(offer.max(), pipe));
+                    }
+                }
                 Some(Ok(other)) => send_other_frame(writer, outbox, encoder, other).await?,
             }
             if outbox.is_full() {
                 outbox.flush(writer).await?;
             }
+        }
+        #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+        {
+            outbox.pipe = offer.and_then(|mut offer| offer.take_pipe());
         }
     }
     if let Some(end) = encoder.finish()? {
@@ -205,15 +227,39 @@ pub(crate) async fn send_message<W: Write + SendFile + SpliceWrite>(
     Ok(())
 }
 
-/// Sends a frame that is neither data nor trailers: a file region, or a pipe,
-/// each with the features it needs.
-#[cfg_attr(
-    not(any(
-        feature = "fs",
-        all(feature = "pipe", any(target_os = "linux", target_os = "android"))
-    )),
-    allow(unused_variables)
-)]
+/// What a writer offers the body it sends: pipe frames when its socket can
+/// splice, of any size, since [`send_pipe`] writes a whole pipe however full,
+/// carrying the pipe the connection kept from its last pipe frame.
+#[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+fn writer_offer<W: SpliceWrite>(writer: &W, outbox: &mut Outbox) -> Option<PipeOffer> {
+    SpliceWrite::can_splice(writer).then(|| match outbox.pipe.take() {
+        Some(pipe) => PipeOffer::with_pipe(usize::MAX, pipe),
+        None => PipeOffer::new(usize::MAX),
+    })
+}
+
+/// Where pipes do not exist, or the feature is off, a writer offers nothing.
+#[cfg(not(all(feature = "pipe", any(target_os = "linux", target_os = "android"))))]
+const fn writer_offer<W>(_writer: &W, _outbox: &mut Outbox) -> Option<PipeOffer> {
+    None
+}
+
+/// The next frame of a body being sent, polled with `offer` when the writer
+/// made one.
+async fn next_sent_frame(
+    body: &mut Body,
+    mut offer: Option<&mut PipeOffer>,
+) -> Option<Result<BodyFrame, BodyError>> {
+    poll_fn(|cx| match offer.as_deref_mut() {
+        Some(offer) => Pin::new(&mut *body).poll_frame_offering(cx, offer),
+        None => Pin::new(&mut *body).poll_next(cx),
+    })
+    .await
+}
+
+/// Sends a frame that is neither data, trailers nor a pipe: a file region,
+/// with the feature it needs.
+#[cfg_attr(not(feature = "fs"), allow(unused_variables))]
 async fn send_other_frame<W: Write + SendFile + SpliceWrite>(
     writer: &mut W,
     outbox: &mut Outbox,
@@ -223,33 +269,32 @@ async fn send_other_frame<W: Write + SendFile + SpliceWrite>(
     match frame {
         #[cfg(feature = "fs")]
         BodyFrame::File(region) => send_region(writer, outbox, encoder, region).await,
-        #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
-        BodyFrame::Pipe(filled) => send_pipe(writer, outbox, encoder, filled).await,
         _ => Err(Error::UnsupportedFrame),
     }
 }
 
 /// Sends the bytes of a pipe: spliced into the socket when it can take them,
 /// framed like a file region, and otherwise read out and sent as data.
+/// Returns the emptied pipe.
 #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
 async fn send_pipe<W: Write + SendFile + SpliceWrite>(
     writer: &mut W,
     outbox: &mut Outbox,
     encoder: &mut BodyEncoder,
     filled: http_kit_io::splice::FilledPipe,
-) -> Result<(), Error> {
+) -> Result<http_kit_io::splice::Pipe, Error> {
     if !SpliceWrite::can_splice(writer) {
-        let (data, _pipe) = filled.read_out()?;
+        let (data, pipe) = filled.read_out()?;
         encoder.data(data, &mut outbox.bufs)?;
-        return Ok(());
+        return Ok(pipe);
     }
     let len = filled.len() as u64;
     outbox.extend(encoder.region_start(len)?);
     outbox.flush(writer).await?;
     tracing::trace!(len, "sending a pipe");
-    writer.splice_from_pipe(filled).await?;
+    let pipe = writer.splice_from_pipe(filled).await?;
     outbox.extend(encoder.region_end());
-    Ok(())
+    Ok(pipe)
 }
 
 #[cfg(feature = "fs")]
@@ -324,13 +369,14 @@ pub(crate) async fn pump_body<R: ReadOwned + SpliceRead, T: Timer, F: Future<Out
         };
         // A send to a dropped body fails; the next demand then reports it.
         if let Some(frame) = frame {
-            sender.send(Message::Frame(frame, offer)).await;
+            sender.send(Message::Frame(frame, offer.take())).await;
         }
         // The end is queued behind the last frame without waiting for a
         // demand: the connection is past the body as soon as it is decoded,
-        // however slowly the consumer reads.
+        // however slowly the consumer reads. It carries the offer of a demand
+        // the end itself answered.
         if decoder.is_done() {
-            sender.send(Message::End).await;
+            sender.send(Message::End(offer)).await;
             return Ok(Pumped::Complete);
         }
     }

@@ -24,7 +24,8 @@ pub(crate) enum Attempt {
 ///
 /// The splice takes at most the run and the offer's `max`, so it never
 /// reaches past the body into the next message's bytes, which stay in the
-/// socket. A stream that received ahead of its reader puts those bytes into
+/// socket. It fills the offer's pipe, and makes one only when the offer
+/// supplies none. A stream that received ahead of its reader puts those bytes into
 /// the pipe before it splices from the socket.
 #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
 pub(crate) async fn try_splice<R: SpliceRead, T: Timer>(
@@ -65,7 +66,9 @@ pub(crate) async fn try_splice<R: SpliceRead, T: Timer>(
             decoder.consume_raw(filled.len() as u64);
             Ok(Attempt::Frame(http_kit::BodyFrame::Pipe(filled)))
         }
-        Ok(Spliced::End(_)) => {
+        Ok(Spliced::End(pipe)) => {
+            // The pipe is still empty: it goes back to the consumer.
+            *offer = PipeOffer::with_pipe(offer.max(), pipe);
             // Nothing is buffered, so this ends a close-delimited body and
             // fails any other that is incomplete.
             decoder.decode_eof(&mut recv.buf, limits)?;

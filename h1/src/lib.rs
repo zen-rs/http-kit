@@ -28,7 +28,11 @@
 //! with nothing buffered ahead of them; framing, trailers and everything else
 //! stay data and trailers frames, and a consumer that offers nothing receives
 //! only those. A pipe frame in a body being sent is spliced into the socket
-//! like a file region, with the chunk framing written around it.
+//! like a file region, with the chunk framing written around it. A
+//! connection whose socket can splice polls each body it sends with an
+//! offer that carries the pipe it emptied last, so a body forwarded from
+//! another connection goes through one pipe for the whole connection, and
+//! a forwarder between the two need not offer anything itself.
 //!
 //! # Request smuggling
 //!

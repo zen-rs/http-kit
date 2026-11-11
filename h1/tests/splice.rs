@@ -13,20 +13,27 @@ mod support;
 
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashSet, VecDeque},
     fs::File,
     future::{Future, poll_fn},
     io::{self, Read as _, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
+    os::unix::fs::MetadataExt as _,
     pin::Pin,
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use bytes::Bytes;
-use futures_lite::{StreamExt as _, future::zip, stream};
+use futures_lite::{Stream as _, StreamExt as _, future::zip, stream};
 use http::{HeaderMap, HeaderValue, Method};
-use http_kit::{Body, BodyFrame, PipeOffer, Request, Response};
+use http_kit::{Body, BodyError, BodyFrame, FrameSource, PipeOffer, Request, Response};
 use http_kit_h1::{
     ClientConfig, ClientOutcome, ServerConfig, ServerConnection, ServerOutcome, Service, handshake,
 };
@@ -48,12 +55,34 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(20);
 /// The most bytes one pipe frame may hold in these tests.
 const OFFER: usize = 64 * 1024;
 
-/// Bytes that went through each path of a socket, per side.
+/// Bytes that went through each path of a socket, per side, and the pipes
+/// the socket was spliced into.
 #[derive(Debug, Default)]
 struct Counts {
     spliced_in: Cell<usize>,
     spliced_out: Cell<usize>,
     written: Cell<usize>,
+    /// How many splices into a pipe brought bytes.
+    fills: Cell<usize>,
+    /// The inode of every pipe a splice went into.
+    pipes: RefCell<HashSet<u64>>,
+}
+
+/// The inode of `pipe`, which tells pipes apart where descriptor numbers do
+/// not: a closed pipe's descriptors are the first a new pipe gets.
+fn pipe_inode(pipe: &Pipe) -> u64 {
+    // `Pipe` shows its descriptors only through `Debug`, as
+    // `Pipe { read: OwnedFd { fd: N }, .. }`.
+    let shown = format!("{pipe:?}");
+    let fd: u32 = shown
+        .split("fd: ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("no descriptor in {shown}"));
+    std::fs::metadata(format!("/proc/self/fd/{fd}"))
+        .expect("the pipe's metadata")
+        .ino()
 }
 
 type Spy = Rc<Counts>;
@@ -88,11 +117,13 @@ impl<R: SpliceRead> SpliceRead for SpyRead<R> {
         pipe: Pipe,
         max: usize,
     ) -> Result<Spliced, (io::Error, Pipe)> {
+        self.counts.pipes.borrow_mut().insert(pipe_inode(&pipe));
         let spliced = self.inner.splice_to_pipe(pipe, max).await?;
         if let Spliced::Filled(filled) = &spliced {
             self.counts
                 .spliced_in
                 .set(self.counts.spliced_in.get() + filled.len());
+            self.counts.fills.set(self.counts.fills.get() + 1);
         }
         Ok(spliced)
     }
@@ -193,8 +224,8 @@ fn read_until(stream: &mut TcpStream, needle: &[u8]) -> Vec<u8> {
     read
 }
 
-/// A response with a `Content-Length`: its head and its body.
-fn read_response(stream: &mut TcpStream) -> (String, Vec<u8>) {
+/// A message with a `Content-Length`: its head and its body.
+fn read_message(stream: &mut TcpStream) -> (String, Vec<u8>) {
     let head = String::from_utf8(read_until(stream, b"\r\n\r\n")).expect("a UTF-8 head");
     let len = head
         .lines()
@@ -355,7 +386,7 @@ async fn content_length_request<I: Listen + Timer + Clone>(io: I) {
         serve_peer(io, recording_service(&seen, true), move |mut stream| {
             send_continued_head(&mut stream, &format!("Content-Length: {}", sent.len()));
             stream.write_all(&sent).expect("send the body");
-            read_response(&mut stream)
+            read_message(&mut stream)
         })
         .await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
@@ -389,7 +420,7 @@ async fn chunked_request_with_trailers<I: Listen + Timer + Clone>(io: I) {
             stream
                 .write_all(b"\r\n0\r\nx-checksum: abc123\r\n\r\n")
                 .expect("send the end of the body");
-            read_response(&mut stream)
+            read_message(&mut stream)
         })
         .await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
@@ -418,8 +449,8 @@ async fn pipelined_request_stays_in_the_socket<I: Listen + Timer + Clone>(io: I)
         stream
             .write_all(&both)
             .expect("send the body and a request");
-        let first = read_response(&mut stream).1;
-        let second = read_response(&mut stream).1;
+        let first = read_message(&mut stream).1;
+        let second = read_message(&mut stream).1;
         (first, second)
     })
     .await;
@@ -442,8 +473,8 @@ async fn pipelined_requests_in_one_write_are_read_as_data<I: Listen + Timer + Cl
                 b"POST /one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhelloPOST /two HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nworld",
             )
             .expect("send both requests");
-        let first = read_response(&mut stream).1;
-        let second = read_response(&mut stream).1;
+        let first = read_message(&mut stream).1;
+        let second = read_message(&mut stream).1;
         (first, second)
     })
     .await;
@@ -464,7 +495,7 @@ async fn a_consumer_that_offers_nothing_gets_data<I: Listen + Timer + Clone>(io:
         serve_peer(io, recording_service(&seen, false), move |mut stream| {
             send_continued_head(&mut stream, &format!("Content-Length: {}", sent.len()));
             stream.write_all(&sent).expect("send the body");
-            read_response(&mut stream)
+            read_message(&mut stream)
         })
         .await;
     assert_eq!(reply, b"/up");
@@ -505,7 +536,7 @@ async fn a_dropped_request_body_closes_the_connection<I: Listen + Timer + Clone>
         send_continued_head(&mut stream, &format!("Content-Length: {announced}"));
         stream.write_all(&sent).expect("send the first part");
         // The peer holds the rest back, so the server has nothing to reset.
-        let reply = read_response(&mut stream).1;
+        let reply = read_message(&mut stream).1;
         (reply, read_to_end(&mut stream))
     })
     .await;
@@ -852,7 +883,7 @@ async fn pipes_forward_from_request_to_response<I: Listen + Timer + Clone>(io: I
     let (counts, (head, reply)) = serve_peer(io, service, move |mut stream| {
         send_continued_head(&mut stream, &format!("Content-Length: {}", sent.len()));
         stream.write_all(&sent).expect("send the body");
-        read_response(&mut stream)
+        read_message(&mut stream)
     })
     .await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
@@ -864,6 +895,210 @@ async fn pipes_forward_from_request_to_response<I: Listen + Timer + Clone>(io: I
         "{} bytes went through write",
         counts.written.get()
     );
+}
+
+/// A body passed on as it is after a first frame its forwarder already
+/// took, with the writer's offer passed through: what a proxy hands a
+/// writer.
+struct Forwarded {
+    first: Option<BodyFrame>,
+    rest: Body,
+}
+
+impl FrameSource for Forwarded {
+    fn poll_next_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        offer: Option<&mut PipeOffer>,
+    ) -> Poll<Option<Result<BodyFrame, BodyError>>> {
+        let this = &mut *self;
+        if let Some(first) = this.first.take() {
+            return Poll::Ready(Some(Ok(first)));
+        }
+        match offer {
+            Some(offer) => Pin::new(&mut this.rest).poll_frame_offering(cx, offer),
+            None => Pin::new(&mut this.rest).poll_next(cx),
+        }
+    }
+}
+
+/// A request body sent back as the response body, for two requests on one
+/// connection: the writer's offers reach the request body's connection, and
+/// every frame the writer asks for goes through the one pipe the connection
+/// keeps.
+async fn a_forwarded_body_reuses_one_pipe_per_connection<I: Listen + Timer + Clone>(io: I) {
+    let bodies = [payload(4000), payload(3000)];
+    let sent = bodies.clone();
+    let service = |request: Request| async move {
+        let length = request.headers()["content-length"].clone();
+        let mut body = request.into_body();
+        // Read before answering, so the connection knows the body was asked
+        // for and stays open. Nothing was offered, so it is data.
+        let first = body.next().await.expect("a frame").expect("body frame");
+        assert!(first.as_data().is_some(), "{first:?}");
+        let mut response = Response::new(Body::from_source(Forwarded {
+            first: Some(first),
+            rest: body,
+        }));
+        response.headers_mut().insert("content-length", length);
+        response
+    };
+    let (counts, replies) = serve_peer(io, service, move |mut stream| {
+        sent.into_iter()
+            .map(|body| {
+                write!(
+                    stream,
+                    "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .expect("send the head");
+                // The body arrives once the head was read, so it waits in the
+                // socket; it is sent while the echo is read, so neither side
+                // stalls on a full socket buffer.
+                thread::sleep(PAUSE);
+                let mut writer = stream.try_clone().expect("clone the stream");
+                let sending =
+                    thread::spawn(move || writer.write_all(&body).expect("send the body"));
+                let reply = read_message(&mut stream);
+                sending.join().expect("the sending thread");
+                reply
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    for ((head, reply), body) in replies.iter().zip(&bodies) {
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("connection: close"),
+            "{head}"
+        );
+        assert!(reply == body, "the body came back intact");
+    }
+    assert!(
+        counts.fills.get() > 2 * bodies.len(),
+        "{} splices, not enough to tell reuse",
+        counts.fills.get()
+    );
+    assert_eq!(
+        counts.pipes.borrow().len(),
+        1,
+        "one pipe for every pipe frame of both bodies"
+    );
+    assert_eq!(counts.spliced_out.get(), counts.spliced_in.get());
+}
+
+/// A request body that answers an offer with its chunks in pipes, filled
+/// from memory, and counts the pipes it makes: one for every offer that
+/// carries none.
+struct Filling {
+    chunks: VecDeque<Bytes>,
+    made: Arc<AtomicUsize>,
+}
+
+impl FrameSource for Filling {
+    fn poll_next_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        offer: Option<&mut PipeOffer>,
+    ) -> Poll<Option<Result<BodyFrame, BodyError>>> {
+        let Some(chunk) = self.chunks.pop_front() else {
+            return Poll::Ready(None);
+        };
+        let Some(offer) = offer else {
+            return Poll::Ready(Some(Ok(BodyFrame::Data(chunk))));
+        };
+        let pipe = offer.take_pipe().unwrap_or_else(|| {
+            self.made.fetch_add(1, Ordering::Relaxed);
+            Pipe::new().expect("pipe")
+        });
+        let filled = pipe
+            .fill(&chunk)
+            .unwrap_or_else(|(error, _)| panic!("fill: {error}"));
+        assert_eq!(filled.len(), chunk.len(), "a chunk fits one pipe");
+        Poll::Ready(Some(Ok(BodyFrame::Pipe(filled))))
+    }
+}
+
+/// Two requests on one client connection, each body several pipe frames: the
+/// client offers the pipe it emptied last, for the next request too.
+async fn a_client_offers_its_emptied_pipe<I: Dial + Timer + Clone>(io: I) {
+    const REQUESTS: usize = 2;
+    const CHUNKS: usize = 3;
+    let chunk = Bytes::from(payload(200));
+    let listener = TcpListener::bind(loopback()).expect("bind");
+    let addr = listener.local_addr().expect("local address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(PEER_TIMEOUT))
+            .expect("read timeout");
+        let bodies = (0..REQUESTS)
+            .map(|_| {
+                let (_, body) = read_message(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .expect("send the response");
+                body
+            })
+            .collect::<Vec<_>>();
+        read_to_end(&mut stream);
+        bodies
+    });
+    let counts = Spy::default();
+    let made = Arc::new(AtomicUsize::new(0));
+    let stream = io.connect(addr).await.expect("connect");
+    let (reader, writer) = stream.split();
+    let (send, connection) = handshake(
+        SpyRead {
+            inner: reader,
+            counts: counts.clone(),
+        },
+        SpyWrite {
+            inner: writer,
+            counts: counts.clone(),
+        },
+        io.clone(),
+        ClientConfig::default(),
+    );
+    let requests = {
+        let chunk = chunk.clone();
+        let made = made.clone();
+        async move {
+            for _ in 0..REQUESTS {
+                let mut request = Request::new(Body::from_source(Filling {
+                    chunks: std::iter::repeat_n(chunk.clone(), CHUNKS).collect(),
+                    made: made.clone(),
+                }));
+                *request.method_mut() = Method::POST;
+                *request.uri_mut() = format!("http://{addr}/up").parse().unwrap();
+                request
+                    .headers_mut()
+                    .insert("content-length", HeaderValue::from(chunk.len() * CHUNKS));
+                let response = send.send(request).await.expect("response");
+                assert_eq!(response.status(), 200);
+                response
+                    .into_body()
+                    .into_bytes()
+                    .await
+                    .expect("response body");
+            }
+        }
+    };
+    let (ran, ()) = zip(connection.run(), requests).await;
+    assert!(matches!(
+        ran.expect("client connection"),
+        ClientOutcome::Closed
+    ));
+    let bodies = server.join().expect("the server thread");
+    let expected = chunk.repeat(CHUNKS);
+    assert!(bodies.iter().all(|body| *body == expected), "bodies intact");
+    assert_eq!(
+        made.load(Ordering::Relaxed),
+        1,
+        "one pipe for all {} frames",
+        REQUESTS * CHUNKS
+    );
+    assert_eq!(counts.spliced_out.get(), REQUESTS * CHUNKS * chunk.len());
 }
 
 macro_rules! suite {
@@ -936,6 +1171,16 @@ macro_rules! suite {
         #[test]
         fn pipes_forward_from_request_to_response() {
             $run(super::pipes_forward_from_request_to_response($io));
+        }
+
+        #[test]
+        fn a_forwarded_body_reuses_one_pipe_per_connection() {
+            $run(super::a_forwarded_body_reuses_one_pipe_per_connection($io));
+        }
+
+        #[test]
+        fn a_client_offers_its_emptied_pipe() {
+            $run(super::a_client_offers_its_emptied_pipe($io));
         }
     };
 }

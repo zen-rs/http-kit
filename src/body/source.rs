@@ -24,7 +24,8 @@ use http_kit_io::splice::Pipe;
 ///
 /// The offer can carry an empty `Pipe`, so a consumer reuses one pipe for a
 /// whole body; a source that takes it with `PipeOffer::take_pipe`
-/// fills it, and the consumer gets it back from the frame. Offers exist on
+/// fills it, and the consumer gets it back from the frame. A wrapper between
+/// a source and its consumer passes the consumer's offer on as it is. Offers exist on
 /// every platform, so code that passes them needs no `cfg`; only a platform
 /// with pipes has sources that accept them.
 #[derive(Debug)]
