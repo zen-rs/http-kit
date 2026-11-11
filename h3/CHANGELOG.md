@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/http-kit/compare/h3/v0.3.0...h3/v0.4.0) - 2026-11-11
+
+### Added
+
+- *(h3)* [**breaking**] make the transport, server and client settings non-exhaustive
+- *(h3)* give back a request that left nothing on the wire
+
+### Fixed
+
+- *(h3)* [**breaking**] show the Verifier the stapled OCSP response
+
+### Other
+
+- Merge pull request #115 from zen-rs/fix/108-h3-try-send
+
 ## [0.3.0](https://github.com/zen-rs/http-kit/compare/h3/v0.2.2...h3/v0.3.0) - 2026-11-10
 
 ### Added

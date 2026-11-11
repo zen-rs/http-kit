@@ -8,14 +8,14 @@ use std::{collections::HashMap, net::SocketAddr, time::Instant};
 use async_channel::Sender;
 use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
 use http::HeaderMap;
-use http_kit::{BodyFrame, Response};
+use http_kit::{Body, BodyFrame, Request, Response};
 use quiche::{
     Shutdown,
     h3::{self, Header, WireErrorCode},
 };
 
 use crate::{
-    Error, Malformed,
+    Error, Malformed, TrySendError,
     body::{Command, FrameSender, Message},
     fields,
 };
@@ -148,7 +148,10 @@ pub(crate) struct Stream {
     /// the task.
     pub(crate) credit: Option<Sender<()>>,
     /// A client's request, until its response head arrives.
-    pub(crate) respond: Option<Sender<Result<Response, Error>>>,
+    pub(crate) respond: Option<Sender<Result<Response, TrySendError>>>,
+    /// A client's request whose body is known to be empty, so none of it is
+    /// read: handed back if the server rejects the stream unprocessed.
+    pub(crate) unsent: Option<(http::request::Parts, Body)>,
     /// A client's `HEAD` request, whose response describes a body it does
     /// not carry.
     pub(crate) head_request: bool,
@@ -578,7 +581,13 @@ impl Conn {
             return;
         };
         if let Some(respond) = stream.respond {
-            respond.try_send(Err(error.clone())).ok();
+            let failure = match stream.unsent {
+                Some((parts, body)) if matches!(error, Error::RequestRejected) => {
+                    TrySendError::unsent(error.clone(), Request::from_parts(parts, body))
+                }
+                _ => error.clone().into(),
+            };
+            respond.try_send(Err(failure)).ok();
         }
         if let Some(recv) = stream.recv {
             // A frame the consumer has not taken yet is moot now.
@@ -616,7 +625,7 @@ impl Conn {
         for id in ids {
             if let Some(stream) = self.streams.remove(&id) {
                 if let Some(respond) = stream.respond {
-                    respond.try_send(Err(error.clone())).ok();
+                    respond.try_send(Err(error.clone().into())).ok();
                 }
                 if let Some(recv) = stream.recv {
                     recv.frames.force_send(Message::Error(error.clone())).ok();

@@ -771,6 +771,7 @@ fn request(
             send: Send::Waiting,
             credit: Some(credit),
             respond: None,
+            unsent: None,
             head_request: false,
         },
     );
