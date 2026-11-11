@@ -937,7 +937,7 @@ mod compio {
     #[cfg(target_os = "linux")]
     #[test]
     fn one_accept_submission_serves_many_connections() {
-        use http_kit_io::{FromStd as _, Listen as _, Listener as _, Timer as _, compio::Compio};
+        use http_kit_io::{Listen as _, Listener as _, Timer as _, compio::Compio};
 
         const CONNECTIONS: usize = 32;
         run(async {
