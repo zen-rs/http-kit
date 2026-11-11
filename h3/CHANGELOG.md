@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/http-kit/compare/h3/v0.5.0...h3/v0.6.0) - 2026-11-11
+
+### Added
+
+- *(io)* [**breaking**] zero-copy send for large writes on io_uring
+- [**breaking**] per-request receive deadlines, and typed failures for a body that ends early
+- *(io)* [**breaking**] per-capability traits replace Io, and a resolver joins them
+
+### Other
+
+- *(h3)* clone the compio driver into the curl server
+
 ## [0.5.0](https://github.com/zen-rs/http-kit/compare/h3/v0.4.0...h3/v0.5.0) - 2026-11-11
 
 ### Added

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/zen-rs/http-kit/compare/tls/v0.3.0...tls/v0.4.0) - 2026-11-11
+
+### Added
+
+- *(io)* [**breaking**] zero-copy send for large writes on io_uring
+- *(io)* [**breaking**] multishot receive into the runtime's provided buffer ring
+- *(tls)* [**breaking**] a typed handshake error
+- *(io)* [**breaking**] per-capability traits replace Io, and a resolver joins them
+
+### Fixed
+
+- *(tls)* positioned read on WASI
+
 ## [0.3.0](https://github.com/zen-rs/http-kit/compare/tls/v0.2.2...tls/v0.3.0) - 2026-11-11
 
 ### Added

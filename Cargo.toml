@@ -3,7 +3,7 @@ members = ["io", "h1", "h3", "tls"]
 
 [package]
 name = "http-kit"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.87"
 authors = ["Lexo Liu <me@lexo.cool>"]
@@ -55,7 +55,7 @@ optional = true
 # The pipe types a `BodyFrame::Pipe` carries. Linux and Android only, like the
 # frame.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.http-kit-io]
-version = "0.5.0"
+version = "0.6.0"
 path = "io"
 optional = true
 
@@ -77,4 +77,4 @@ thiserror = "2.0.17"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dev-dependencies]
-http-kit-io = { version = "0.5.0", path = "io", features = ["tokio"] }
+http-kit-io = { version = "0.6.0", path = "io", features = ["tokio"] }

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/http-kit/compare/io/v0.5.0...io/v0.6.0) - 2026-11-11
+
+### Added
+
+- *(io)* [**breaking**] name stream sockets by registered file slots on io_uring
+- *(io)* [**breaking**] zero-copy send for large writes on io_uring
+- *(io)* [**breaking**] multishot receive into the runtime's provided buffer ring
+- *(io)* [**breaking**] per-capability traits replace Io, and a resolver joins them
+
+### Other
+
+- *(io)* drop an unused import
+- Merge remote-tracking branch 'origin/main' into feat/124-multishot-accept
+- *(io)* accept with one multishot submission on io_uring
+
 ## [0.5.0](https://github.com/zen-rs/http-kit/compare/io/v0.4.0...io/v0.5.0) - 2026-11-11
 
 ### Added

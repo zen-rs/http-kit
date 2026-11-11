@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/http-kit/compare/h1/v0.5.0...h1/v0.6.0) - 2026-11-11
+
+### Added
+
+- *(body)* [**breaking**] poll_frame_offering takes an optional offer
+- *(h1)* send queued buffers through write_all_owned
+- *(io)* [**breaking**] zero-copy send for large writes on io_uring
+- *(h1)* [**breaking**] receive through ReadOwned
+- [**breaking**] per-request receive deadlines, and typed failures for a body that ends early
+- *(io)* [**breaking**] per-capability traits replace Io, and a resolver joins them
+
+### Other
+
+- *(h1)* drop an unused import
+- *(h1)* reuse one pipe per connection for spliced bodies
+
 ## [0.5.0](https://github.com/zen-rs/http-kit/compare/h1/v0.4.0...h1/v0.5.0) - 2026-11-11
 
 ### Added
