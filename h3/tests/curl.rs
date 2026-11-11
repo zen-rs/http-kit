@@ -54,7 +54,7 @@ fn answers_curl_http3() {
     on_compio(|io| async move {
         let socket = io.bind_udp(loopback()).await.unwrap();
         let port = socket.local_addr().unwrap().port();
-        let server = Server::new(socket, io, &server_config(&pki)).unwrap();
+        let server = Server::new(socket, io.clone(), &server_config(&pki)).unwrap();
         let (stop, stopped) = async_channel::bounded::<()>(1);
         let served = server.serve_until(&echo, async move {
             stopped.recv().await.ok();
