@@ -14,6 +14,8 @@
 //! - [`TcpOptions`]: socket options of a connected TCP stream.
 //! - [`SendFile`]: file-to-socket transfer, through `sendfile`/`splice` where
 //!   the platform has them.
+//! - [`SpliceRead`] and [`SpliceWrite`]: socket-to-socket forwarding through
+//!   a pipe, see [`splice`].
 //! - `WriteControl` (Unix): a write carrying control messages, for
 //!   protocols the kernel frames (kernel TLS record types).
 //! - [`DatagramSocket`]: datagram sockets with segmentation offload (GSO) on
@@ -41,6 +43,7 @@
 
 pub mod datagram;
 pub mod poll;
+pub mod splice;
 pub mod stream;
 pub mod time;
 
@@ -63,6 +66,7 @@ pub use compio_buf::{self, BufResult, IntoInner, IoBuf, IoBufMut, IoVectoredBuf,
 pub use crate::{
     datagram::{DatagramSocket, RecvMeta},
     poll::{CopyingPoll, IntoPoll},
+    splice::{SpliceRead, SpliceWrite},
     stream::{Listener, Read, ReadHalf, SendFile, Split, TcpOptions, Write, WriteHalf},
     time::Timer,
 };
@@ -78,12 +82,20 @@ pub use crate::stream::WriteControl;
 /// on a thread where the implementation's runtime is running.
 pub trait Io: Timer + Clone + 'static {
     /// A connected stream socket.
-    type TcpStream: Read + Write + SendFile + Split + IntoPoll + TcpOptions + 'static;
+    type TcpStream: Read
+        + Write
+        + SendFile
+        + SpliceRead
+        + SpliceWrite
+        + Split
+        + IntoPoll
+        + TcpOptions
+        + 'static;
     /// A listening stream socket.
     type TcpListener: Listener<Stream = Self::TcpStream, Addr = SocketAddr> + 'static;
     /// A connected Unix-domain stream socket.
     #[cfg(unix)]
-    type UnixStream: Read + Write + SendFile + Split + IntoPoll + 'static;
+    type UnixStream: Read + Write + SendFile + SpliceRead + SpliceWrite + Split + IntoPoll + 'static;
     /// A listening Unix-domain stream socket.
     #[cfg(unix)]
     type UnixListener: Listener<Stream = Self::UnixStream, Addr = std::os::unix::net::SocketAddr>

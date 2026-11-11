@@ -19,6 +19,8 @@ use std::{
 use compio_buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf};
 use socket2::{SockAddr, SockRef};
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::splice::{FilledPipe, Pipe, Spliced};
 use crate::{
     datagram::{DatagramSocket, RecvMeta, send_batched},
     stream::sealed::SharedStream,
@@ -225,6 +227,53 @@ impl<T: Ready> SharedStream for Stream<T> {
             })
             .await;
         BufResult(res, (buf, control))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_to_pipe(&self, pipe: Pipe, max: usize) -> Result<Spliced, (io::Error, Pipe)> {
+        use std::os::fd::AsFd;
+
+        if max == 0 {
+            return Err((
+                io::Error::new(io::ErrorKind::InvalidInput, "splice of zero bytes"),
+                pipe,
+            ));
+        }
+        let len = max.min(pipe.capacity());
+        // The reactor keeps the socket non-blocking, so a splice from an
+        // empty socket reports `WouldBlock` and waits for readability.
+        match self
+            .0
+            .read_io(|sock| crate::sys::pipe::splice(sock.as_fd(), pipe.write_fd(), len))
+            .await
+        {
+            Ok(0) => Ok(Spliced::End(pipe)),
+            Ok(n) => Ok(Spliced::Filled(FilledPipe::new(pipe, n))),
+            Err(e) => Err((e, pipe)),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_from_pipe(&self, filled: FilledPipe) -> io::Result<Pipe> {
+        use std::os::fd::AsFd;
+
+        let mut left = filled.len();
+        while left > 0 {
+            let moved = self
+                .0
+                .write_io(|sock| {
+                    crate::sys::pipe::splice(filled.pipe().read_fd(), sock.as_fd(), left)
+                })
+                .await?;
+            if moved == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "stream accepted no bytes",
+                ));
+            }
+            left -= moved;
+        }
+        Ok(filled.into_pipe())
     }
 
     async fn send_file<F: Borrow<File> + 'static>(

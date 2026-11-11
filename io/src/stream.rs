@@ -220,6 +220,17 @@ pub(crate) mod sealed {
             buf: B,
             control: C,
         ) -> impl Future<Output = BufResult<usize, (B, C)>>;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fn splice_to_pipe(
+            &self,
+            pipe: crate::splice::Pipe,
+            max: usize,
+        ) -> impl Future<Output = Result<crate::splice::Spliced, (io::Error, crate::splice::Pipe)>>;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fn splice_from_pipe(
+            &self,
+            filled: crate::splice::FilledPipe,
+        ) -> impl Future<Output = io::Result<crate::splice::Pipe>>;
     }
 }
 
@@ -271,6 +282,42 @@ macro_rules! impl_stream {
                 len: usize,
             ) -> impl ::std::future::Future<Output = ::compio_buf::BufResult<usize, F>> {
                 $crate::stream::sealed::SharedStream::send_file(&*self, file, offset, len)
+            }
+        }
+
+        impl<$($generics)*> $crate::splice::SpliceRead for $ty {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            fn can_splice(&self) -> bool {
+                true
+            }
+
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            fn splice_to_pipe(
+                &mut self,
+                pipe: $crate::splice::Pipe,
+                max: usize,
+            ) -> impl ::std::future::Future<
+                Output = ::std::result::Result<
+                    $crate::splice::Spliced,
+                    (::std::io::Error, $crate::splice::Pipe),
+                >,
+            > {
+                $crate::stream::sealed::SharedStream::splice_to_pipe(&*self, pipe, max)
+            }
+        }
+
+        impl<$($generics)*> $crate::splice::SpliceWrite for $ty {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            fn can_splice(&self) -> bool {
+                true
+            }
+
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            fn splice_from_pipe(
+                &mut self,
+                filled: $crate::splice::FilledPipe,
+            ) -> impl ::std::future::Future<Output = ::std::io::Result<$crate::splice::Pipe>> {
+                $crate::stream::sealed::SharedStream::splice_from_pipe(&*self, filled)
             }
         }
 
@@ -388,6 +435,38 @@ impl<S: SharedStream> SendFile for WriteHalf<S> {
         len: usize,
     ) -> impl Future<Output = BufResult<usize, F>> {
         self.0.send_file(file, offset, len)
+    }
+}
+
+impl<S: SharedStream> crate::splice::SpliceRead for ReadHalf<S> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        true
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn splice_to_pipe(
+        &mut self,
+        pipe: crate::splice::Pipe,
+        max: usize,
+    ) -> impl Future<Output = Result<crate::splice::Spliced, (io::Error, crate::splice::Pipe)>>
+    {
+        self.0.splice_to_pipe(pipe, max)
+    }
+}
+
+impl<S: SharedStream> crate::splice::SpliceWrite for WriteHalf<S> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        true
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn splice_from_pipe(
+        &mut self,
+        filled: crate::splice::FilledPipe,
+    ) -> impl Future<Output = io::Result<crate::splice::Pipe>> {
+        self.0.splice_from_pipe(filled)
     }
 }
 
