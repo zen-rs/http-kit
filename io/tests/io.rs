@@ -702,6 +702,94 @@ mod compio {
         assert_eq!(echoed, "世界 せかい 세계".as_bytes());
         server.join().expect("server thread");
     }
+
+    /// The io-wq workers of this process that are doing something other than
+    /// waiting for work, each as its thread id and kernel wait channel.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn busy_kernel_workers() -> Vec<String> {
+        let mut busy = Vec::new();
+        for task in std::fs::read_dir("/proc/self/task").expect("list threads") {
+            let task = task.expect("thread entry").path();
+            let comm = std::fs::read_to_string(task.join("comm")).unwrap_or_default();
+            if !comm.starts_with("iou-wrk") {
+                continue;
+            }
+            let wchan = std::fs::read_to_string(task.join("wchan")).unwrap_or_default();
+            if wchan.trim() != "io_wq_worker" {
+                busy.push(format!("{}: {}", task.display(), wchan.trim()));
+            }
+        }
+        busy
+    }
+
+    /// A region larger than both socket buffers, sent to a peer that stops
+    /// reading, leaves no io-wq worker waiting for the peer.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn send_file_to_a_stalled_peer_holds_no_kernel_worker() {
+        use std::{io::Read as _, sync::mpsc, time::Duration};
+
+        use http_kit_io::{BufResult, Io as _, Listener as _, SendFile as _};
+
+        const BUFFER: usize = 16 * 1024;
+
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("compio-stalled-peer");
+        let contents = super::payload();
+        std::fs::write(&path, &contents).expect("write the file to send");
+        let file = std::rc::Rc::new(std::fs::File::open(&path).expect("open the file to send"));
+
+        let (release, released) = mpsc::channel::<()>();
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let addr = addr_rx.recv().expect("listener address");
+            let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                .expect("peer socket");
+            socket
+                .set_recv_buffer_size(BUFFER)
+                .expect("peer receive buffer");
+            socket
+                .connect(&socket2::SockAddr::from(addr))
+                .expect("connect");
+            let mut stream = std::net::TcpStream::from(socket);
+            released.recv().expect("release");
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).expect("read");
+            received
+        });
+
+        let busy = run(async {
+            let io = http_kit_io::compio::Compio;
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
+            addr_tx
+                .send(listener.local_addr().expect("local address"))
+                .expect("send address");
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            socket2::SockRef::from(&stream)
+                .set_send_buffer_size(BUFFER)
+                .expect("send buffer");
+            let send = async {
+                let BufResult(res, _) = stream.send_file_all(file, 0, contents.len()).await;
+                res.expect("send file region");
+                http_kit_io::Write::shutdown(&mut stream)
+                    .await
+                    .expect("shutdown");
+            };
+            let watch = async {
+                ::compio::time::sleep(Duration::from_millis(500)).await;
+                let busy = busy_kernel_workers();
+                release.send(()).expect("release the peer");
+                busy
+            };
+            futures_lite::future::zip(send, watch).await.1
+        });
+        let received = peer.join().expect("peer thread");
+        std::fs::remove_file(&path).expect("remove the sent file");
+        super::assert_bytes(&received, &contents);
+        assert!(
+            busy.is_empty(),
+            "kernel workers held during the stall: {busy:?}"
+        );
+    }
 }
 
 #[cfg(feature = "tokio")]

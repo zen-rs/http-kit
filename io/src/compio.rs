@@ -5,11 +5,12 @@
 //! runtime on the current thread.
 //!
 //! [`SendFile`](crate::SendFile) moves file data in the kernel: on Linux
-//! through two `splice(2)` operations per round (file into a pipe, pipe into
-//! the socket), submitted to io_uring so that a page-cache miss blocks
-//! neither the thread nor the ring; on Apple platforms through `sendfile(2)`
-//! once the socket is writable. Elsewhere the region is read into a buffer
-//! and written.
+//! through two `splice(2)` operations per round, file into a pipe submitted
+//! to io_uring so that a page-cache miss blocks neither the thread nor the
+//! ring, then pipe into the socket on the thread, non-blocking, waiting for
+//! writability through the driver so that a slow reader holds no kernel
+//! worker; on Apple platforms through `sendfile(2)` once the socket is
+//! writable. Elsewhere the region is read into a buffer and written.
 //!
 //! The poll-style capability is a [`CopyingPoll`]: a completion-based driver
 //! cannot read into a buffer borrowed for one poll.
@@ -205,6 +206,8 @@ pub struct Stream<S> {
     /// The pipe file transfers splice through, kept between transfers. A
     /// transfer takes it out while data may sit in it, so one that fails or
     /// is cancelled midway drops it instead of leaving stale bytes behind.
+    /// A stream that has held one has an `O_NONBLOCK` socket, which compio's
+    /// own operations on io_uring still wait on inside the kernel.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pipe: std::cell::Cell<Option<splice::Pipe>>,
 }
@@ -375,7 +378,7 @@ mod splice {
         rc::Rc,
     };
 
-    use ::compio::driver::op::{Splice, SpliceFlags};
+    use ::compio::driver::op::{Interest, PollOnce, Splice, SpliceFlags};
     use compio_buf::{BufResult, IntoInner};
 
     use super::{Socket, Stream};
@@ -419,6 +422,14 @@ mod splice {
 
     /// One round: up to a pipe's capacity from the file into the pipe, then
     /// all of it from the pipe into the socket.
+    ///
+    /// The second step is not an io_uring splice: io_uring runs every splice
+    /// on an io-wq worker, and with no poll support for the operation a
+    /// splice into a full socket either holds that worker until the peer
+    /// reads (blocking socket) or fails with `EAGAIN` after the handoff
+    /// (non-blocking one). A `splice(2)` on the thread into the non-blocking
+    /// socket moves what the socket takes at once, and a full socket is
+    /// waited on with a poll the driver arms, which holds no thread.
     pub(super) async fn send_file<S: Socket + AsFd, F: Borrow<File> + 'static>(
         stream: &Stream<S>,
         file: F,
@@ -436,7 +447,9 @@ mod splice {
         };
         let pipe = match stream.pipe.take() {
             Some(pipe) => pipe,
-            None => match Pipe::new() {
+            None => match crate::sys::linux::set_nonblocking(stream.inner.as_fd())
+                .and_then(|()| Pipe::new())
+            {
                 Ok(pipe) => pipe,
                 Err(e) => return BufResult(Err(e), file),
             },
@@ -463,15 +476,11 @@ mod splice {
 
         let mut drained = 0;
         while drained < filled {
-            let drain = Splice::new(
-                pipe.read.clone(),
-                -1,
-                stream.inner.clone(),
-                -1,
+            match crate::sys::linux::splice(
+                pipe.read.as_fd(),
+                stream.inner.as_fd(),
                 filled - drained,
-                SpliceFlags::empty(),
-            );
-            match ::compio::runtime::submit(drain).await.0 {
+            ) {
                 Ok(0) => {
                     return BufResult(
                         Err(io::Error::new(
@@ -482,6 +491,12 @@ mod splice {
                     );
                 }
                 Ok(n) => drained += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let writable = PollOnce::new(stream.inner.clone(), Interest::Writable);
+                    if let Err(e) = ::compio::runtime::submit(writable).await.0 {
+                        return BufResult(Err(e), file);
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return BufResult(Err(e), file),
             }

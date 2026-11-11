@@ -104,3 +104,35 @@ pub(crate) fn pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd, 
     let capacity = usize::try_from(capacity).map_err(|_| io::Error::last_os_error())?;
     Ok((read, write, capacity))
 }
+
+/// Sets `O_NONBLOCK` on `fd`'s open file description.
+#[cfg(feature = "compio")]
+pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let mut on: libc::c_int = 1;
+    // SAFETY: `FIONBIO` reads one `c_int` through the pointer passed.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONBIO, &raw mut on) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// One `splice(2)` of up to `len` bytes from `from` to `to`, neither of
+/// which has an offset (a pipe or a socket), that never waits: `SPLICE_F_NONBLOCK` covers the pipe end,
+/// and a socket end must itself be `O_NONBLOCK`, since a socket's wait is
+/// decided by its own flag alone (`splice_to_socket` and `tcp_splice_read`).
+#[cfg(feature = "compio")]
+pub(crate) fn splice(from: BorrowedFd<'_>, to: BorrowedFd<'_>, len: usize) -> io::Result<usize> {
+    // SAFETY: both descriptors are open for the duration of the call, and
+    // the offsets are null, so the kernel writes through neither.
+    let moved = unsafe {
+        libc::splice(
+            from.as_raw_fd(),
+            std::ptr::null_mut(),
+            to.as_raw_fd(),
+            std::ptr::null_mut(),
+            len,
+            libc::SPLICE_F_NONBLOCK,
+        )
+    };
+    usize::try_from(moved).map_err(|_| io::Error::last_os_error())
+}
