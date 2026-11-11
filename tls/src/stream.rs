@@ -2,7 +2,12 @@
 
 use std::{borrow::Borrow, fmt, fs::File, future::Future, io};
 
-use http_kit_io::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, Split, Write};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use http_kit_io::splice::{FilledPipe, Pipe, Spliced};
+use http_kit_io::{
+    BufResult, IoBuf, IoBufMut, IoVectoredBuf, Read, SendFile, SpliceRead, SpliceWrite, Split,
+    Write,
+};
 use rustls::{ProtocolVersion, SupportedCipherSuite};
 
 use crate::{engine::Engine, side::Side, user};
@@ -84,6 +89,14 @@ pub trait KernelRead<R, D: Side>: Sized {
     fn get_ref(&self) -> &R;
 
     fn read<B: IoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
+
+    /// [`SpliceRead::splice_to_pipe`] on the plaintext the kernel opens.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn splice_to_pipe(
+        &mut self,
+        pipe: Pipe,
+        max: usize,
+    ) -> impl Future<Output = Result<Spliced, (io::Error, Pipe)>>;
 }
 
 /// The writing half of a kernel TLS connection over `W`, as [`KernelRead`].
@@ -108,6 +121,10 @@ pub trait KernelWrite<W, D: Side>: Sized {
         offset: u64,
         len: usize,
     ) -> impl Future<Output = BufResult<usize, F>>;
+
+    /// [`SpliceWrite::splice_from_pipe`] into the socket the kernel seals.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn splice_from_pipe(&mut self, filled: FilledPipe) -> impl Future<Output = io::Result<Pipe>>;
 }
 
 /// The kernel half of a transport the kernel cannot encrypt for: no value
@@ -129,6 +146,15 @@ impl<R, D: Side> KernelRead<R, D> for Never {
     }
 
     async fn read<B: IoBufMut>(&mut self, _buf: B) -> BufResult<usize, B> {
+        match *self {}
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_to_pipe(
+        &mut self,
+        _pipe: Pipe,
+        _max: usize,
+    ) -> Result<Spliced, (io::Error, Pipe)> {
         match *self {}
     }
 }
@@ -160,6 +186,11 @@ impl<W, D: Side> KernelWrite<W, D> for Never {
         _offset: u64,
         _len: usize,
     ) -> BufResult<usize, F> {
+        match *self {}
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_from_pipe(&mut self, _filled: FilledPipe) -> io::Result<Pipe> {
         match *self {}
     }
 }
@@ -216,13 +247,13 @@ impl<W: Write + SendFile + 'static> TransportWrite for W {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel"))]
-impl<R: Read + std::os::fd::AsFd + 'static> TransportRead for R {
+impl<R: Read + SpliceRead + std::os::fd::AsFd + 'static> TransportRead for R {
     type Kernel<D: Side> = crate::kernel::linux::Reader<R, D>;
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel"))]
-impl<W: Write + SendFile + http_kit_io::WriteControl + std::os::fd::AsFd + 'static> TransportWrite
-    for W
+impl<W: Write + SendFile + SpliceWrite + http_kit_io::WriteControl + std::os::fd::AsFd + 'static>
+    TransportWrite for W
 {
     type Kernel<D: Side> = crate::kernel::linux::Writer<W, D>;
 
@@ -493,6 +524,81 @@ impl<W: TransportWrite, D: Side> SendFile for TlsWriteHalf<W, D> {
             WriteInner::User(writer) => writer.send_file(file, offset, len).await,
             WriteInner::Kernel(writer) => writer.send_file(file, offset, len).await,
         }
+    }
+}
+
+/// Forwarding without reading into memory works only where the kernel opens
+/// the records: a user-space connection reports that it cannot splice, and a
+/// forwarder reads and writes it instead.
+impl<R: TransportRead, D: Side> SpliceRead for TlsReadHalf<R, D> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        matches!(self.0, ReadInner::Kernel(_))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_to_pipe(
+        &mut self,
+        pipe: Pipe,
+        max: usize,
+    ) -> Result<Spliced, (io::Error, Pipe)> {
+        match &mut self.0 {
+            ReadInner::User(_) => Err((unsplicable(), pipe)),
+            ReadInner::Kernel(reader) => reader.splice_to_pipe(pipe, max).await,
+        }
+    }
+}
+
+impl<W: TransportWrite, D: Side> SpliceWrite for TlsWriteHalf<W, D> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        matches!(self.0, WriteInner::Kernel(_))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn splice_from_pipe(&mut self, filled: FilledPipe) -> io::Result<Pipe> {
+        match &mut self.0 {
+            WriteInner::User(_) => Err(unsplicable()),
+            WriteInner::Kernel(writer) => writer.splice_from_pipe(filled).await,
+        }
+    }
+}
+
+/// What a splice on a user-space connection fails with: its bytes are
+/// records only rustls can open or seal.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unsplicable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a TLS connection encrypted in user space cannot splice",
+    )
+}
+
+impl<S: Transport, D: Side> SpliceRead for TlsStream<S, D> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        SpliceRead::can_splice(&self.read)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn splice_to_pipe(
+        &mut self,
+        pipe: Pipe,
+        max: usize,
+    ) -> impl Future<Output = Result<Spliced, (io::Error, Pipe)>> {
+        self.read.splice_to_pipe(pipe, max)
+    }
+}
+
+impl<S: Transport, D: Side> SpliceWrite for TlsStream<S, D> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn can_splice(&self) -> bool {
+        SpliceWrite::can_splice(&self.write)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn splice_from_pipe(&mut self, filled: FilledPipe) -> impl Future<Output = io::Result<Pipe>> {
+        self.write.splice_from_pipe(filled)
     }
 }
 
