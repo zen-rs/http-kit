@@ -1709,6 +1709,108 @@ mod compio {
         super::assert_bytes(&received, &expected);
     }
 
+    /// A file read into the ring's region of registered buffers is sent from
+    /// it, with a head from ordinary memory before it, byte for byte; a
+    /// write with no bytes in the region goes out as before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_from_the_registered_region_sends_its_bytes() {
+        use std::io::Read as _;
+
+        use http_kit_io::{
+            BufResult, Listen as _, Listener as _, Write as _,
+            compio::{Compio, FixedBuffers, ZeroCopySend},
+        };
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/io.rs");
+        let body = std::fs::read(path).expect("read the file");
+        let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\n".to_vec();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let addr = addr_rx.recv().expect("listener address");
+            let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).expect("read");
+            received
+        });
+
+        let (sent_head, len) = (head.clone(), body.len());
+        run(async move {
+            let io = Compio::default()
+                .with_zero_copy(ZeroCopySend::new(0))
+                .with_fixed_buffers(FixedBuffers::new(4 * 1024 * 1024))
+                .register_fixed_region()
+                .await
+                .expect("register the region");
+            let listener = io.bind_tcp(super::loopback()).expect("bind");
+            addr_tx
+                .send(listener.local_addr().expect("local address"))
+                .expect("send address");
+            let (mut stream, _) = listener.accept().await.expect("accept");
+
+            let body = match io.fixed_region() {
+                Some(region) => {
+                    let file = ::compio::driver::SharedFd::new(
+                        std::fs::File::open(path).expect("open the file"),
+                    );
+                    region
+                        .read_at(file, 0, len)
+                        .await
+                        .expect("read into the region")
+                        .expect("the region has room")
+                }
+                // The kernel refused io_uring: nothing is registered.
+                None => bytes::Bytes::from(std::fs::read(path).expect("read the file")),
+            };
+            let BufResult(res, _) = stream
+                .write_all_owned([bytes::Bytes::from(sent_head), body])
+                .await;
+            res.expect("write from the region");
+            let BufResult(res, _) = stream
+                .write_all_owned([bytes::Bytes::from_static(b"ordinary memory")])
+                .await;
+            res.expect("write from ordinary memory");
+            http_kit_io::Write::shutdown(&mut stream)
+                .await
+                .expect("shutdown");
+        });
+        let received = peer.join().expect("peer thread");
+        let mut expected = head;
+        expected.extend_from_slice(&body);
+        expected.extend_from_slice(b"ordinary memory");
+        super::assert_bytes(&received, &expected);
+    }
+
+    /// Bytes handed out of a region and dropped on another thread give their
+    /// span back to it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn region_bytes_dropped_elsewhere_give_their_span_back() {
+        use http_kit_io::compio::{Compio, FixedBuffers};
+
+        run(async {
+            let io = Compio::default()
+                .with_fixed_buffers(FixedBuffers::new(1024 * 1024))
+                .register_fixed_region()
+                .await
+                .expect("register the region");
+            let Some(region) = io.fixed_region() else {
+                // The kernel refused io_uring: nothing is registered.
+                return;
+            };
+            // Most of the region, since the allocator rounds a request up to
+            // its size class.
+            let most = region.len() / 4 * 3;
+            let held = region.alloc(most).expect("most of the region");
+            assert!(region.alloc(most).is_none(), "the region has no room left");
+            let bytes = held.freeze();
+            std::thread::spawn(move || drop(bytes))
+                .join()
+                .expect("drop on another thread");
+            assert!(region.alloc(most).is_some(), "the span came back");
+        });
+    }
+
     /// The name the kernel gives a socket's file, as `/proc` lists it.
     #[cfg(target_os = "linux")]
     fn socket_name(socket: &impl std::os::fd::AsFd) -> String {

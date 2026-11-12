@@ -14,7 +14,7 @@ categories = ["asynchronous", "network-programming"]
 
 [features]
 ## compio: io_uring on Linux (falling back to polling where io_uring is unavailable), IOCP on Windows, polling elsewhere.
-compio = ["dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core", "dep:io-uring", "dep:linux-raw-sys"]
+compio = ["dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core", "dep:io-uring", "dep:linux-raw-sys", "dep:offset-allocator", "dep:tracing"]
 ## tokio's reactor, adapted to owned buffers.
 tokio = ["dep:tokio", "dep:socket2", "dep:libc", "dep:windows-sys"]
 ## async-io's reactor, adapted to owned buffers.
@@ -42,6 +42,21 @@ futures-core = { version = "0.3.34", default-features = false, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies.io-uring]
 version = "0.7.16"
 default-features = false
+optional = true
+
+# The allocator of a ring's region of registered buffers, which hands out
+# spans of memory it does not own.
+[target.'cfg(target_os = "linux")'.dependencies.offset-allocator]
+version = "0.2.0"
+default-features = false
+optional = true
+
+# Where a contract violation in a ring's region of registered buffers is
+# reported in a release build, which runs inside a user's application.
+[target.'cfg(target_os = "linux")'.dependencies.tracing]
+version = "0.1.44"
+default-features = false
+features = ["std"]
 optional = true
 
 [target.'cfg(target_os = "linux")'.dependencies.linux-raw-sys]
