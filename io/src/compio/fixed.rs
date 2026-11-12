@@ -560,7 +560,10 @@ pub(super) async fn write_all<S: Socket, B: IoVectoredBuf>(
     let mut inside = false;
     let mut outside = 0;
     let mut count = 0;
-    for slice in buf.iter_slice().filter(|slice| !slice.is_empty()) {
+    for slice in buf.iter_slice() {
+        if slice.is_empty() {
+            continue;
+        }
         count += 1;
         if region.contains(slice) {
             inside = true;
@@ -580,7 +583,10 @@ pub(super) async fn write_all<S: Socket, B: IoVectoredBuf>(
         // The span is initialized: the mapping starts zeroed.
         span.len = outside;
         let mut at = 0;
-        for slice in buf.iter_slice().filter(|slice| !region.contains(slice)) {
+        for slice in buf.iter_slice() {
+            if region.contains(slice) {
+                continue;
+            }
             span[at..at + slice.len()].copy_from_slice(slice);
             at += slice.len();
         }
@@ -588,7 +594,10 @@ pub(super) async fn write_all<S: Socket, B: IoVectoredBuf>(
     };
     let mut slices = Vec::with_capacity(count);
     let mut copied_at = copied.as_ref().map_or(0, |copied| copied.as_ptr() as usize);
-    for slice in buf.iter_slice().filter(|slice| !slice.is_empty()) {
+    for slice in buf.iter_slice() {
+        if slice.is_empty() {
+            continue;
+        }
         if region.contains(slice) {
             slices.push((slice.as_ptr() as usize, slice.len()));
         } else {
