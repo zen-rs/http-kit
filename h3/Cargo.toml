@@ -1,6 +1,6 @@
 [package]
 name = "http-kit-h3"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Lexo Liu <me@lexo.cool>"]
@@ -36,8 +36,8 @@ pipe = ["quiche", "http-kit/pipe"]
 [dependencies]
 quiche = { version = "0.30.0", default-features = false, features = ["boringssl-boring-crate"], optional = true }
 boring = { version = "5.4.0", default-features = false, optional = true }
-http-kit = { version = "0.8.2", path = "..", default-features = false, features = ["std"], optional = true }
-http-kit-io = { version = "0.6.2", path = "../io", optional = true }
+http-kit = { version = "0.8.3", path = "..", default-features = false, features = ["std"], optional = true }
+http-kit-io = { version = "0.6.3", path = "../io", optional = true }
 http = { version = "1.5.0", default-features = false, features = ["std"], optional = true }
 bytes = { version = "1.12.1", default-features = false, features = ["std"], optional = true }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"], optional = true }
@@ -48,7 +48,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"], op
 
 [dev-dependencies]
 socket2 = { version = "0.6.5", default-features = false }
-http-kit-io = { version = "0.6.2", path = "../io", features = ["tokio", "compio"] }
+http-kit-io = { version = "0.6.3", path = "../io", features = ["tokio", "compio"] }
 compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["runtime"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
 

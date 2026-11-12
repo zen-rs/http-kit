@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3](https://github.com/zen-rs/http-kit/compare/v0.8.2...v0.8.3) - 2026-11-12
+
+### Other
+
+- updated the following local packages: http-kit-io
+
 ## [0.8.2](https://github.com/zen-rs/http-kit/compare/v0.8.1...v0.8.2) - 2026-11-11
 
 ### Other
