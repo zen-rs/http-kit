@@ -3,9 +3,10 @@
 //! The region is one anonymous mapping registered as the ring's buffer `0`,
 //! so that any slices of it can go out in one vectored send: the kernel
 //! requires every iovec of a send from registered buffers to lie in the one
-//! buffer its index names (`io_vec_fill_bvec`). An allocator hands it out in
-//! [`FixedBufMut`]s, which freeze into [`Bytes`] that any thread may hold and
-//! drop.
+//! buffer its index names (`io_vec_fill_bvec`). Its allocator lives on the
+//! ring's thread and hands it out in [`FixedBufMut`]s, which freeze into
+//! [`Bytes`] that any thread may hold and drop: a span dropped elsewhere
+//! comes back to the ring's thread over a channel.
 //!
 //! A zero-copy send from the region skips what a send from other memory
 //! costs on each call: pinning every page (`zerocopy_fill_skb_from_iter`),
@@ -14,12 +15,17 @@
 //! notification (`io_notif_account_mem`).
 
 use std::{
+    cell::RefCell,
     fmt, io,
     mem::MaybeUninit,
     os::fd::{AsFd, AsRawFd as _, OwnedFd, RawFd},
     ptr::NonNull,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::ThreadId,
 };
 
@@ -45,39 +51,66 @@ const UNIT: usize = 256;
 /// The index the region is registered at: it is the ring's only buffer.
 const INDEX: u16 = 0;
 
-/// A ring's region of registered buffers, which [`Compio::register_fixed_region`]
-/// registers on the ring's thread. Clones share the region; it is `Send` and
-/// `Sync`, but only the ring it was registered on can read into it or send
-/// from it by its index.
+/// A ring's region of registered buffers, which
+/// [`Compio::register_fixed_region`] registers on the ring's thread and
+/// [`Compio::fixed_region`] hands out. It stays on that thread (it is neither
+/// `Send` nor `Sync`); what it hands out does not.
 ///
 /// [`Compio::register_fixed_region`]: super::Compio::register_fixed_region
+/// [`Compio::fixed_region`]: super::Compio::fixed_region
 #[derive(Clone)]
-pub struct FixedRegion(Arc<Region>);
+pub struct FixedRegion(Rc<Region>);
 
 struct Region {
-    base: NonNull<u8>,
-    len: usize,
-    /// Free space, in [`UNIT`]s. A lock, because a [`Bytes`] handed out of
-    /// the region is `Send` and gives its span back from whatever thread
-    /// drops it; the ring's thread is the only one that allocates, so the
-    /// lock is contended only by such a release.
-    allocator: Mutex<Allocator>,
-    /// The ring the region is registered on: the thread, and the ring's
-    /// descriptor, which a later ring on the thread may reuse; a send that
-    /// then finds no registered buffer fails before sending anything, and the
-    /// stream drops the region.
+    mapping: Arc<Mapping>,
+    /// The free space, in [`UNIT`]s, which only the ring's thread touches.
+    allocator: RefCell<Allocator>,
+    /// The spans given back, from any thread, since the last allocation.
+    freed: mpsc::Receiver<Allocation>,
+    free: mpsc::Sender<Allocation>,
+    /// The ring the region is registered on: its thread, and its descriptor,
+    /// which no other ring has while it lives.
     ring: (ThreadId, RawFd),
     /// Whether the kernel takes a registered buffer on a vectored zero-copy
     /// send (Linux 6.15), as a probe at registration found.
     vectored: bool,
 }
 
-// SAFETY: the region is plain memory: each span is written only through the
-// one `FixedBufMut` that holds it, and read through `Bytes` once frozen; the
-// allocator is behind its lock.
-unsafe impl Send for Region {}
+/// The region's memory, which outlives the region while a span of it is
+/// held.
+struct Mapping {
+    base: NonNull<u8>,
+    len: usize,
+    /// Whether a ring may still hold it registered, in which case it is
+    /// never unmapped: the kernel would read and write whatever the address
+    /// space later maps there.
+    registered: AtomicBool,
+}
+
+// SAFETY: the mapping is plain memory: each span is written only through the
+// one `FixedBufMut` that holds it, and read through `Bytes` once frozen.
+unsafe impl Send for Mapping {}
 // SAFETY: as above.
-unsafe impl Sync for Region {}
+unsafe impl Sync for Mapping {}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        if !self.registered.load(Ordering::Acquire) {
+            // SAFETY: no ring holds the mapping and no span of it is held.
+            unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
+        }
+    }
+}
+
+/// A broken contract: a panic in a debug build, and in a release build,
+/// where this runs inside a user's application, a log.
+#[track_caller]
+fn violated(what: &str) {
+    if cfg!(debug_assertions) {
+        panic!("{what}");
+    }
+    tracing::error!("{what}");
+}
 
 impl FixedRegion {
     /// Maps and registers the current ring's region of `bytes` bytes, and
@@ -118,61 +151,84 @@ impl FixedRegion {
                 format!("mapping a region of {len} registered bytes: {error}"),
             ));
         }
-        let base = NonNull::new(base.cast::<u8>()).expect("a mapping is not at address 0");
-        let registered = Runtime::with_current(|runtime| {
-            // SAFETY: the mapping is unmapped only once it is unregistered,
-            // or never (`Region`'s `Drop`).
+        let mapping = Arc::new(Mapping {
+            base: NonNull::new(base.cast::<u8>()).expect("a mapping is not at address 0"),
+            len,
+            registered: AtomicBool::new(false),
+        });
+        Runtime::with_current(|runtime| {
+            // SAFETY: the mapping is unmapped only once nothing holds it
+            // registered (`Mapping::registered`).
             unsafe {
                 runtime.register_buffers(&[std::io::IoSliceMut::new(
-                    std::slice::from_raw_parts_mut(base.as_ptr(), len),
+                    std::slice::from_raw_parts_mut(mapping.base.as_ptr(), len),
                 )])
             }
-        });
-        if let Err(error) = registered {
-            // SAFETY: the mapping is unregistered and unused.
-            unsafe { libc::munmap(base.as_ptr().cast(), len) };
-            return Err(io::Error::new(
+        })
+        .map_err(|error| {
+            io::Error::new(
                 error.kind(),
                 format!("registering a region of {len} bytes: {error}"),
-            ));
-        }
+            )
+        })?;
+        mapping.registered.store(true, Ordering::Release);
+        let (free, freed) = mpsc::channel();
         let mut region = Region {
-            base,
-            len,
+            mapping,
             // offset-allocator's default bound on live allocations; past it
             // an allocation fails like one the region has no room for.
-            allocator: Mutex::new(Allocator::new(units)),
+            allocator: RefCell::new(Allocator::new(units)),
+            freed,
+            free,
             ring,
             vectored: false,
         };
         region.vectored = probe_vectored(&region).await?;
-        Ok(Some(Self(Arc::new(region))))
+        Ok(Some(Self(Rc::new(region))))
     }
 
     /// The region's size in bytes.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.len
+        self.0.mapping.len
     }
 
     /// Whether the region is empty, which a registered region never is.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.len == 0
+        self.0.mapping.len == 0
     }
 
     /// `len` bytes of the region to fill, or `None` when it has no room for
     /// them: the caller then uses memory of its own.
     #[must_use]
     pub fn alloc(&self, len: usize) -> Option<FixedBufMut> {
-        FixedBufMut::alloc(Arc::clone(&self.0), len)
+        let units = u32::try_from(len.div_ceil(UNIT).max(1)).ok()?;
+        let mut allocator = self.0.allocator.borrow_mut();
+        self.0.reclaim(&mut allocator);
+        let allocation = allocator.allocate(units).or_else(|| {
+            // A span may have come back meanwhile.
+            self.0.reclaim(&mut allocator);
+            allocator.allocate(units)
+        })?;
+        Some(FixedBufMut {
+            lease: Lease {
+                mapping: Arc::clone(&self.0.mapping),
+                offset: allocation.offset as usize * UNIT,
+                allocation,
+                capacity: len,
+                free: self.0.free.clone(),
+            },
+            len: 0,
+        })
     }
 
     /// Reads `len` bytes of `file` from `offset` into the region, through
     /// reads into the registered buffer (`IORING_OP_READ_FIXED`), which pin
     /// nothing either. `None` when the region has no room for them.
     ///
-    /// Call it on the region's ring.
+    /// Call it inside the region's ring's runtime: anywhere else is a
+    /// contract violation.
     ///
     /// # Errors
     ///
@@ -185,6 +241,7 @@ impl FixedRegion {
         len: usize,
     ) -> io::Result<Option<Bytes>> {
         if !self.is_current_ring() {
+            violated("reading into a region of registered buffers on another ring");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "reading into a region of registered buffers on another ring",
@@ -212,32 +269,52 @@ impl FixedRegion {
                 }
                 Ok(n) => buf.len = from + n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    refused(&e);
+                    return Err(e);
+                }
             }
         }
         Ok(Some(buf.freeze()))
     }
 
-    /// Whether the current thread's ring is the one the region is registered
-    /// on, as far as its thread and descriptor tell.
-    pub(super) fn is_current_ring(&self) -> bool {
+    /// The region for a stream being made: a stream on another ring than the
+    /// region's is a contract violation, and gets none.
+    pub(super) fn for_stream(&self) -> Option<Self> {
+        if self.is_current_ring() {
+            return Some(self.clone());
+        }
+        violated("a stream made from a ring's Compio on another ring");
+        None
+    }
+
+    /// Whether the current runtime is the ring the region is registered on.
+    fn is_current_ring(&self) -> bool {
         let (thread, fd) = self.0.ring;
         thread == std::thread::current().id()
             && Runtime::try_with_current(|runtime| runtime.as_raw_fd() == fd).unwrap_or(false)
     }
 
-    /// Where in the region `slice` lies, if it lies in it whole.
+    /// Whether `slice` lies in the region whole.
     fn contains(&self, slice: &[u8]) -> bool {
-        let base = self.0.base.as_ptr() as usize;
+        let base = self.0.mapping.base.as_ptr() as usize;
         let start = slice.as_ptr() as usize;
-        start >= base && start + slice.len() <= base + self.0.len
+        start >= base && start + slice.len() <= base + self.0.mapping.len
+    }
+}
+
+impl Region {
+    fn reclaim(&self, allocator: &mut Allocator) {
+        while let Ok(allocation) = self.freed.try_recv() {
+            allocator.free(allocation);
+        }
     }
 }
 
 impl fmt::Debug for FixedRegion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FixedRegion")
-            .field("len", &self.0.len)
+            .field("len", &self.0.mapping.len)
             .field("vectored", &self.0.vectored)
             .finish_non_exhaustive()
     }
@@ -251,14 +328,22 @@ impl Drop for Region {
                 runtime.as_raw_fd() == fd && runtime.unregister_buffers().is_ok()
             })
             .unwrap_or(false);
+        // Outside its ring's runtime the ring may still hold the mapping
+        // registered: it stays mapped, and goes with the process.
         if unregistered {
-            // SAFETY: the mapping is unregistered, and nothing refers to it:
-            // every buffer out of it holds the region.
-            unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
+            self.mapping.registered.store(false, Ordering::Release);
         }
-        // Otherwise the ring may still hold the mapping registered, and the
-        // kernel would read and write whatever the address space later maps
-        // there: the mapping stays, and goes with the process.
+    }
+}
+
+/// An error the kernel gave an operation on the region. `EFAULT` says the
+/// operation named memory outside the ring's registered buffer: the region
+/// sent or read a span it does not hold, or the ring is not the region's.
+fn refused(error: &io::Error) {
+    if error.raw_os_error() == Some(libc::EFAULT) {
+        violated(&format!(
+            "the ring refused a span of its region of registered buffers: {error}"
+        ));
     }
 }
 
@@ -271,10 +356,10 @@ impl Drop for Region {
 async fn probe_vectored(region: &Region) -> io::Result<bool> {
     // The region is registered and nothing else holds it yet: its first
     // unit is free to send.
-    // SAFETY: the unit lies in the mapping, which outlives the operation:
-    // the caller holds the region until the probe returns, and the operation
-    // completes before it does.
-    let unit: &'static [u8] = unsafe { std::slice::from_raw_parts(region.base.as_ptr(), 1) };
+    // SAFETY: the unit lies in the mapping, which stays mapped while it is
+    // registered, and it is until the region is dropped, after the probe.
+    let unit: &'static [u8] =
+        unsafe { std::slice::from_raw_parts(region.mapping.base.as_ptr(), 1) };
     let socket = OwnedFd::from(std::os::unix::net::UnixDatagram::unbound()?);
     let op = SendVectoredZcFixed::new(
         SharedFd::new(socket2::Socket::from(socket)),
@@ -294,34 +379,17 @@ pub struct FixedBufMut {
     len: usize,
 }
 
-/// A span of the region, given back once dropped, from any thread.
+/// A span of the region, given back to the ring's thread once dropped, from
+/// any thread.
 struct Lease {
-    region: Arc<Region>,
+    mapping: Arc<Mapping>,
     allocation: Allocation,
     offset: usize,
     capacity: usize,
+    free: mpsc::Sender<Allocation>,
 }
 
 impl FixedBufMut {
-    fn alloc(region: Arc<Region>, len: usize) -> Option<Self> {
-        let units = u32::try_from(len.div_ceil(UNIT).max(1)).ok()?;
-        let allocation = region
-            .allocator
-            .lock()
-            .expect("the region's allocator is not poisoned")
-            .allocate(units)?;
-        let offset = allocation.offset as usize * UNIT;
-        Some(Self {
-            lease: Lease {
-                region,
-                allocation,
-                offset,
-                capacity: len,
-            },
-            len: 0,
-        })
-    }
-
     /// How many bytes it holds at most.
     #[must_use]
     pub const fn capacity(&self) -> usize {
@@ -344,7 +412,7 @@ impl FixedBufMut {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.lease
-                    .region
+                    .mapping
                     .base
                     .as_ptr()
                     .add(self.lease.offset)
@@ -401,21 +469,18 @@ impl IoBufMut for FixedBufMut {
 
 impl AsRef<[u8]> for Lease {
     fn as_ref(&self) -> &[u8] {
-        // SAFETY: the span lies in the mapping, which `region` keeps; the
+        // SAFETY: the span lies in the mapping, which the lease keeps; the
         // mapping starts zeroed, so every byte is initialized.
         unsafe {
-            std::slice::from_raw_parts(self.region.base.as_ptr().add(self.offset), self.capacity)
+            std::slice::from_raw_parts(self.mapping.base.as_ptr().add(self.offset), self.capacity)
         }
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.region
-            .allocator
-            .lock()
-            .expect("the region's allocator is not poisoned")
-            .free(self.allocation);
+        // A region already gone has no allocator to give the span back to.
+        let _ = self.free.send(self.allocation);
     }
 }
 
@@ -540,7 +605,6 @@ pub(super) async fn write_all<S: Socket, B: IoVectoredBuf>(
     });
     let flags = SendFlags::from_bits_retain(libc::MSG_WAITALL.cast_unsigned());
     let mut written = 0;
-    let mut refused = false;
     let res = loop {
         if written == len {
             break Ok(());
@@ -571,23 +635,14 @@ pub(super) async fn write_all<S: Socket, B: IoVectoredBuf>(
             }
             Ok(n) => written += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            // The ring holds no such registered buffer: the region's ring is
-            // gone and this is another one on the same thread and descriptor.
-            // The kernel refused before sending anything, so the write goes
-            // out the usual way, and the stream keeps away from the region.
-            Err(e) if written == 0 && e.raw_os_error() == Some(libc::EFAULT) => {
-                stream.drop_fixed_region();
-                refused = true;
+            Err(e) => {
+                refused(&e);
                 break Err(e);
             }
-            Err(e) => break Err(e),
         }
     };
     drop(parts);
-    match Rc::into_inner(buf) {
-        Some(buf) if refused => Sent::Declined(buf),
-        buf => Sent::Done(BufResult(res, buf)),
-    }
+    Sent::Done(BufResult(res, Rc::into_inner(buf)))
 }
 
 /// Submits a zero-copy send from the region on the stream's socket.

@@ -112,19 +112,136 @@ pub use fixed::{FixedBufMut, FixedRegion};
 /// The compio implementation. compio keeps its runtime per thread, and every
 /// operation goes to the current thread's; this holds the operator's
 /// settings, [`ZeroCopySend`], [`FileTable`] and [`FixedBuffers`], which every
-/// stream it creates or adopts shares, and, once
-/// [`register_fixed_region`](Self::register_fixed_region) gave it one, the
-/// region its thread's ring registered.
-#[derive(Debug, Clone, Default)]
-pub struct Compio {
+/// stream it creates or adopts shares, and its [`Scope`]: [`Shared`], the
+/// settings alone, which any thread may hold, or [`Ring`], what one ring
+/// registered for its streams, which stays on the ring's thread.
+#[derive(Debug, Clone)]
+pub struct Compio<R = Shared> {
     zero_copy: ZeroCopySend,
     file_table: FileTable,
     fixed_buffers: FixedBuffers,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only Linux registers anything for a ring; elsewhere the scope is the type alone"
+        )
+    )]
+    scope: R,
+}
+
+/// What a [`Compio`] carries beside the settings: [`Shared`] or [`Ring`].
+pub trait Scope: sealed::Scope + Clone + fmt::Debug + 'static {}
+
+mod sealed {
+    pub trait Scope {
+        /// The region of registered buffers of the current ring, which a
+        /// stream sends from.
+        #[cfg(target_os = "linux")]
+        fn fixed_region(&self) -> Option<&super::FixedRegion>;
+    }
+}
+
+/// The settings alone: a [`Compio`] any thread may hold.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Shared;
+
+impl Scope for Shared {}
+
+impl sealed::Scope for Shared {
     #[cfg(target_os = "linux")]
-    fixed_region: Option<FixedRegion>,
+    fn fixed_region(&self) -> Option<&FixedRegion> {
+        None
+    }
+}
+
+/// What one ring registered for its streams, beside the settings:
+/// [`Compio::register_fixed_region`] makes it on the ring's thread, and it
+/// stays there (it is neither `Send` nor `Sync`), so a stream it creates can
+/// only be on that thread.
+///
+/// It must be used while its ring's runtime lives, and inside it: a stream
+/// made from it on another ring is a contract violation.
+#[derive(Debug, Clone)]
+pub struct Ring {
+    #[cfg(target_os = "linux")]
+    region: Option<FixedRegion>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Scope for Ring {}
+
+impl sealed::Scope for Ring {
+    #[cfg(target_os = "linux")]
+    fn fixed_region(&self) -> Option<&FixedRegion> {
+        self.region.as_ref()
+    }
+}
+
+impl Default for Compio {
+    fn default() -> Self {
+        Self {
+            zero_copy: ZeroCopySend::default(),
+            file_table: FileTable::default(),
+            fixed_buffers: FixedBuffers::default(),
+            scope: Shared,
+        }
+    }
 }
 
 impl Compio {
+    /// Registers the current thread's ring's region, [`FixedBuffers::bytes`]
+    /// large, and returns this implementation for the ring, carrying it: its
+    /// streams then send zero-copy writes from the region when their bytes
+    /// lie in it, and [`fixed_region`](Compio::fixed_region) hands the region
+    /// out to fill.
+    ///
+    /// Call it once per ring, inside the ring's runtime. Without a region to
+    /// register (a size of `0`, a runtime on polling, a platform other than
+    /// Linux) the ring carries none.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the region cannot be mapped or the kernel refuses to register
+    /// it: over `RLIMIT_MEMLOCK`, or on a ring that already has registered
+    /// buffers.
+    pub async fn register_fixed_region(&self) -> io::Result<Compio<Ring>> {
+        let scope = Ring {
+            #[cfg(target_os = "linux")]
+            region: FixedRegion::register(self.fixed_buffers.bytes()).await?,
+            _thread: std::marker::PhantomData,
+        };
+        Ok(Compio {
+            zero_copy: self.zero_copy.clone(),
+            file_table: self.file_table.clone(),
+            fixed_buffers: self.fixed_buffers.clone(),
+            scope,
+        })
+    }
+}
+
+impl Compio<Ring> {
+    /// The region of registered buffers the ring registered, if it registered
+    /// one.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub const fn fixed_region(&self) -> Option<&FixedRegion> {
+        self.scope.region.as_ref()
+    }
+
+    /// The settings alone, for another thread.
+    #[must_use]
+    pub fn shared(&self) -> Compio {
+        Compio {
+            zero_copy: self.zero_copy.clone(),
+            file_table: self.file_table.clone(),
+            fixed_buffers: self.fixed_buffers.clone(),
+            scope: Shared,
+        }
+    }
+}
+
+impl<R: Scope> Compio<R> {
     /// This implementation with its rings' regions of registered buffers
     /// sized as `fixed_buffers` says.
     #[must_use]
@@ -139,46 +256,6 @@ impl Compio {
     #[must_use]
     pub const fn fixed_buffers(&self) -> &FixedBuffers {
         &self.fixed_buffers
-    }
-
-    /// Registers the current thread's ring's region, [`FixedBuffers::bytes`]
-    /// large, and returns this implementation carrying it: its streams then
-    /// send zero-copy writes from the region when their bytes lie in it, and
-    /// [`fixed_region`](Self::fixed_region) hands the region out to fill.
-    ///
-    /// Call it once per ring, inside the ring's runtime, and use what it
-    /// returns on that thread: a stream on another ring ignores the region.
-    /// Without a region to register (a size of `0`, a runtime on polling, a
-    /// platform other than Linux) it returns this implementation unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the region cannot be mapped or the kernel refuses to register
-    /// it: over `RLIMIT_MEMLOCK`, or on a ring that already has registered
-    /// buffers.
-    pub async fn register_fixed_region(&self) -> io::Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            let region = FixedRegion::register(self.fixed_buffers.bytes()).await?;
-            Ok(Self {
-                fixed_region: region,
-                ..self.clone()
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Ok(self.clone())
-        }
-    }
-
-    /// The region of registered buffers [`register_fixed_region`] gave this
-    /// implementation, if it registered one.
-    ///
-    /// [`register_fixed_region`]: Self::register_fixed_region
-    #[cfg(target_os = "linux")]
-    #[must_use]
-    pub const fn fixed_region(&self) -> Option<&FixedRegion> {
-        self.fixed_region.as_ref()
     }
 
     /// This implementation with its streams sending zero-copy as `zero_copy`
@@ -361,13 +438,13 @@ impl FixedBuffers {
     }
 }
 
-impl Timer for Compio {
+impl<R: Scope> Timer for Compio<R> {
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
         ::compio::time::sleep_until(deadline)
     }
 }
 
-impl Dial for Compio {
+impl<R: Scope> Dial for Compio<R> {
     type Connection = TcpStream;
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
@@ -377,7 +454,7 @@ impl Dial for Compio {
 }
 
 #[cfg(unix)]
-impl DialUnix for Compio {
+impl<R: Scope> DialUnix for Compio<R> {
     type UnixConnection = UnixStream;
 
     async fn connect_unix(&self, path: &std::path::Path) -> io::Result<UnixStream> {
@@ -386,24 +463,24 @@ impl DialUnix for Compio {
     }
 }
 
-impl Listen for Compio {
-    type Listener = TcpListener;
+impl<R: Scope> Listen for Compio<R> {
+    type Listener = TcpListener<R>;
 
-    fn bind_tcp(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+    fn bind_tcp(&self, addr: SocketAddr) -> io::Result<TcpListener<R>> {
         self.tcp_listener(std::net::TcpListener::bind(addr)?)
     }
 }
 
 #[cfg(unix)]
-impl ListenUnix for Compio {
-    type UnixListener = UnixListener;
+impl<R: Scope> ListenUnix for Compio<R> {
+    type UnixListener = UnixListener<R>;
 
-    fn bind_unix(&self, path: &std::path::Path) -> io::Result<UnixListener> {
+    fn bind_unix(&self, path: &std::path::Path) -> io::Result<UnixListener<R>> {
         self.unix_listener(std::os::unix::net::UnixListener::bind(path)?)
     }
 }
 
-impl Datagram for Compio {
+impl<R: Scope> Datagram for Compio<R> {
     type UdpSocket = UdpSocket;
 
     async fn bind_udp(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
@@ -412,18 +489,18 @@ impl Datagram for Compio {
 }
 
 #[cfg(unix)]
-impl FromStdUnix for Compio {
+impl<R: Scope> FromStdUnix for Compio<R> {
     fn unix_listener(
         &self,
         listener: std::os::unix::net::UnixListener,
-    ) -> io::Result<UnixListener> {
+    ) -> io::Result<UnixListener<R>> {
         let listener = net::UnixListener::from_std(listener)?;
         Ok(UnixListener::new(listener, self.clone()))
     }
 }
 
-impl FromStd for Compio {
-    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener> {
+impl<R: Scope> FromStd for Compio<R> {
+    fn tcp_listener(&self, listener: std::net::TcpListener) -> io::Result<TcpListener<R>> {
         let listener = net::TcpListener::from_std(listener)?;
         Ok(TcpListener::new(listener, self.clone()))
     }
@@ -586,7 +663,7 @@ pub struct Stream<S> {
     /// The region of registered buffers of the stream's ring, which a
     /// zero-copy write whose bytes lie in it is sent from.
     #[cfg(target_os = "linux")]
-    fixed: std::cell::RefCell<Option<FixedRegion>>,
+    fixed: Option<FixedRegion>,
 }
 
 #[expect(
@@ -594,7 +671,7 @@ pub struct Stream<S> {
     reason = "every method is private: only this module creates and drives a stream"
 )]
 impl<S: Socket> Stream<S> {
-    fn new(inner: S, io: &Compio) -> Self {
+    fn new<R: Scope>(inner: S, io: &Compio<R>) -> Self {
         // Only Linux sends zero-copy and registers files.
         #[cfg(not(target_os = "linux"))]
         let _ = io;
@@ -617,19 +694,9 @@ impl<S: Socket> Stream<S> {
             zero_copy: io.zero_copy.clone(),
             #[cfg(target_os = "linux")]
             recv_empty: std::cell::Cell::new(false),
-            // A region another ring registered is not this stream's to send
-            // from.
             #[cfg(target_os = "linux")]
-            fixed: std::cell::RefCell::new(
-                io.fixed_region.clone().filter(FixedRegion::is_current_ring),
-            ),
+            fixed: sealed::Scope::fixed_region(&io.scope).and_then(FixedRegion::for_stream),
         }
-    }
-
-    /// Stops sending from the region: its ring is gone.
-    #[cfg(target_os = "linux")]
-    fn drop_fixed_region(&self) {
-        self.fixed.borrow_mut().take();
     }
 
     /// Submits `op`, which operates on this socket: on Linux by the socket's
@@ -874,9 +941,8 @@ impl<S: Socket> SharedStream for Stream<S> {
         if S::ZERO_COPY && buf.total_len() >= threshold {
             // Bytes that would not go out zero-copy on their own, a head or
             // framing, are worth copying into the region beside its bytes.
-            let region = self.fixed.borrow().clone();
-            let buf = match region {
-                Some(region) => match fixed::write_all(self, &region, buf, threshold).await {
+            let buf = match &self.fixed {
+                Some(region) => match fixed::write_all(self, region, buf, threshold).await {
                     fixed::Sent::Done(result) => return result,
                     fixed::Sent::Declined(buf) => buf,
                 },
@@ -2192,16 +2258,16 @@ mod multishot {
 
 /// A listening TCP socket.
 #[derive(Debug)]
-pub struct TcpListener {
+pub struct TcpListener<R = Shared> {
     inner: net::TcpListener,
     #[cfg(target_os = "linux")]
     accepts: multishot::Accepts,
     /// The settings each accepted stream shares.
-    io: Compio,
+    io: Compio<R>,
 }
 
-impl TcpListener {
-    fn new(inner: net::TcpListener, io: Compio) -> Self {
+impl<R: Scope> TcpListener<R> {
+    fn new(inner: net::TcpListener, io: Compio<R>) -> Self {
         Self {
             #[cfg(target_os = "linux")]
             accepts: multishot::Accepts::new(&inner),
@@ -2218,13 +2284,13 @@ impl TcpListener {
 }
 
 #[cfg(unix)]
-impl std::os::fd::AsFd for TcpListener {
+impl<R> std::os::fd::AsFd for TcpListener<R> {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.inner.as_fd()
     }
 }
 
-impl Listener for TcpListener {
+impl<R: Scope> Listener for TcpListener<R> {
     type Stream = TcpStream;
     type Addr = SocketAddr;
 
@@ -2249,17 +2315,17 @@ impl Listener for TcpListener {
 /// A listening Unix-domain socket.
 #[cfg(unix)]
 #[derive(Debug)]
-pub struct UnixListener {
+pub struct UnixListener<R = Shared> {
     inner: net::UnixListener,
     #[cfg(target_os = "linux")]
     accepts: multishot::Accepts,
     /// The settings each accepted stream shares.
-    io: Compio,
+    io: Compio<R>,
 }
 
 #[cfg(unix)]
-impl UnixListener {
-    fn new(inner: net::UnixListener, io: Compio) -> Self {
+impl<R: Scope> UnixListener<R> {
+    fn new(inner: net::UnixListener, io: Compio<R>) -> Self {
         Self {
             #[cfg(target_os = "linux")]
             accepts: multishot::Accepts::new(&inner),
@@ -2276,14 +2342,14 @@ impl UnixListener {
 }
 
 #[cfg(unix)]
-impl std::os::fd::AsFd for UnixListener {
+impl<R> std::os::fd::AsFd for UnixListener<R> {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.inner.as_fd()
     }
 }
 
 #[cfg(unix)]
-impl Listener for UnixListener {
+impl<R: Scope> Listener for UnixListener<R> {
     type Stream = UnixStream;
     type Addr = std::os::unix::net::SocketAddr;
 
