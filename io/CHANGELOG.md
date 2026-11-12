@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/zen-rs/http-kit/compare/io/v0.6.2...io/v0.6.3) - 2026-11-12
+
+### Added
+
+- *(io)* send zero-copy writes from a ring's registered region
+
+### Fixed
+
+- *(io)* walk a write's slices without a filter closure
+- *(io)* keep a ring's region on its ring and its allocator on its thread
+- *(io)* check the descriptor only where an operation names it
+
+### Other
+
+- *(io)* bring SendFile into scope for the reused-descriptor test on Linux
+- *(io)* check a compio stream's descriptor still names its socket
+- *(io)* consume the receive buffer ring incrementally
+- depend on compio from the lexoliu/compio skyzen branch
+
 ## [0.6.2](https://github.com/zen-rs/http-kit/compare/io/v0.6.1...io/v0.6.2) - 2026-11-11
 
 ### Fixed
