@@ -14,7 +14,7 @@ categories = ["asynchronous", "network-programming"]
 
 [features]
 ## compio: io_uring on Linux (falling back to polling where io_uring is unavailable), IOCP on Windows, polling elsewhere.
-compio = ["dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core", "dep:io-uring", "dep:linux-raw-sys"]
+compio = ["dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core", "dep:io-uring", "dep:linux-raw-sys", "dep:offset-allocator"]
 ## tokio's reactor, adapted to owned buffers.
 tokio = ["dep:tokio", "dep:socket2", "dep:libc", "dep:windows-sys"]
 ## async-io's reactor, adapted to owned buffers.
@@ -41,6 +41,13 @@ futures-core = { version = "0.3.34", default-features = false, optional = true }
 # them with, so that an entry built here is one its driver takes.
 [target.'cfg(target_os = "linux")'.dependencies.io-uring]
 version = "0.7.16"
+default-features = false
+optional = true
+
+# The allocator of a ring's region of registered buffers, which hands out
+# spans of memory it does not own.
+[target.'cfg(target_os = "linux")'.dependencies.offset-allocator]
+version = "0.2.0"
 default-features = false
 optional = true
 

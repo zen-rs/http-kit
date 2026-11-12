@@ -62,6 +62,19 @@
 //! slots (before 5.19), leaves the stream on its descriptor. The ring's
 //! table belongs to these streams: nothing else on the runtime may use it.
 //!
+//! On Linux over io_uring a ring may register a region of memory as its
+//! one registered buffer ([`Compio::register_fixed_region`], sized by
+//! [`FixedBuffers`]), which the kernel pins once. A zero-copy write whose
+//! slices lie in the region goes out from it (`IORING_RECVSEND_FIXED_BUF`),
+//! with none of its pages pinned or charged to `RLIMIT_MEMLOCK` per send;
+//! slices outside it, fewer than [`ZeroCopySend::threshold`] bytes in all (a
+//! head, chunk framing), are copied into the region beside them. A write of
+//! several slices needs Linux 6.15, which the ring probes for when it
+//! registers; a write the region cannot take (no slice in it, too much
+//! outside it, no room, an older kernel) is sent zero-copy as before. Bytes
+//! reach the region by being read into it (`FixedRegion::read_at`) or
+//! written into a span of it (`FixedRegion::alloc`).
+//!
 //! The poll-style capability is a [`CopyingPoll`]: a completion-based driver
 //! cannot read into a buffer borrowed for one poll.
 
@@ -91,17 +104,83 @@ use crate::{
 #[cfg(unix)]
 use crate::{DialUnix, FromStdUnix, ListenUnix};
 
+#[cfg(target_os = "linux")]
+mod fixed;
+#[cfg(target_os = "linux")]
+pub use fixed::{FixedBufMut, FixedRegion};
+
 /// The compio implementation. compio keeps its runtime per thread, and every
-/// operation goes to the current thread's; this holds only the operator's
-/// settings, [`ZeroCopySend`] and [`FileTable`], which every stream it
-/// creates or adopts shares.
+/// operation goes to the current thread's; this holds the operator's
+/// settings, [`ZeroCopySend`], [`FileTable`] and [`FixedBuffers`], which every
+/// stream it creates or adopts shares, and, once
+/// [`register_fixed_region`](Self::register_fixed_region) gave it one, the
+/// region its thread's ring registered.
 #[derive(Debug, Clone, Default)]
 pub struct Compio {
     zero_copy: ZeroCopySend,
     file_table: FileTable,
+    fixed_buffers: FixedBuffers,
+    #[cfg(target_os = "linux")]
+    fixed_region: Option<FixedRegion>,
 }
 
 impl Compio {
+    /// This implementation with its rings' regions of registered buffers
+    /// sized as `fixed_buffers` says.
+    #[must_use]
+    pub fn with_fixed_buffers(self, fixed_buffers: FixedBuffers) -> Self {
+        Self {
+            fixed_buffers,
+            ..self
+        }
+    }
+
+    /// The registered-buffer setting its rings share.
+    #[must_use]
+    pub const fn fixed_buffers(&self) -> &FixedBuffers {
+        &self.fixed_buffers
+    }
+
+    /// Registers the current thread's ring's region, [`FixedBuffers::bytes`]
+    /// large, and returns this implementation carrying it: its streams then
+    /// send zero-copy writes from the region when their bytes lie in it, and
+    /// [`fixed_region`](Self::fixed_region) hands the region out to fill.
+    ///
+    /// Call it once per ring, inside the ring's runtime, and use what it
+    /// returns on that thread: a stream on another ring ignores the region.
+    /// Without a region to register (a size of `0`, a runtime on polling, a
+    /// platform other than Linux) it returns this implementation unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the region cannot be mapped or the kernel refuses to register
+    /// it: over `RLIMIT_MEMLOCK`, or on a ring that already has registered
+    /// buffers.
+    pub async fn register_fixed_region(&self) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let region = FixedRegion::register(self.fixed_buffers.bytes()).await?;
+            Ok(Self {
+                fixed_region: region,
+                ..self.clone()
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(self.clone())
+        }
+    }
+
+    /// The region of registered buffers [`register_fixed_region`] gave this
+    /// implementation, if it registered one.
+    ///
+    /// [`register_fixed_region`]: Self::register_fixed_region
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub const fn fixed_region(&self) -> Option<&FixedRegion> {
+        self.fixed_region.as_ref()
+    }
+
     /// This implementation with its streams sending zero-copy as `zero_copy`
     /// says.
     #[must_use]
@@ -239,6 +318,46 @@ impl ZeroCopySend {
 impl Default for ZeroCopySend {
     fn default() -> Self {
         Self::new(Self::DEFAULT_THRESHOLD)
+    }
+}
+
+/// How large a ring's region of registered buffers is, on Linux over
+/// io_uring: the memory [`Compio::register_fixed_region`] maps and registers
+/// for a thread's ring, which its `FixedRegion` hands out.
+///
+/// It is the operator's runtime-adjustable handle: every clone shares one
+/// value, across threads. A ring registers its region once, so a change sizes
+/// the regions registered afterwards. `0`, the default, registers none.
+///
+/// The kernel pins the whole region when it registers it and charges it to
+/// the user's `RLIMIT_MEMLOCK` unless the process has `CAP_IPC_LOCK`
+/// (`io_buffer_account_pin`), so a region larger than the limit allows is
+/// refused, and the error names its size. In exchange a zero-copy send from
+/// it is charged nothing and pins nothing per send.
+#[derive(Debug, Clone, Default)]
+pub struct FixedBuffers {
+    bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FixedBuffers {
+    /// A setting of regions of `bytes` bytes.
+    #[must_use]
+    pub fn new(bytes: usize) -> Self {
+        Self {
+            bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(bytes)),
+        }
+    }
+
+    /// The bytes a ring's region is registered with.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sets the size for every clone of this setting.
+    pub fn set_bytes(&self, bytes: usize) {
+        self.bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -464,6 +583,10 @@ pub struct Stream<S> {
     /// stream does.
     #[cfg(target_os = "linux")]
     recv_empty: std::cell::Cell<bool>,
+    /// The region of registered buffers of the stream's ring, which a
+    /// zero-copy write whose bytes lie in it is sent from.
+    #[cfg(target_os = "linux")]
+    fixed: std::cell::RefCell<Option<FixedRegion>>,
 }
 
 #[expect(
@@ -494,7 +617,19 @@ impl<S: Socket> Stream<S> {
             zero_copy: io.zero_copy.clone(),
             #[cfg(target_os = "linux")]
             recv_empty: std::cell::Cell::new(false),
+            // A region another ring registered is not this stream's to send
+            // from.
+            #[cfg(target_os = "linux")]
+            fixed: std::cell::RefCell::new(
+                io.fixed_region.clone().filter(FixedRegion::is_current_ring),
+            ),
         }
+    }
+
+    /// Stops sending from the region: its ring is gone.
+    #[cfg(target_os = "linux")]
+    fn drop_fixed_region(&self) {
+        self.fixed.borrow_mut().take();
     }
 
     /// Submits `op`, which operates on this socket: on Linux by the socket's
@@ -735,7 +870,18 @@ impl<S: Socket> SharedStream for Stream<S> {
 
     #[cfg(target_os = "linux")]
     async fn write_all_owned<B: IoVectoredBuf>(&self, buf: B) -> BufResult<(), Option<B>> {
-        if S::ZERO_COPY && buf.total_len() >= self.zero_copy.threshold() {
+        let threshold = self.zero_copy.threshold();
+        if S::ZERO_COPY && buf.total_len() >= threshold {
+            // Bytes that would not go out zero-copy on their own, a head or
+            // framing, are worth copying into the region beside its bytes.
+            let region = self.fixed.borrow().clone();
+            let buf = match region {
+                Some(region) => match fixed::write_all(self, &region, buf, threshold).await {
+                    fixed::Sent::Done(result) => return result,
+                    fixed::Sent::Declined(buf) => buf,
+                },
+                None => buf,
+            };
             return zero_copy::write_all(self, buf).await;
         }
         let BufResult(res, buf) =
@@ -1527,7 +1673,7 @@ mod zero_copy {
 
     /// The caller's buffers, shared by the sends of one write: a short send
     /// is continued by another while the first still holds what it sent.
-    struct Shared<B>(Rc<B>);
+    pub(super) struct Shared<B>(pub(super) Rc<B>);
 
     impl<B: IoVectoredBuf> IoVectoredBuf for Shared<B> {
         fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
