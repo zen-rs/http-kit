@@ -57,13 +57,24 @@ impl<R: ReadOwned> Recv<R> {
     /// future is dropped mid-read then, the buffer goes with it, and the
     /// connection is unusable and must close.
     pub(crate) async fn fill(&mut self) -> Result<usize, Error> {
+        let (len, owned) = self.receive().await?;
+        if let Some(bytes) = owned {
+            self.buf.extend_from_slice(&bytes);
+        }
+        Ok(len)
+    }
+
+    // Lent buffers return immediately; independently owned bytes can bypass
+    // the parsing buffer when the body decoder is in a raw data run.
+    async fn receive(&mut self) -> Result<(usize, Option<Bytes>), Error> {
         loop {
             match self.reader.read_owned().await {
                 Ok(Received::Lent(bytes)) => {
                     self.buf.extend_from_slice(&bytes);
-                    return Ok(bytes.len());
+                    return Ok((bytes.len(), None));
                 }
-                Ok(Received::End) => return Ok(0),
+                Ok(Received::Owned(bytes)) => return Ok((bytes.len(), Some(bytes))),
+                Ok(Received::End) => return Ok((0, None)),
                 Ok(Received::ReadInstead) => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error.into()),
@@ -78,7 +89,7 @@ impl<R: ReadOwned> Recv<R> {
             match result {
                 Ok(n) => {
                     self.buf = buf;
-                    return Ok(n);
+                    return Ok((n, None));
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
@@ -406,9 +417,22 @@ async fn next_frame<R: ReadOwned + SpliceRead, T: Timer>(
                 Attempt::End => return Ok(None),
             }
         }
-        let read = until(timer, deadline_after(body_idle), recv.fill())
+        let (read, owned) = until(timer, deadline_after(body_idle), recv.receive())
             .await
             .ok_or(Error::Timeout(Timeout::BodyRead))??;
+        if let Some(mut bytes) = owned {
+            if recv.buf.is_empty()
+                && !bytes.is_empty()
+                && let Some(run) = decoder.raw_run()
+            {
+                let len = usize::try_from(run).unwrap_or(usize::MAX).min(bytes.len());
+                let data = bytes.split_to(len);
+                decoder.consume_raw(len as u64);
+                recv.buf.extend_from_slice(&bytes);
+                return Ok(Some(BodyFrame::Data(data)));
+            }
+            recv.buf.extend_from_slice(&bytes);
+        }
         if read == 0 {
             break decoder.decode_eof(&mut recv.buf, limits)?;
         }
@@ -440,4 +464,127 @@ pub(crate) async fn while_driving<M: Future, S: Future>(
     })
     .await;
     (output, side_output)
+}
+
+#[cfg(test)]
+mod owned_receive_tests {
+    use super::*;
+    use crate::proto::BodyKind;
+    use http_kit_io::{IoBufMut, NoBuf, Read};
+    use std::collections::VecDeque;
+
+    struct Reader(VecDeque<Bytes>);
+
+    impl Read for Reader {
+        async fn read<B: IoBufMut>(&mut self, _: B) -> BufResult<usize, B> {
+            panic!("owned reader must not use caller buffers")
+        }
+    }
+
+    impl ReadOwned for Reader {
+        type Buf = NoBuf;
+        async fn read_owned(&mut self) -> io::Result<Received<NoBuf>> {
+            Ok(self.0.pop_front().map_or(Received::End, Received::Owned))
+        }
+    }
+
+    impl SpliceRead for Reader {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fn can_splice(&self) -> bool {
+            false
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        async fn splice_to_pipe(
+            &mut self,
+            _: http_kit_io::splice::Pipe,
+            _: usize,
+        ) -> Result<http_kit_io::splice::Spliced, (io::Error, http_kit_io::splice::Pipe)> {
+            panic!("owned reader cannot splice")
+        }
+    }
+
+    struct NoTimer;
+    impl Timer for NoTimer {
+        async fn sleep_until(&self, _: Instant) {
+            pending().await
+        }
+    }
+
+    async fn frame(
+        recv: &mut Recv<Reader>,
+        decoder: &mut BodyDecoder,
+    ) -> Result<Option<BodyFrame>, Error> {
+        next_frame(recv, decoder, &Limits::default(), &NoTimer, None, &mut None).await
+    }
+
+    #[test]
+    fn owned_length_body_preserves_allocation_and_next_message() {
+        futures_lite::future::block_on(async {
+            let bytes = Bytes::from(Vec::from(&b"bodyNEXT"[..]));
+            let mut recv = Recv::new(Reader([bytes.clone()].into()), 1024);
+            let mut decoder = BodyDecoder::new(BodyKind::Length(4));
+            let Some(BodyFrame::Data(data)) = frame(&mut recv, &mut decoder).await.unwrap() else {
+                panic!("expected data")
+            };
+            assert_eq!(&data[..], b"body");
+            assert_eq!(data.as_ptr(), bytes.as_ptr());
+            assert!(frame(&mut recv, &mut decoder).await.unwrap().is_none());
+            assert_eq!(&recv.buf[..], b"NEXT");
+        });
+    }
+
+    #[test]
+    fn owned_chunk_body_preserves_allocation_across_split_framing() {
+        futures_lite::future::block_on(async {
+            let bytes = Bytes::from(Vec::from(&b"body\r"[..]));
+            let mut recv = Recv::new(
+                Reader(
+                    [
+                        Bytes::from_static(b"4\r"),
+                        Bytes::from_static(b"\n"),
+                        bytes.clone(),
+                        Bytes::from_static(b"\n0\r\n\r\nNEXT"),
+                    ]
+                    .into(),
+                ),
+                1024,
+            );
+            let mut decoder = BodyDecoder::new(BodyKind::Chunked);
+            let Some(BodyFrame::Data(data)) = frame(&mut recv, &mut decoder).await.unwrap() else {
+                panic!("expected data")
+            };
+            assert_eq!(&data[..], b"body");
+            assert_eq!(data.as_ptr(), bytes.as_ptr());
+            while frame(&mut recv, &mut decoder).await.unwrap().is_some() {}
+            assert_eq!(&recv.buf[..], b"NEXT");
+        });
+    }
+
+    #[test]
+    fn owned_close_delimited_body_ends_at_eof() {
+        futures_lite::future::block_on(async {
+            let bytes = Bytes::from(Vec::from(&b"body"[..]));
+            let mut recv = Recv::new(Reader([bytes.clone()].into()), 1024);
+            let mut decoder = BodyDecoder::new(BodyKind::CloseDelimited);
+            let Some(BodyFrame::Data(data)) = frame(&mut recv, &mut decoder).await.unwrap() else {
+                panic!("expected data")
+            };
+            assert_eq!(data.as_ptr(), bytes.as_ptr());
+            assert!(frame(&mut recv, &mut decoder).await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn owned_partial_length_reports_early_eof() {
+        futures_lite::future::block_on(async {
+            let mut recv = Recv::new(Reader([Bytes::from_static(b"one")].into()), 1024);
+            let mut decoder = BodyDecoder::new(BodyKind::Length(4));
+            assert!(matches!(
+                frame(&mut recv, &mut decoder).await.unwrap(),
+                Some(BodyFrame::Data(_))
+            ));
+            assert!(frame(&mut recv, &mut decoder).await.is_err());
+        });
+    }
 }
