@@ -25,6 +25,9 @@ pub enum Received<B> {
     /// Received bytes in a buffer the stream owns. Dropping it hands the
     /// buffer back to the stream.
     Lent(B),
+    /// Independently owned bytes that may be retained or transferred without
+    /// holding the stream's receive ring.
+    Owned(bytes::Bytes),
     /// The end of the stream.
     End,
     /// The stream has no buffer of its own to lend now: read into one of the
@@ -32,7 +35,7 @@ pub enum Received<B> {
     ReadInstead,
 }
 
-/// Reads that lend the stream's own receive buffer, so a reader waiting for
+/// Reads that lend or transfer a receive buffer, so a reader waiting for
 /// bytes holds no buffer of its own.
 ///
 /// The compio implementation on Linux receives with a multishot receive into
@@ -45,7 +48,7 @@ pub trait ReadOwned: Read {
     /// The received bytes as lent out.
     type Buf: Deref<Target = [u8]>;
 
-    /// Waits for received bytes and lends them out.
+    /// Waits for received bytes and lends or transfers them.
     fn read_owned(&mut self) -> impl Future<Output = io::Result<Received<Self::Buf>>>;
 }
 
