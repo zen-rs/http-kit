@@ -4,7 +4,11 @@
 
 mod support;
 
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use futures_lite::future::{or, zip};
 use http_kit::{Method, Request, Response};
@@ -12,18 +16,18 @@ use http_kit_h2::{ServerConfig, ServerConnection};
 use http_kit_io::{Listen as _, Listener as _};
 use support::{CJK, cjk_payload, loopback, on_compio, pki, tls_acceptor, within};
 
-fn find_http2_curl() -> Option<PathBuf> {
+fn find_http2_curl() -> Option<(PathBuf, bool)> {
     for var in ["HTTP_KIT_H2_CURL", "HTTP_KIT_H3_CURL"] {
         if let Some(val) = std::env::var_os(var) {
             let path = PathBuf::from(val);
-            if supports_http2(&path) {
-                return Some(path);
+            if let Some(schannel) = probe_http2_curl(&path) {
+                return Some((path, schannel));
             }
         }
     }
     let default = PathBuf::from("curl");
-    if supports_http2(&default) {
-        return Some(default);
+    if let Some(schannel) = probe_http2_curl(&default) {
+        return Some((default, schannel));
     }
     assert!(
         std::env::var_os("CI").is_none(),
@@ -32,11 +36,23 @@ fn find_http2_curl() -> Option<PathBuf> {
     None
 }
 
-fn supports_http2(bin: &PathBuf) -> bool {
-    let Ok(out) = Command::new(bin).arg("-V").output() else {
-        return false;
-    };
-    out.status.success() && String::from_utf8_lossy(&out.stdout).contains("HTTP2")
+/// Returns `Some(uses_schannel)` if `bin -V` reports HTTP/2 support.
+fn probe_http2_curl(bin: &Path) -> Option<bool> {
+    let out = Command::new(bin).arg("-V").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let info = String::from_utf8_lossy(&out.stdout);
+    info.contains("HTTP2").then(|| info.contains("Schannel"))
+}
+
+fn extract_header<'a>(dumped: &'a str, name: &str) -> Option<&'a str> {
+    dumped.lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| v.trim_matches([' ', '\t', '\r']))
+    })
 }
 
 async fn echo_service(request: Request) -> Response {
@@ -50,7 +66,7 @@ async fn echo_service(request: Request) -> Response {
 
 #[test]
 fn answers_curl_http2_tls_and_prior_knowledge() {
-    let Some(curl) = find_http2_curl() else {
+    let Some((curl, schannel)) = find_http2_curl() else {
         return;
     };
 
@@ -67,9 +83,20 @@ fn answers_curl_http2_tls_and_prior_knowledge() {
     let dl_tls = dir.join("download-tls.bin");
     let dl_h2c = dir.join("download-h2c.bin");
 
+    // Pass UTF-8 headers via `@file` and `--dump-header` so Windows `CP1252`
+    // process argv / stdout encoding never mangles CJK octets.
+    let req_hdr_tls = dir.join("req-hdr-tls.txt");
+    let req_hdr_h2c = dir.join("req-hdr-h2c.txt");
+    std::fs::write(&req_hdr_tls, format!("x-greeting: {}\r\n", CJK[2])).expect("write tls hdr");
+    std::fs::write(&req_hdr_h2c, format!("x-greeting: {}\r\n", CJK[0])).expect("write h2c hdr");
+    let resp_hdr_tls = dir.join("resp-hdr-tls.txt");
+    let resp_hdr_h2c = dir.join("resp-hdr-h2c.txt");
+
     let acceptor = tls_acceptor(&pki);
     let dl_tls_out = dl_tls.clone();
     let dl_h2c_out = dl_h2c.clone();
+    let resp_hdr_tls_out = resp_hdr_tls.clone();
+    let resp_hdr_h2c_out = resp_hdr_h2c.clone();
 
     on_compio(|io| async move {
         let tls_listener = io.bind_tcp(loopback()).expect("bind tls");
@@ -136,20 +163,26 @@ fn answers_curl_http2_tls_and_prior_knowledge() {
 
         let (done_tx, done_rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let out_tls = Command::new(&curl)
-                .args(["--http2", "--silent", "--show-error", "--fail"])
+            let mut cmd_tls = Command::new(&curl);
+            cmd_tls.args(["--http2", "--silent", "--show-error", "--fail"]);
+            if schannel {
+                // Windows `System32\curl.exe` uses Schannel, which requires
+                // `--ssl-no-revoke` for ephemeral self-signed test CAs with no CRL/OCSP.
+                cmd_tls.arg("--ssl-no-revoke");
+            }
+            let out_tls = cmd_tls
                 .arg("--cacert")
                 .arg(&root_pem)
                 .args(["--resolve", &format!("localhost:{tls_port}:127.0.0.1")])
-                .args(["--header", &format!("x-greeting: {}", CJK[2])])
+                .arg("--header")
+                .arg(format!("@{}", req_hdr_tls.display()))
+                .arg("--dump-header")
+                .arg(&resp_hdr_tls_out)
                 .arg("--data-binary")
                 .arg(format!("@{}", upload.display()))
                 .arg("--output")
                 .arg(&dl_tls_out)
-                .args([
-                    "--write-out",
-                    "%{http_version} %{response_code} %header{x-greeting}",
-                ])
+                .args(["--write-out", "%{http_version} %{response_code}"])
                 .arg(format!("https://localhost:{tls_port}/echo"))
                 .output()
                 .expect("spawn curl --http2");
@@ -161,15 +194,15 @@ fn answers_curl_http2_tls_and_prior_knowledge() {
                     "--show-error",
                     "--fail",
                 ])
-                .args(["--header", &format!("x-greeting: {}", CJK[0])])
+                .arg("--header")
+                .arg(format!("@{}", req_hdr_h2c.display()))
+                .arg("--dump-header")
+                .arg(&resp_hdr_h2c_out)
                 .arg("--data-binary")
                 .arg(format!("@{}", upload.display()))
                 .arg("--output")
                 .arg(&dl_h2c_out)
-                .args([
-                    "--write-out",
-                    "%{http_version} %{response_code} %header{x-greeting}",
-                ])
+                .args(["--write-out", "%{http_version} %{response_code}"])
                 .arg(format!("http://127.0.0.1:{h2c_port}/echo"))
                 .output()
                 .expect("spawn curl --http2-prior-knowledge");
@@ -197,21 +230,20 @@ fn answers_curl_http2_tls_and_prior_knowledge() {
             "curl --http2 failed: {}",
             String::from_utf8_lossy(&out_tls.stderr)
         );
-        assert_eq!(
-            String::from_utf8(out_tls.stdout).expect("utf8"),
-            format!("2 200 {}", CJK[2])
-        );
+        assert_eq!(String::from_utf8(out_tls.stdout).expect("utf8"), "2 200");
 
         assert!(
             out_h2c.status.success(),
             "curl --http2-prior-knowledge failed: {}",
             String::from_utf8_lossy(&out_h2c.stderr)
         );
-        assert_eq!(
-            String::from_utf8(out_h2c.stdout).expect("utf8"),
-            format!("2 200 {}", CJK[0])
-        );
+        assert_eq!(String::from_utf8(out_h2c.stdout).expect("utf8"), "2 200");
     });
+
+    let dumped_tls = std::fs::read_to_string(&resp_hdr_tls).expect("read tls response headers");
+    assert_eq!(extract_header(&dumped_tls, "x-greeting"), Some(CJK[2]));
+    let dumped_h2c = std::fs::read_to_string(&resp_hdr_h2c).expect("read h2c response headers");
+    assert_eq!(extract_header(&dumped_h2c, "x-greeting"), Some(CJK[0]));
 
     assert_eq!(std::fs::read(&dl_tls).expect("read tls download"), body);
     assert_eq!(std::fs::read(&dl_h2c).expect("read h2c download"), body);

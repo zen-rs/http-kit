@@ -317,6 +317,38 @@ fn rejects_rfc7541_wire_errors() {
     dec_shrink_ok.set_max_table_size(256);
     dec_shrink_ok.set_max_table_size(1024);
     assert!(dec_shrink_ok.decode(&valid_updates.freeze(), 4096).is_ok());
+
+    // Header block ending immediately (`pos == buf.len()`) without satisfying
+    // `pending_min_size` (e.g. only `update(512)` when `min_req` is `256`, or empty)
+    // must be rejected!
+    let mut dec_unsatisfied_eof = Decoder::new(4096);
+    dec_unsatisfied_eof.set_max_table_size(256);
+    dec_unsatisfied_eof.set_max_table_size(1024);
+    let mut only_512 = BytesMut::new();
+    http_kit_h2::hpack::int::encode_int(512, 5, 0x20, &mut only_512);
+    assert_eq!(
+        dec_unsatisfied_eof.decode(&only_512.freeze(), 4096),
+        Err(HpackError::InvalidTableSizeUpdate)
+    );
+    let mut dec_empty_eof = Decoder::new(4096);
+    dec_empty_eof.set_max_table_size(256);
+    assert_eq!(
+        dec_empty_eof.decode(&Bytes::new(), 4096),
+        Err(HpackError::InvalidTableSizeUpdate)
+    );
+
+    // `Encoder::new(max_local_size < 4096)` and `set_peer_max_table_size` must
+    // emit their mandatory size update even when encoding onto a non-empty `BytesMut`!
+    let mut enc_small = Encoder::new(1024);
+    let mut dec_peer = Decoder::new(4096);
+    dec_peer.set_max_table_size(2048);
+    let mut prefixed = BytesMut::from(&b"prefix"[..]);
+    let prefix_len = prefixed.len();
+    enc_small.encode([EncodeField::new(b":method", b"GET")], &mut prefixed);
+    let block = prefixed.freeze().slice(prefix_len..);
+    assert_eq!(block[0] & 0xE0, 0x20, "expected dynamic table size update");
+    assert!(dec_peer.decode(&block, 4096).is_ok());
+    assert_eq!(dec_peer.dynamic_table_max_size(), 1024);
 }
 
 #[derive(Debug, Deserialize)]

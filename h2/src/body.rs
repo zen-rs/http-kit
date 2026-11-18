@@ -26,7 +26,7 @@ use futures_lite::Stream;
 use http::HeaderMap;
 use http_kit::{Body, BodyError, BodyFrame, FrameSource, PipeOffer};
 
-use crate::{Error, proto::StreamId};
+use crate::{Error, Reason, proto::StreamId};
 
 /// Commands sent from [`IncomingBody`] handles to the connection driver.
 pub(crate) enum BodyCommand {
@@ -99,6 +99,11 @@ impl RecvStream {
         self.done
     }
 
+    /// Whether the peer has sent `END_STREAM` for this body.
+    pub(crate) const fn has_end_stream(&self) -> bool {
+        self.end_stream
+    }
+
     /// Active body-read idle deadline, armed only while a consumer demand waits on the wire.
     pub(crate) const fn idle_deadline(&self) -> Option<Instant> {
         self.idle_deadline
@@ -140,13 +145,9 @@ impl RecvStream {
             self.end_stream = true;
         }
         self.idle_deadline = None;
-        if self
+        let _ = self
             .frames
-            .try_send(BodyMessage::Frame(BodyFrame::Pipe(filled), None))
-            .is_err()
-        {
-            self.done = true;
-        }
+            .try_send(BodyMessage::Frame(BodyFrame::Pipe(filled), None));
     }
 
     /// Handles a consumer [`BodyCommand::Demand`], returning how many `DATA` bytes
@@ -160,23 +161,15 @@ impl RecvStream {
             return match queued {
                 QueuedFrame::Data(data) => {
                     let len = data.len();
-                    if self
+                    let _ = self
                         .frames
-                        .try_send(BodyMessage::Frame(BodyFrame::Data(data), offer))
-                        .is_err()
-                    {
-                        self.done = true;
-                    }
+                        .try_send(BodyMessage::Frame(BodyFrame::Data(data), offer));
                     len
                 }
                 QueuedFrame::Trailers(trailers) => {
-                    if self
+                    let _ = self
                         .frames
-                        .try_send(BodyMessage::Frame(BodyFrame::Trailers(trailers), offer))
-                        .is_err()
-                    {
-                        self.done = true;
-                    }
+                        .try_send(BodyMessage::Frame(BodyFrame::Trailers(trailers), offer));
                     0
                 }
             };
@@ -214,13 +207,9 @@ impl RecvStream {
             {
                 self.idle_deadline = None;
                 let len = data.len();
-                if self
+                let _ = self
                     .frames
-                    .try_send(BodyMessage::Frame(BodyFrame::Data(data), offer))
-                    .is_err()
-                {
-                    self.done = true;
-                }
+                    .try_send(BodyMessage::Frame(BodyFrame::Data(data), offer));
                 return len;
             }
             self.queue.push_back(QueuedFrame::Data(data));
@@ -247,22 +236,18 @@ impl RecvStream {
             && let Some(offer) = self.demand.take()
         {
             self.idle_deadline = None;
-            if self
+            let _ = self
                 .frames
-                .try_send(BodyMessage::Frame(BodyFrame::Trailers(trailers), offer))
-                .is_err()
-            {
-                self.done = true;
-            }
+                .try_send(BodyMessage::Frame(BodyFrame::Trailers(trailers), offer));
             return;
         }
         self.queue.push_back(QueuedFrame::Trailers(trailers));
     }
 
-    /// Fails the incoming body with `error`, returning any unconsumed queued byte count
-    /// if the body is already done.
+    /// Fails the incoming body with `error`, ignoring RFC 9113 §8.1
+    /// `RST_STREAM(NO_ERROR)` once `END_STREAM` has already been received.
     pub(crate) fn fail(&mut self, error: Error) -> usize {
-        if self.done {
+        if self.done || (self.end_stream && matches!(error, Error::StreamReset(Reason::NO_ERROR))) {
             return 0;
         }
         self.idle_deadline = None;
@@ -383,4 +368,66 @@ fn read_out(frame: BodyFrame) -> Result<BodyFrame, BodyError> {
         return Ok(BodyFrame::Data(data));
     }
     Ok(frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Waker};
+
+    use super::*;
+
+    #[test]
+    fn demand_then_drop_releases_all_queued_bytes_and_reports_peer_open() {
+        let (mailbox_tx, mailbox_rx) = async_channel::unbounded();
+        let sid = StreamId::new(1).expect("odd stream id");
+        let (mut recv, mut body) = channel(sid, mailbox_tx, None);
+
+        assert_eq!(recv.push_data(Bytes::from_static(b"chunk-1"), false), 0);
+        assert_eq!(recv.push_data(Bytes::from_static(b"chunk-22"), false), 0);
+
+        // Poll once (`Pending` before driver answers) -> queues `Demand`, then drop -> queues `Discard`
+        // and closes `frames` receiver!
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            Pin::new(&mut body)
+                .poll_frame_offering(&mut cx, None)
+                .is_pending()
+        );
+        drop(body);
+
+        let Ok(BodyCommand::Demand { offer, .. }) = mailbox_rx.try_recv() else {
+            panic!("expected Demand");
+        };
+        let released_on_demand = recv.on_demand(offer, Instant::now());
+        assert_eq!(released_on_demand, 7);
+        assert!(
+            !recv.is_done(),
+            "RecvStream must remain active until Discard drains remaining queued frames"
+        );
+
+        let Ok(BodyCommand::Discard { .. }) = mailbox_rx.try_recv() else {
+            panic!("expected Discard");
+        };
+        let (released_on_discard, peer_open) = recv.discard();
+        assert_eq!(released_on_discard, 8);
+        assert!(peer_open);
+        assert!(recv.is_done());
+    }
+
+    #[test]
+    fn rst_no_error_after_end_stream_preserves_buffered_response() {
+        let (mailbox_tx, _mailbox_rx) = async_channel::unbounded();
+        let sid = StreamId::new(1).expect("odd stream id");
+        let (mut recv, _body) = channel(sid, mailbox_tx, None);
+
+        assert_eq!(recv.push_data(Bytes::from_static(b"complete"), true), 0);
+        assert!(recv.has_end_stream());
+        assert_eq!(recv.fail(Error::StreamReset(Reason::NO_ERROR)), 0);
+
+        let now = Instant::now();
+        assert_eq!(recv.on_demand(None, now), 8);
+        assert!(!recv.is_done());
+        assert_eq!(recv.on_demand(None, now), 0);
+        assert!(recv.is_done());
+    }
 }

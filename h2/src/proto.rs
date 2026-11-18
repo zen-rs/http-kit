@@ -1902,15 +1902,10 @@ impl<S: Side> ProtoConn<S> {
             ));
         }
 
-        if self.locally_reset_streams.contains(stream_id) || self.closed_streams.contains(stream_id)
-        {
-            return Ok(());
-        }
-
-        Err(self.conn_error(
-            Reason::PROTOCOL_ERROR,
-            "WINDOW_UPDATE received on unopened stream",
-        ))
+        // Stream is neither open (`self.streams`) nor idle (`is_idle_stream`), so
+        // by RFC 9113 §5.1.1 it is closed (including streams evicted past
+        // `STREAM_HISTORY_CAP`), where late `WINDOW_UPDATE` frames must be ignored.
+        Ok(())
     }
 
     fn apply_rst_stream(
@@ -1952,17 +1947,11 @@ impl<S: Side> ProtoConn<S> {
         if self.locally_reset_streams.contains(stream_id) {
             self.locally_reset_streams.remove(stream_id);
             self.closed_streams.insert(stream_id);
-            return Ok(());
         }
 
-        if self.closed_streams.contains(stream_id) {
-            return Ok(());
-        }
-
-        Err(self.conn_error(
-            Reason::PROTOCOL_ERROR,
-            "RST_STREAM received on unopened stream",
-        ))
+        // Any non-open, non-idle stream is closed (RFC 9113 §5.1.1), including
+        // older closed streams evicted past `STREAM_HISTORY_CAP`.
+        Ok(())
     }
 
     fn apply_goaway(
@@ -2453,6 +2442,9 @@ impl<S: Side> ProtoConn<S> {
                 reason,
                 detail,
             } => {
+                if self.is_idle_stream(stream_id) {
+                    return Err(self.conn_error(reason, detail));
+                }
                 if self.streams.contains_key(&stream_id) {
                     self.fail_open_stream(stream_id, reason, Error::Protocol { reason, detail });
                 } else if !self.locally_reset_streams.contains(stream_id) {

@@ -527,6 +527,12 @@ impl OutgoingStreams {
         self.sent_recoverable.remove(&stream_id);
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.streams.clear();
+        self.order.clear();
+        self.sent_recoverable.clear();
+    }
+
     fn finish_stream(&mut self, stream_id: StreamId) {
         if let Some(entry) = self.streams.remove(&stream_id)
             && self.retain_recoverable
@@ -567,7 +573,9 @@ impl OutgoingStreams {
                     match poll_next_non_empty(
                         cx,
                         entry,
-                        proto.send_window(stream_id),
+                        proto
+                            .send_window(stream_id)
+                            .min(proto.peer_max_frame_size()),
                         writer,
                         outbox,
                     ) {

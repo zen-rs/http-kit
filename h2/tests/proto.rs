@@ -372,18 +372,6 @@ fn stream_states_priority_idle_monotonicity_and_self_dependency() {
     );
     wire.extend_from_slice(&[0, 0, 0, 0, 16]);
 
-    // Self-dependent PRIORITY on stream 7 -> stream error `RST_STREAM(PROTOCOL_ERROR)` (5.3.1.2)
-    wire.extend_from_slice(
-        &FrameHeader {
-            length: 5,
-            kind: kind::PRIORITY,
-            flags: 0,
-            stream_id: StreamId::new(7).unwrap(),
-        }
-        .encode(),
-    );
-    wire.extend_from_slice(&[0x80, 0, 0, 7, 16]);
-
     let mut enc = Encoder::default();
     let mut block = BytesMut::new();
     enc.encode(
@@ -409,6 +397,21 @@ fn stream_states_priority_idle_monotonicity_and_self_dependency() {
         ev,
         Some(ProtoEvent::Request { stream_id, .. }) if stream_id.get() == 5
     ));
+
+    // Self-dependent PRIORITY on implicitly closed stream 3 (`< 5`) -> stream error
+    // `RST_STREAM(PROTOCOL_ERROR)` without terminating the connection; whereas on an
+    // idle stream RFC 9113 §6.4 forbids `RST_STREAM` and escalates to `GOAWAY(PROTOCOL_ERROR)`.
+    wire.extend_from_slice(
+        &FrameHeader {
+            length: 5,
+            kind: kind::PRIORITY,
+            flags: 0,
+            stream_id: StreamId::new(3).unwrap(),
+        }
+        .encode(),
+    );
+    wire.extend_from_slice(&[0x80, 0, 0, 3, 16]);
+    assert!(server.poll_recv(&mut wire, now).unwrap().is_none());
 
     // 2. MAX_CONCURRENT_STREAMS = 1: opening stream 7 while stream 5 is open
     //    rejects stream 7 with `RST_STREAM(REFUSED_STREAM)` while preserving
@@ -943,4 +946,94 @@ fn consume_external_data_content_length_mismatch_emits_stream_error() {
     // connection receive window cleanly without panicking or emitting stream WU!
     server.release_recv_capacity(s1, 6 * 1024 * 1024);
     assert!(server.has_pending_send());
+}
+
+#[test]
+fn idle_zero_window_update_sends_goaway_without_rst_and_evicted_closed_streams_ignore_late_frames()
+{
+    let now = Instant::now();
+
+    // 1. `WINDOW_UPDATE(increment = 0)` on an idle stream MUST fail the connection
+    // with `GOAWAY(PROTOCOL_ERROR)` and MUST NOT emit `RST_STREAM` (RFC 9113 §5.1, §6.4).
+    let (_, mut server, _, _) =
+        handshake_pair(&ClientConfig::default(), &ServerConfig::default(), now);
+    let mut bad_wu = BytesMut::new();
+    bad_wu.extend_from_slice(
+        &FrameHeader {
+            length: 4,
+            kind: kind::WINDOW_UPDATE,
+            flags: 0,
+            stream_id: StreamId::new(9).unwrap(),
+        }
+        .encode(),
+    );
+    bad_wu.extend_from_slice(&0u32.to_be_bytes());
+    let err = server.poll_recv(&mut bad_wu, now).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Protocol {
+            reason: Reason::PROTOCOL_ERROR,
+            ..
+        }
+    ));
+    let mut out = Vec::new();
+    server.drain_control(&mut out);
+    let mut out_bytes = BytesMut::new();
+    for chunk in out {
+        out_bytes.extend_from_slice(&chunk);
+    }
+    let mut saw_goaway = false;
+    while out_bytes.len() >= 9 {
+        let hdr = FrameHeader::decode(out_bytes[..9].try_into().unwrap());
+        let _ = out_bytes.split_to(9 + hdr.length as usize);
+        assert_ne!(
+            hdr.kind,
+            kind::RST_STREAM,
+            "idle stream error must never emit RST_STREAM"
+        );
+        if hdr.kind == kind::GOAWAY {
+            saw_goaway = true;
+        }
+    }
+    assert!(saw_goaway, "expected GOAWAY(PROTOCOL_ERROR)");
+
+    // 2. Open and close 300 streams (`> STREAM_HISTORY_CAP = 256`), then send
+    // late `WINDOW_UPDATE` and `RST_STREAM` on stream 1 (evicted from ring);
+    // both must be ignored cleanly per RFC 9113 §5.1.1.
+    let (mut client, mut srv, mut c2s, mut s2c) =
+        handshake_pair(&ClientConfig::default(), &ServerConfig::default(), now);
+    let get_parts = http::Request::builder()
+        .method(Method::GET)
+        .uri("https://example.com/")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    let ok_parts = http::Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    for _ in 0..300 {
+        let sid = client.open_request(&get_parts, None, true).unwrap();
+        pump_control(&mut client, &mut c2s);
+        while srv.poll_recv(&mut c2s, now).unwrap().is_some() {}
+        srv.send_response(sid, &ok_parts, None, true, None).unwrap();
+        pump_control(&mut srv, &mut s2c);
+        while client.poll_recv(&mut s2c, now).unwrap().is_some() {}
+    }
+
+    let s1 = StreamId::new(1).unwrap();
+    let mut late = BytesMut::new();
+    frame::encode_window_update(s1, 1024, &mut late);
+    frame::encode_rst_stream(s1, Reason::NO_ERROR, &mut late);
+    let mut late_for_client = late.clone();
+    assert!(srv.poll_recv(&mut late, now).unwrap().is_none());
+    assert!(
+        client
+            .poll_recv(&mut late_for_client, now)
+            .unwrap()
+            .is_none()
+    );
 }

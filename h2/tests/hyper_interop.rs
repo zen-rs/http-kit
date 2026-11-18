@@ -937,6 +937,133 @@ fn server_handles_extended_connect_from_h2_client() {
     });
 }
 
+/// Regression test covering:
+/// 1. RFC 9113 §8.1: Server sends a complete multi-frame response (`END_STREAM`)
+///    followed immediately by `RST_STREAM(NO_ERROR)` while the client's upload
+///    stream is still open — client must still read the complete response body!
+/// 2. Server sends `HEADERS` + `DATA(END_STREAM)` + `GOAWAY(NO_ERROR)` and closes
+///    TCP (`EOF`) *before* the caller polls `Response::into_body()` — client must
+///    still read the buffered complete response body and exit `Connection::run` cleanly!
+#[test]
+fn complete_response_with_rst_no_error_and_peer_eof_before_body_poll() {
+    let std_listener = std::net::TcpListener::bind(loopback()).expect("bind");
+    std_listener.set_nonblocking(true).expect("nonblocking");
+    let addr = std_listener.local_addr().expect("addr");
+    let expected = Bytes::from(cjk_payload(256));
+    let expected_srv = expected.clone();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let payload = expected_srv.clone();
+                handles.push(tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(tcp).await else {
+                        return;
+                    };
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        let path = req.uri().path().to_owned();
+                        if path == "/early-reply-rst" {
+                            let payload = payload.clone();
+                            tokio::spawn(async move {
+                                let resp = http::Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(())
+                                    .unwrap();
+                                let mut send = respond.send_response(resp, false).unwrap();
+                                let mid = payload.len() / 2;
+                                send.send_data(payload.slice(..mid), false).unwrap();
+                                send.send_data(payload.slice(mid..), true).unwrap();
+                                // Let `conn` flush `HEADERS` + `DATA(END_STREAM)` onto TCP first,
+                                // then drop `req` (with client upload still open), causing `h2`
+                                // to transmit `RST_STREAM(NO_ERROR)` per RFC 9113 §8.1!
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                drop(req);
+                            });
+                        } else if path == "/complete-then-eof" {
+                            conn.graceful_shutdown();
+                            let resp = http::Response::builder()
+                                .status(StatusCode::OK)
+                                .body(())
+                                .unwrap();
+                            let mut send = respond.send_response(resp, false).unwrap();
+                            send.send_data(payload.clone(), true).unwrap();
+                            // Drive `conn` to send HEADERS + DATA(END_STREAM) + GOAWAY(NO_ERROR) and close TCP!
+                            break;
+                        }
+                    }
+                    while conn.accept().await.is_some() {}
+                }));
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+        });
+    });
+
+    on_compio(|io| async move {
+        // Part 1: Complete response + `RST_STREAM(NO_ERROR)` while upload is still open.
+        let stream1 = io.connect(addr).await.expect("connect 1");
+        let (send1, conn1) = handshake_stream(stream1, io.clone(), ClientConfig::default());
+        let timer1 = io.clone();
+        let exp1 = expected.clone();
+        let part1 = async move {
+            let (_upload_tx, upload_rx) = async_channel::bounded::<Result<Bytes, BodyError>>(4);
+            let mut req = Request::new(Body::from_stream(upload_rx));
+            *req.method_mut() = Method::POST;
+            *req.uri_mut() = format!("http://localhost:{}/early-reply-rst", addr.port())
+                .parse()
+                .unwrap();
+            let resp = send1.send(req).await.expect("response head");
+            // Wait slightly so `DATA(END_STREAM)` + `RST_STREAM(NO_ERROR)` both arrive in `recv_body`
+            // before the consumer polls the body!
+            timer1.sleep(Duration::from_millis(30)).await;
+            let body_bytes = resp
+                .into_body()
+                .into_bytes()
+                .await
+                .expect("complete response must survive RST_STREAM(NO_ERROR)");
+            assert_eq!(body_bytes.as_ref(), exp1.as_ref());
+            drop(send1);
+        };
+        let (r1, ()) = within(&io, Duration::from_secs(15), zip(conn1.run(), part1)).await;
+        r1.expect("conn1 clean");
+
+        // Part 2: Complete response + `GOAWAY(NO_ERROR)` + peer TCP EOF before body is polled.
+        let stream2 = io.connect(addr).await.expect("connect 2");
+        let (send2, conn2) = handshake_stream(stream2, io.clone(), ClientConfig::default());
+        let timer2 = io.clone();
+        let exp2 = expected;
+        let part2 = async move {
+            let mut req = Request::new(Body::empty());
+            *req.uri_mut() = format!("http://localhost:{}/complete-then-eof", addr.port())
+                .parse()
+                .unwrap();
+            let resp = send2.send(req).await.expect("response head");
+            // Wait until the server has sent GOAWAY + closed TCP (`send2.is_closed()` + EOF read)!
+            timer2.sleep(Duration::from_millis(40)).await;
+            assert!(send2.is_closed());
+            let body_bytes = resp
+                .into_body()
+                .into_bytes()
+                .await
+                .expect("buffered END_STREAM body must survive peer EOF");
+            assert_eq!(body_bytes.as_ref(), exp2.as_ref());
+            drop(send2);
+        };
+        let (r2, ()) = within(&io, Duration::from_secs(15), zip(conn2.run(), part2)).await;
+        r2.expect("conn2 clean after graceful GOAWAY + EOF");
+    });
+}
+
 /// On Linux and Android (`pipe` feature), verifies that `ServerConnection`
 /// echoing a streaming `POST` body from `hyper` splices unpadded `DATA` payloads
 /// directly through kernel pipes (`SpliceRead` -> `Pipe` -> `SpliceWrite`).

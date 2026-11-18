@@ -20,6 +20,7 @@ mod x86;
 /// `$pred`. Paired with [`HI_BIT_LUT`], `(LUT[b & 0x0F] & HI_BIT_LUT[b >> 4]) != 0`
 /// decides membership over all `0x00..=0xFF` in five vector instructions while
 /// rejecting every non-ASCII byte (`b >= 0x80`, where `HI_BIT_LUT[b >> 4] == 0`).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 macro_rules! ascii_nibble_lut {
     ($pred:ident) => {{
         let mut lut = [0u8; 16];
@@ -35,6 +36,7 @@ macro_rules! ascii_nibble_lut {
 }
 
 /// Maps high nibble `0..=7` to `1 << h` and `8..=15` (`b >= 0x80`) to `0`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(super) const HI_BIT_LUT: [u8; 16] = [
     1 << 0,
     1 << 1,
@@ -55,10 +57,28 @@ pub(super) const HI_BIT_LUT: [u8; 16] = [
 ];
 
 /// Low-nibble lookup table for lowercase HTTP token characters (RFC 9113 §8.2.1).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(super) const NAME_LO_LUT: [u8; 16] = ascii_nibble_lut!(is_field_name_byte);
 
 /// Low-nibble lookup table for URI path-and-query bytes (RFC 9113 §8.3.1).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(super) const PATH_LO_LUT: [u8; 16] = ascii_nibble_lut!(is_path_byte);
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+pub(super) fn validate_ascii_lut_scalar(bytes: &[u8], lo_lut: &[u8; 16]) -> bool {
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        let allowed = lo_lut[(b & 0x0F) as usize];
+        let bit = HI_BIT_LUT[(b >> 4) as usize];
+        if (allowed & bit) == 0 {
+            return false;
+        }
+        idx += 1;
+    }
+    true
+}
 
 /// Scalar reference for RFC 9113 §8.2.1 field-name bytes: HTTP `tchar`
 /// (RFC 9110 §5.6.2) excluding uppercase `A-Z`.
@@ -219,6 +239,28 @@ mod tests {
                 slice.fill(b'a');
                 assert_eq!(validate_field_name(slice), scalar_field_name(slice));
                 assert_eq!(validate_field_value(slice), scalar_field_value(slice));
+                #[cfg(target_arch = "aarch64")]
+                {
+                    assert_eq!(
+                        neon::validate_ascii_lut(slice, &NAME_LO_LUT),
+                        slice.iter().copied().all(is_field_name_byte)
+                    );
+                    assert_eq!(
+                        neon::validate_field_value_body(slice),
+                        bytes_all_value(slice)
+                    );
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    assert_eq!(
+                        x86::validate_ascii_lut(slice, &NAME_LO_LUT),
+                        slice.iter().copied().all(is_field_name_byte)
+                    );
+                    assert_eq!(
+                        x86::validate_field_value_body(slice),
+                        bytes_all_value(slice)
+                    );
+                }
 
                 if len > 0 {
                     for pos in [0, len / 2, len - 1] {

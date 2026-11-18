@@ -265,7 +265,9 @@ where
 
         let mut accepting = true;
         let mut peer_eof = false;
+        let mut write_error: Option<Error> = None;
         let mut peer_goaway_error: Option<Error> = None;
+        let mut eof_error: Option<Error> = None;
         let mut commands: Vec<BodyCommand> = Vec::new();
         let mut failed_outgoing: Vec<(StreamId, Error)> = Vec::new();
 
@@ -309,41 +311,57 @@ where
                 }
             }
 
-            // 2. Check protocol and per-stream deadlines.
-            if let Err(error) = proto.poll_timeout(now) {
-                return abort_connection(
-                    error,
-                    &mut proto,
-                    &mut recv_slot,
-                    &mut write_slot,
-                    &mut write_task,
-                    &timer,
-                    &mut streams,
-                    &mut outgoing,
-                    &mut waiting,
-                    &exchanges,
-                )
-                .await;
+            // 2. Check protocol and per-stream deadlines while the peer socket is open.
+            if !peer_eof {
+                if let Err(error) = proto.poll_timeout(now) {
+                    return abort_connection(
+                        error,
+                        &mut proto,
+                        &mut recv_slot,
+                        &mut write_slot,
+                        &mut write_task,
+                        &timer,
+                        &mut streams,
+                        &mut outgoing,
+                        &mut waiting,
+                        &exchanges,
+                    )
+                    .await;
+                }
+                expire_streams(now, &mut proto, &mut streams, &mut outgoing);
             }
-            expire_streams(now, &mut proto, &mut streams, &mut outgoing);
 
             // 3. Open streams for queued requests while concurrency allows.
-            open_waiting(now, &mut proto, &mut streams, &mut outgoing, &mut waiting);
+            if !peer_eof && write_error.is_none() {
+                open_waiting(now, &mut proto, &mut streams, &mut outgoing, &mut waiting);
+            }
             settle_streams(&mut streams, &outgoing);
 
             // 4. Clean completion once no new requests can arrive and all active streams finished.
-            if (!accepting || proto.is_closing() || peer_eof)
+            if (!accepting || proto.is_closing() || peer_eof || write_error.is_some())
                 && waiting.is_empty()
                 && streams.is_empty()
                 && outgoing.is_empty()
             {
                 exchanges.close();
+                if peer_eof || write_error.is_some() {
+                    if let Some((w, o, _)) = write_task.finish().await {
+                        write_slot = Some((w, o));
+                    }
+                    if let Some((mut writer, _)) = write_slot.take() {
+                        let _ = writer.shutdown().await;
+                    }
+                    return match peer_goaway_error.or(eof_error) {
+                        Some(err) => Err(err),
+                        None => Ok(()),
+                    };
+                }
                 if let Some((w, o, res)) = write_task.finish().await {
                     write_slot = Some((w, o));
                     res?;
                 }
                 if let Some((mut writer, mut outbox)) = write_slot.take() {
-                    if !peer_eof && peer_goaway_error.is_none() && !proto.is_closing() {
+                    if peer_goaway_error.is_none() && !proto.is_closing() {
                         proto.send_goaway(StreamId::CONNECTION, Reason::NO_ERROR, b"");
                     }
                     flush_and_shutdown(&mut proto, &mut writer, &mut outbox).await?;
@@ -364,7 +382,11 @@ where
             }
 
             // 6. Arm the earliest timer across protocol and stream deadlines.
-            let next_at = earliest_deadline(proto.next_deadline(), &streams);
+            let next_at = if peer_eof {
+                None
+            } else {
+                earliest_deadline(proto.next_deadline(), &streams)
+            };
             if next_at != sleep_at {
                 if let Some(at) = next_at {
                     sleep.set(timer.sleep_until(at));
@@ -400,15 +422,24 @@ where
 
                 // Apply body demand/discard commands immediately so `PipeOffer`s and
                 // `WINDOW_UPDATE`s take effect in the same tick.
+                let write_dead = peer_eof || write_error.is_some();
                 if !commands.is_empty() {
                     let tick_now = Instant::now();
                     for cmd in commands.drain(..) {
-                        apply_body_command(cmd, tick_now, &mut proto, &mut streams, &mut outgoing);
+                        apply_body_command(
+                            cmd,
+                            tick_now,
+                            write_dead,
+                            &mut proto,
+                            &mut streams,
+                            &mut outgoing,
+                        );
                     }
                 }
 
                 // Start a write if idle and either control or outgoing stream frames are ready.
-                if !write_task.is_active()
+                if !write_dead
+                    && !write_task.is_active()
                     && let Some((writer, mut outbox)) = write_slot.take()
                 {
                     if let Some(op) = outgoing.poll_ready(
@@ -431,14 +462,16 @@ where
                     progressed = true;
                 }
 
-                if let Poll::Ready((writer, outbox, result)) = write_task.poll(cx) {
-                    write_slot = Some((writer, outbox));
-                    return Poll::Ready(Wake::Write(result));
-                }
-
+                // Poll `read_task` ahead of `write_task` so frames sent by a closing peer
+                // are ingested before a concurrent write error (`BrokenPipe`/`ConnectionReset`).
                 if let Poll::Ready((recv, result)) = read_task.poll(cx) {
                     recv_slot = Some(recv);
                     return Poll::Ready(Wake::Read(result));
+                }
+
+                if let Poll::Ready((writer, outbox, result)) = write_task.poll(cx) {
+                    write_slot = Some((writer, outbox));
+                    return Poll::Ready(Wake::Write(result));
                 }
 
                 if sleep_at.is_some() && sleep.as_mut().poll(cx).is_ready() {
@@ -446,7 +479,7 @@ where
                     return Poll::Ready(Wake::Timer);
                 }
 
-                if progressed || proto.has_pending_send() {
+                if progressed || (!write_dead && proto.has_pending_send()) {
                     return Poll::Ready(Wake::Activity);
                 }
 
@@ -457,34 +490,70 @@ where
             match wake {
                 Wake::Write(Ok(())) | Wake::Timer | Wake::Activity => {}
                 Wake::Write(Err(error)) => {
-                    return abort_connection(
-                        error,
-                        &mut proto,
-                        &mut recv_slot,
-                        &mut write_slot,
-                        &mut write_task,
-                        &timer,
-                        &mut streams,
-                        &mut outgoing,
-                        &mut waiting,
-                        &exchanges,
-                    )
-                    .await;
+                    accepting = false;
+                    exchanges.close();
+                    let refuse_err = peer_goaway_error.clone().unwrap_or_else(|| error.clone());
+                    for queued in waiting.drain(..) {
+                        queued.refuse(refuse_err.clone());
+                    }
+                    while let Ok(queued) = exchanges.0.try_recv() {
+                        queued.refuse(refuse_err.clone());
+                    }
+                    outgoing.clear();
+                    if peer_eof {
+                        settle_peer_disconnect(
+                            error,
+                            true,
+                            &mut streams,
+                            &mut outgoing,
+                            &mut eof_error,
+                        );
+                    } else {
+                        // Keep reading until the read half reaches EOF/error so any
+                        // response + GOAWAY frames already sent by the peer are delivered.
+                        write_error.get_or_insert(error);
+                    }
                 }
                 Wake::Read(Err(error)) => {
-                    return abort_connection(
-                        error,
-                        &mut proto,
-                        &mut recv_slot,
-                        &mut write_slot,
-                        &mut write_task,
-                        &timer,
-                        &mut streams,
-                        &mut outgoing,
-                        &mut waiting,
-                        &exchanges,
-                    )
-                    .await;
+                    let clean_goaway =
+                        proto.is_closing() && recv_slot.as_ref().is_some_and(|r| r.buf.is_empty());
+                    let has_complete = streams.values().any(|s| {
+                        s.respond.is_none()
+                            && s.recv_body.as_ref().is_some_and(RecvStream::has_end_stream)
+                    });
+                    if clean_goaway || has_complete {
+                        peer_eof = true;
+                        accepting = false;
+                        exchanges.close();
+                        let close_err = peer_goaway_error.clone().unwrap_or(error);
+                        for queued in waiting.drain(..) {
+                            queued.refuse(close_err.clone());
+                        }
+                        while let Ok(queued) = exchanges.0.try_recv() {
+                            queued.refuse(close_err.clone());
+                        }
+                        settle_peer_disconnect(
+                            close_err,
+                            clean_goaway,
+                            &mut streams,
+                            &mut outgoing,
+                            &mut eof_error,
+                        );
+                    } else {
+                        return abort_connection(
+                            error,
+                            &mut proto,
+                            &mut recv_slot,
+                            &mut write_slot,
+                            &mut write_task,
+                            &timer,
+                            &mut streams,
+                            &mut outgoing,
+                            &mut waiting,
+                            &exchanges,
+                        )
+                        .await;
+                    }
                 }
                 Wake::Read(Ok(done)) => {
                     if let Err(error) = handle_read_done(
@@ -494,9 +563,13 @@ where
                         recv_slot.as_mut().expect("returned above"),
                         &mut streams,
                         &mut outgoing,
-                        &waiting,
+                        &mut waiting,
+                        &exchanges,
+                        &mut accepting,
                         &mut peer_eof,
+                        &write_error,
                         &peer_goaway_error,
+                        &mut eof_error,
                     ) {
                         return abort_connection(
                             error,
@@ -568,17 +641,33 @@ fn handle_read_done<R>(
     recv: &mut Recv<R>,
     streams: &mut HashMap<StreamId, ClientStream>,
     outgoing: &mut OutgoingStreams,
-    waiting: &VecDeque<Exchange>,
+    waiting: &mut VecDeque<Exchange>,
+    exchanges: &Queue,
+    accepting: &mut bool,
     peer_eof: &mut bool,
+    write_error: &Option<Error>,
     peer_goaway_error: &Option<Error>,
+    eof_error: &mut Option<Error>,
 ) -> Result<(), Error> {
     match done {
         ReadDone::Bytes { read: 0, .. } => {
             *peer_eof = true;
+            *accepting = false;
+            exchanges.close();
             proto.on_eof(recv.buf.is_empty())?;
-            if !streams.is_empty() || !waiting.is_empty() {
-                return Err(peer_goaway_error.clone().unwrap_or(Error::ConnectionClosed));
+
+            let close_err = peer_goaway_error
+                .clone()
+                .or_else(|| write_error.clone())
+                .unwrap_or(Error::ConnectionClosed);
+            for queued in waiting.drain(..) {
+                queued.refuse(close_err.clone());
             }
+            while let Ok(queued) = exchanges.0.try_recv() {
+                queued.refuse(close_err.clone());
+            }
+
+            settle_peer_disconnect(close_err, true, streams, outgoing, eof_error);
             Ok(())
         }
         ReadDone::Bytes {
@@ -823,6 +912,7 @@ fn open_waiting(
 fn apply_body_command(
     cmd: BodyCommand,
     now: Instant,
+    peer_eof: bool,
     proto: &mut ProtoConn<ClientSide>,
     streams: &mut HashMap<StreamId, ClientStream>,
     outgoing: &mut OutgoingStreams,
@@ -833,7 +923,7 @@ fn apply_body_command(
                 && let Some(recv_body) = stream.recv_body.as_mut()
             {
                 let released = recv_body.on_demand(offer, now);
-                if released > 0 {
+                if released > 0 && !peer_eof {
                     proto.release_recv_capacity(stream_id, released);
                 }
             }
@@ -844,10 +934,10 @@ fn apply_body_command(
                 && let Some(recv_body) = stream.recv_body.as_mut()
             {
                 let (unconsumed, peer_open) = recv_body.discard();
-                if unconsumed > 0 {
+                if unconsumed > 0 && !peer_eof {
                     proto.release_recv_capacity(stream_id, unconsumed);
                 }
-                if peer_open && !outgoing.contains(stream_id) {
+                if peer_open && !peer_eof && !outgoing.contains(stream_id) {
                     proto.send_reset(stream_id, Reason::CANCEL);
                 }
             }
@@ -954,6 +1044,32 @@ fn fail_client_stream(
             streams.insert(stream_id, stream);
         }
     }
+}
+
+fn settle_peer_disconnect(
+    close_err: Error,
+    clean_close: bool,
+    streams: &mut HashMap<StreamId, ClientStream>,
+    outgoing: &mut OutgoingStreams,
+    eof_error: &mut Option<Error>,
+) {
+    let ids: Vec<StreamId> = streams.keys().copied().collect();
+    let mut had_incomplete = false;
+    for stream_id in ids {
+        let complete_recv = streams.get(&stream_id).is_some_and(|s| {
+            s.respond.is_none() && s.recv_body.as_ref().is_some_and(RecvStream::has_end_stream)
+        });
+        if complete_recv {
+            outgoing.remove(stream_id);
+        } else {
+            had_incomplete = true;
+            fail_client_stream(stream_id, close_err.clone(), false, streams, outgoing);
+        }
+    }
+    if (had_incomplete || !clean_close) && eof_error.is_none() {
+        *eof_error = Some(close_err);
+    }
+    settle_streams(streams, outgoing);
 }
 
 fn settle_streams(streams: &mut HashMap<StreamId, ClientStream>, outgoing: &OutgoingStreams) {

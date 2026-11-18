@@ -5,13 +5,15 @@ use core::arch::aarch64::{
     vorrq_u8, vqtbl1q_u8, vshrq_n_u8, vtstq_u8,
 };
 
-use super::HI_BIT_LUT;
+use super::{HI_BIT_LUT, swar, validate_ascii_lut_scalar};
 
-/// Validates `bytes` (`bytes.len() >= 16`) against an ASCII nibble-LUT.
+/// Validates `bytes` against an ASCII nibble-LUT using 16-byte NEON loads.
 #[inline]
 pub(super) fn validate_ascii_lut(bytes: &[u8], lo_lut: &[u8; 16]) -> bool {
-    debug_assert!(bytes.len() >= 16);
     let len = bytes.len();
+    if len < 16 {
+        return validate_ascii_lut_scalar(bytes, lo_lut);
+    }
     let ptr = bytes.as_ptr();
 
     // SAFETY: `lo_lut` and `HI_BIT_LUT` are `[u8; 16]` arrays, so loading 16
@@ -37,9 +39,8 @@ pub(super) fn validate_ascii_lut(bytes: &[u8], lo_lut: &[u8; 16]) -> bool {
     }
 
     if offset < len {
-        // SAFETY: Callers uphold `len >= 16` (checked by `debug_assert!` and
-        // gated in `simd/mod.rs`; returning early below if ever violated), so
-        // `len - 16` cannot underflow and `[len - 16..len]` lies within `bytes`.
+        // SAFETY: `len >= 16` was checked at function entry, so `len - 16`
+        // cannot underflow and `[len - 16..len]` lies within `bytes`.
         let tail = unsafe { vld1q_u8(ptr.add(len - 16)) };
         if !check_lut_chunk(tail, lo_tbl, hi_tbl, mask_0f) {
             return false;
@@ -68,12 +69,14 @@ fn check_lut_chunk(
     }
 }
 
-/// Validates interior field-value bytes (`bytes.len() >= 16`), rejecting
+/// Validates interior field-value bytes using 16-byte NEON loads, rejecting
 /// `0x00..=0x08`, `0x0A..=0x1F`, and `0x7F`.
 #[inline]
 pub(super) fn validate_field_value_body(bytes: &[u8]) -> bool {
-    debug_assert!(bytes.len() >= 16);
     let len = bytes.len();
+    if len < 16 {
+        return swar::validate_field_value_body(bytes);
+    }
     let ptr = bytes.as_ptr();
 
     // SAFETY: Register-only splats on baseline `aarch64`.
@@ -91,8 +94,8 @@ pub(super) fn validate_field_value_body(bytes: &[u8]) -> bool {
     }
 
     if offset < len {
-        // SAFETY: `len >= 16` is guaranteed by the caller (`simd/mod.rs`), so
-        // `[len - 16..len]` is in-bounds of `bytes`.
+        // SAFETY: `len >= 16` was checked at function entry, so `[len - 16..len]`
+        // is in-bounds of `bytes`.
         let tail = unsafe { vld1q_u8(ptr.add(len - 16)) };
         if !check_value_chunk(tail, v20, v09, v7f) {
             return false;

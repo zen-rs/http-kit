@@ -89,8 +89,8 @@ impl Decoder {
     /// `SETTINGS_HEADER_TABLE_SIZE` change takes effect (RFC 7541 §4.2).
     ///
     /// When the new maximum reduces the encoder's current table capacity, the
-    /// peer's next non-empty header block must begin with a dynamic table size
-    /// update at or below the smallest intermediate maximum.
+    /// peer's next header block must begin with a dynamic table size update at
+    /// or below the smallest intermediate maximum.
     pub fn set_max_table_size(&mut self, new_max: u32) {
         let cap = new_max as usize;
         if cap < self.table.max_size() {
@@ -138,7 +138,7 @@ impl Decoder {
             self.table.set_max_size(new_size);
         }
 
-        if pos < buf.len() && self.pending_min_size.is_some() {
+        if self.pending_min_size.is_some() {
             return Err(HpackError::InvalidTableSizeUpdate);
         }
 

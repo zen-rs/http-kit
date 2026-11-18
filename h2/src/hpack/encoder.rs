@@ -136,10 +136,8 @@ impl Encoder {
             self.table.set_max_size(min_size);
             encode_int(min_size as u64, 5, 0x20, out);
         }
-        if self.table.max_size() != self.target_size || out.is_empty() {
-            self.table.set_max_size(self.target_size);
-            encode_int(self.target_size as u64, 5, 0x20, out);
-        }
+        self.table.set_max_size(self.target_size);
+        encode_int(self.target_size as u64, 5, 0x20, out);
     }
 
     /// Encodes a single field (caller must call [`flush_size_updates`](Self::flush_size_updates)

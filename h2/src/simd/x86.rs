@@ -9,56 +9,50 @@ use core::arch::x86_64::{
     _mm256_shuffle_epi8, _mm256_srli_epi16,
 };
 
-use super::{HI_BIT_LUT, swar};
+use super::{HI_BIT_LUT, swar, validate_ascii_lut_scalar};
 
 #[inline]
 pub(super) fn validate_ascii_lut(bytes: &[u8], lo_lut: &[u8; 16]) -> bool {
+    if bytes.len() < 16 {
+        return validate_ascii_lut_scalar(bytes, lo_lut);
+    }
     #[cfg(target_feature = "avx2")]
     {
-        // SAFETY: `avx2` is enabled at compile time for this target, and
-        // `simd/mod.rs` only calls this when `bytes.len() >= 16`.
+        // SAFETY: `avx2` is enabled at compile time for this target.
         return unsafe { validate_ascii_lut_avx2(bytes, lo_lut) };
     }
     #[cfg(not(target_feature = "avx2"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: Runtime CPUID confirmed AVX2 support, and `bytes.len() >= 16`.
+            // SAFETY: Runtime CPUID confirmed AVX2 support.
             return unsafe { validate_ascii_lut_avx2(bytes, lo_lut) };
         }
         if std::arch::is_x86_feature_detected!("sse4.2") {
-            // SAFETY: Runtime CPUID confirmed SSE4.2 (which includes SSSE3),
-            // and `bytes.len() >= 16`.
+            // SAFETY: Runtime CPUID confirmed SSE4.2 (which includes SSSE3).
             return unsafe { validate_ascii_lut_sse42(bytes, lo_lut) };
         }
-        let mut idx = 0;
-        while idx < bytes.len() {
-            let b = bytes[idx];
-            let allowed = lo_lut[(b & 0x0F) as usize];
-            let bit = HI_BIT_LUT[(b >> 4) as usize];
-            if (allowed & bit) == 0 {
-                return false;
-            }
-            idx += 1;
-        }
-        true
+        validate_ascii_lut_scalar(bytes, lo_lut)
     }
 }
 
 #[inline]
 pub(super) fn validate_field_value_body(bytes: &[u8]) -> bool {
+    if bytes.len() < 16 {
+        return swar::validate_field_value_body(bytes);
+    }
     #[cfg(target_feature = "avx2")]
     {
-        // SAFETY: `avx2` is enabled at compile time and `bytes.len() >= 16`.
+        // SAFETY: `avx2` is enabled at compile time for this target.
         return unsafe { validate_value_avx2(bytes) };
     }
     #[cfg(not(target_feature = "avx2"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: Runtime CPUID confirmed AVX2 support and `bytes.len() >= 16`.
+            // SAFETY: Runtime CPUID confirmed AVX2 support.
             return unsafe { validate_value_avx2(bytes) };
         }
         if std::arch::is_x86_feature_detected!("sse4.2") {
-            // SAFETY: Runtime CPUID confirmed SSE4.2 support and `bytes.len() >= 16`.
+            // SAFETY: Runtime CPUID confirmed SSE4.2 support.
             return unsafe { validate_value_sse42(bytes) };
         }
         swar::validate_field_value_body(bytes)
@@ -69,7 +63,7 @@ pub(super) fn validate_field_value_body(bytes: &[u8]) -> bool {
 unsafe fn validate_ascii_lut_avx2(bytes: &[u8], lo_lut: &[u8; 16]) -> bool {
     let len = bytes.len();
     if len < 32 {
-        // SAFETY: `avx2` implies `sse4.2`, and `len >= 16` from `simd/mod.rs`.
+        // SAFETY: `avx2` implies `sse4.2`.
         return unsafe { validate_ascii_lut_sse42(bytes, lo_lut) };
     }
     let ptr = bytes.as_ptr();
@@ -137,8 +131,10 @@ unsafe fn check_lut_256(
 
 #[target_feature(enable = "sse4.2")]
 unsafe fn validate_ascii_lut_sse42(bytes: &[u8], lo_lut: &[u8; 16]) -> bool {
-    debug_assert!(bytes.len() >= 16);
     let len = bytes.len();
+    if len < 16 {
+        return validate_ascii_lut_scalar(bytes, lo_lut);
+    }
     let ptr = bytes.as_ptr();
 
     // SAFETY: `lo_lut` and `HI_BIT_LUT` are 16-byte arrays; unaligned loads
@@ -165,7 +161,7 @@ unsafe fn validate_ascii_lut_sse42(bytes: &[u8], lo_lut: &[u8; 16]) -> bool {
     }
 
     if offset < len {
-        // SAFETY: `len >= 16` is upheld by `simd/mod.rs`, so `[len - 16..len]`
+        // SAFETY: `len >= 16` was checked at function entry, so `[len - 16..len]`
         // lies within `bytes`.
         let tail = unsafe { _mm_loadu_si128(ptr.add(len - 16).cast::<__m128i>()) };
         // SAFETY: SSE4.2 enabled by `#[target_feature]`.
@@ -201,7 +197,7 @@ unsafe fn check_lut_128(
 unsafe fn validate_value_avx2(bytes: &[u8]) -> bool {
     let len = bytes.len();
     if len < 32 {
-        // SAFETY: `avx2` implies `sse4.2` and `len >= 16`.
+        // SAFETY: `avx2` implies `sse4.2`.
         return unsafe { validate_value_sse42(bytes) };
     }
     let ptr = bytes.as_ptr();
@@ -266,8 +262,10 @@ unsafe fn check_value_256(
 
 #[target_feature(enable = "sse4.2")]
 unsafe fn validate_value_sse42(bytes: &[u8]) -> bool {
-    debug_assert!(bytes.len() >= 16);
     let len = bytes.len();
+    if len < 16 {
+        return swar::validate_field_value_body(bytes);
+    }
     let ptr = bytes.as_ptr();
 
     // SAFETY: Register-only splats.
@@ -293,7 +291,7 @@ unsafe fn validate_value_sse42(bytes: &[u8]) -> bool {
     }
 
     if offset < len {
-        // SAFETY: `len >= 16` is upheld by `simd/mod.rs`, so `[len - 16..len]`
+        // SAFETY: `len >= 16` was checked at function entry, so `[len - 16..len]`
         // lies within `bytes`.
         let tail = unsafe { _mm_loadu_si128(ptr.add(len - 16).cast::<__m128i>()) };
         // SAFETY: SSE4.2 enabled by `#[target_feature]`.

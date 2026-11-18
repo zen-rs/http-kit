@@ -544,7 +544,7 @@ fn handle_server_read_done<R, SFut>(
                 return Ok(());
             }
             proto.on_eof(recv.buf.is_empty())?;
-            if !streams.is_empty() || !in_flight.is_empty() || !outgoing.is_empty() {
+            if streams.values().any(|s| !s.peer_recv_ended) {
                 return Err(Error::ConnectionClosed);
             }
             Ok(())
