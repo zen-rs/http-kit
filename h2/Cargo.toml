@@ -8,13 +8,15 @@ license = "MIT"
 description = "Sans-IO HTTP/2 server and client with zero-copy bodies, driven over owned-buffer I/O"
 documentation = "https://docs.rs/http-kit-h2"
 repository = "https://github.com/zen-rs/http-kit"
-keywords = ["http", "http2", "sans-io", "io-uring", "server"]
+keywords = ["http", "http2", "hpack", "sans-io", "io-uring"]
 categories = ["network-programming", "web-programming::http-server", "web-programming::http-client"]
 
 [features]
 ## File-region body frames, sent with the I/O layer's file-to-socket path.
 fs = ["http-kit/fs"]
-## Pipe body frames, on Linux and Android.
+## Pipe body frames, on Linux and Android: a received body whose bytes are
+## still in the socket is handed up as a pipe to a consumer that offers one,
+## and a pipe frame is sent with `splice(2)`.
 pipe = ["http-kit/pipe"]
 
 [dependencies]
@@ -22,9 +24,24 @@ http-kit = { version = "0.8.2", path = "..", default-features = false, features 
 http-kit-io = { version = "0.6.2", path = "../io" }
 http = { version = "1.5.0", default-features = false, features = ["std"] }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.21", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+http-kit = { version = "0.8.2", path = "..", default-features = false, features = ["std", "fs"] }
+http-kit-io = { version = "0.6.2", path = "../io", features = ["tokio", "compio"] }
+http-kit-tls = { version = "0.4.2", path = "../tls", features = ["kernel"] }
+compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["runtime"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "io-util", "time"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+hyper = { version = "1.12.0", default-features = false, features = ["client", "server", "http2"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+h2 = { version = "0.4.20", default-features = false, features = ["stream"] }
+http-body-util = { version = "0.1.5", default-features = false }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
@@ -38,5 +55,3 @@ unsafe_code = "deny"
 
 [package.metadata.docs.rs]
 all-features = true
-
-[workspace]
