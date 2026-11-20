@@ -84,11 +84,3 @@ tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dev-dependencies]
 http-kit-io = { version = "0.6.2", path = "io", features = ["tokio"] }
-
-# Forks carrying manifest fixes that let the no_std resolution actually stay
-# no_std (upstream crates are #![no_std] but their dep specs enable the deps'
-# default features, which pull std). Sent upstream as hyperium PRs; the
-# patches are only needed until they merge and release.
-[patch.crates-io]
-http = { git = "https://github.com/lexoliu/http", branch = "skyzen" }
-http-body = { git = "https://github.com/lexoliu/http-body", branch = "skyzen" }
