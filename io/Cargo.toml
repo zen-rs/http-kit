@@ -17,11 +17,13 @@ default = ["std"]
 ## `std`: the operating system's I/O surface — `std::io`, `std::fs::File`,
 ## `std::net` adoption traits and Unix-domain sockets. Off for no_std, where
 ## an implementation brings its own equivalents.
-std = ["dep:futures-io", "futures-io/std", "compio-buf/std"]
+std = ["dep:futures-io", "futures-io/std"]
 ## `core::io` instead of `std::io` on no_std builds: nightly-only until
 ## `core_io_fundamentals` stabilizes (rust-lang/rust#154046), which is what
 ## embedded users opt into; it compiles to nothing once stable.
-core-io = ["compio-buf/core-io"]
+core-io = []
+# `compio-buf/core-io` is the intended wiring once compio-buf gains a
+# no_std mode; it cannot resolve today.
 ## compio: io_uring on Linux (falling back to polling where io_uring is unavailable), IOCP on Windows, polling elsewhere.
 compio = ["std", "dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core", "dep:io-uring", "dep:linux-raw-sys", "dep:offset-allocator", "dep:tracing"]
 ## tokio's reactor, adapted to owned buffers.
