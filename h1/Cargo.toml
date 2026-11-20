@@ -13,26 +13,36 @@ keywords = ["http", "http1", "sans-io", "io-uring", "server"]
 categories = ["network-programming", "web-programming::http-server", "web-programming::http-client"]
 
 [features]
+default = ["std"]
+## `std`: an operating system's surface — `std::io` errors, SIMD head
+## parsing and file/pipe body frames. Off for no_std, which needs `core-io`.
+std = ["http-kit/std", "http/std", "bytes/std", "httparse/std",
+       "futures-lite/std", "tracing/std", "async-channel/std", "dep:httpdate"]
+## `core::io` errors on no_std builds: nightly-only until
+## `core_io_fundamentals` stabilizes (rust-lang/rust#154046).
+core-io = ["http-kit-io/core-io", "http-kit/core-io"]
 ## File-region body frames, sent with the I/O layer's file-to-socket path.
-fs = ["http-kit/fs"]
+fs = ["std", "http-kit/fs"]
 ## Pipe body frames, on Linux and Android: a received body whose bytes are
 ## still in the socket is handed up as a pipe to a consumer that offers one,
 ## and a pipe frame is sent with `splice(2)`.
-pipe = ["http-kit/pipe"]
+pipe = ["std", "http-kit/pipe"]
 
 [dependencies]
-http-kit = { version = "0.8.2", path = "..", default-features = false, features = ["std"] }
-http-kit-io = { version = "0.6.2", path = "../io" }
-http = { version = "1.5.0", default-features = false, features = ["std"] }
-bytes = { version = "1.12.1", default-features = false, features = ["std"] }
-httparse = { version = "1.10.1", default-features = false, features = ["std"] }
-httpdate = { version = "1.0.3", default-features = false }
-async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
-futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+http-kit = { version = "0.8.2", path = "..", default-features = false }
+http-kit-io = { version = "0.6.2", path = "../io", default-features = false }
+http = { version = "1.5.0", default-features = false }
+bytes = { version = "1.12.1", default-features = false }
+httparse = { version = "1.10.1", default-features = false }
+httpdate = { version = "1.0.3", default-features = false, optional = true }
+async-channel = { version = "2.5.0", default-features = false }
+futures-lite = { version = "2.6.1", default-features = false }
 thiserror = { version = "2.0.17", default-features = false }
-tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing = { version = "0.1.44", default-features = false }
 
-[dev-dependencies]
+# Tests run on the host; keeping the driver features out of the none-elf
+# resolution lets `--no-default-features` checks stay no_std.
+[target.'cfg(any(unix, windows))'.dev-dependencies]
 http-kit-io = { version = "0.6.2", path = "../io", features = ["tokio", "compio"] }
 compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["runtime"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt"] }

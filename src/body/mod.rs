@@ -92,6 +92,7 @@ pub use source::{FrameSource, PipeOffer};
 extern crate std;
 use futures_lite::{ready, Stream, StreamExt};
 use http_body::Frame;
+#[cfg(feature = "std")]
 use mime::Mime;
 
 use bytestr::ByteStr;
@@ -148,6 +149,7 @@ pub type LocalBody = GenericBody<Local>;
 /// }
 /// ```
 pub struct GenericBody<F: Flavor> {
+    #[cfg(feature = "std")]
     mime: Option<Mime>,
     inner: BodyInner<F>,
 }
@@ -219,6 +221,7 @@ impl<F: Flavor> GenericBody<F> {
     /// ```
     pub const fn empty() -> Self {
         Self {
+            #[cfg(feature = "std")]
             mime: None,
             inner: BodyInner::Once(Bytes::new()),
         }
@@ -252,6 +255,7 @@ impl<F: Flavor> GenericBody<F> {
         F: Holds<B>,
     {
         Self {
+            #[cfg(feature = "std")]
             mime: None,
             inner: BodyInner::HttpBody(F::http_body(body)),
         }
@@ -275,6 +279,7 @@ impl<F: Flavor> GenericBody<F> {
     /// ```
     pub const fn frozen() -> Self {
         Self {
+            #[cfg(feature = "std")]
             mime: None,
             inner: BodyInner::Freeze,
         }
@@ -326,6 +331,7 @@ impl<F: Flavor> GenericBody<F> {
         F: Holds<S>,
     {
         Self {
+            #[cfg(feature = "std")]
             mime: None,
             inner: BodyInner::Frames(Frames {
                 stream: F::source(source),
@@ -344,6 +350,7 @@ impl<F: Flavor> GenericBody<F> {
         F: Holds<S>,
     {
         Self {
+            #[cfg(feature = "std")]
             mime: None,
             inner: BodyInner::Frames(Frames {
                 stream: F::frames(stream, map),
@@ -377,6 +384,7 @@ impl<F: Flavor> GenericBody<F> {
     #[must_use]
     pub const fn from_file_region(region: FileRegion) -> Self {
         Self {
+            #[cfg(feature = "std")]
             mime: None,
             inner: BodyInner::File(region),
         }
@@ -446,6 +454,7 @@ impl<F: Flavor> GenericBody<F> {
     /// ```
     pub fn from_bytes(data: impl Into<Bytes>) -> Self {
         Self {
+            #[cfg(feature = "std")]
             mime: Some(mime::APPLICATION_OCTET_STREAM),
             inner: BodyInner::Once(data.into()),
         }
@@ -474,6 +483,7 @@ impl<F: Flavor> GenericBody<F> {
     /// ```
     pub fn from_text(str: impl Into<ByteStr>) -> Self {
         Self {
+            #[cfg(feature = "std")]
             mime: Some(mime::TEXT_PLAIN_UTF_8),
             inner: BodyInner::Once(str.into().into()),
         }
@@ -512,6 +522,7 @@ impl<F: Flavor> GenericBody<F> {
     #[cfg(feature = "fs")]
     pub async fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
         let path = path.as_ref();
+#[cfg(feature = "std")]
         let mime = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -524,6 +535,7 @@ impl<F: Flavor> GenericBody<F> {
         })
         .await?;
         Ok(Self {
+            #[cfg(feature = "std")]
             mime,
             ..Self::from_file_region(FileRegion::new(file, 0, len))
         })
@@ -571,6 +583,7 @@ impl<F: Flavor> GenericBody<F> {
     #[cfg(feature = "json")]
     pub fn from_json<T: serde::Serialize>(value: T) -> Result<Self, serde_json::Error> {
         Ok(Self {
+            #[cfg(feature = "std")]
             mime: Some(mime::APPLICATION_JSON),
             ..Self::from_bytes(serde_json::to_string(&value)?)
         })
@@ -617,6 +630,7 @@ impl<F: Flavor> GenericBody<F> {
     #[cfg(feature = "form")]
     pub fn from_form<T: serde::Serialize>(value: T) -> Result<Self, serde_urlencoded::ser::Error> {
         Ok(Self {
+            #[cfg(feature = "std")]
             mime: Some(mime::APPLICATION_WWW_FORM_URLENCODED),
             ..Self::from_bytes(serde_urlencoded::to_string(value)?)
         })
@@ -655,6 +669,7 @@ impl<F: Flavor> GenericBody<F> {
         F: Holds<S>,
     {
         Self {
+            #[cfg(feature = "std")]
             mime: Some(mime::TEXT_EVENT_STREAM),
             ..Self::from_mapped_frames(s, |result: Result<Event, E>| {
                 result.map(|event| BodyFrame::Data(Bytes::from(event.encode().into_bytes())))
@@ -663,11 +678,13 @@ impl<F: Flavor> GenericBody<F> {
     }
 
     /// Returns the MIME type of the body, if known.
+    #[cfg(feature = "std")]
     pub fn mime(&self) -> Option<&Mime> {
         self.mime.as_ref()
     }
 
     /// Sets the MIME type of the body.
+    #[cfg(feature = "std")]
     pub fn with_mime(mut self, mime: Mime) -> Self {
         self.mime = Some(mime);
         self
@@ -1154,6 +1171,7 @@ impl<F: Flavor> GenericBody<F> {
     pub fn try_clone(&self) -> Option<Self> {
         match &self.inner {
             BodyInner::Once(bytes) => Some(Self {
+                #[cfg(feature = "std")]
                 mime: self.mime.clone(),
                 inner: BodyInner::Once(bytes.clone()),
             }),
@@ -1355,6 +1373,7 @@ impl From<Body> for LocalBody {
             BodyInner::Freeze => BodyInner::Freeze,
         };
         Self {
+            #[cfg(feature = "std")]
             mime: body.mime,
             inner,
         }

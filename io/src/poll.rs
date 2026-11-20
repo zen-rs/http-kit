@@ -7,13 +7,16 @@
 //! kernel write into a buffer that is only borrowed for one poll, so it offers
 //! [`CopyingPoll`], whose name states the extra copy.
 
-use std::{
+use alloc::{boxed::Box, format, vec::Vec};
+use core::{
     fmt,
     future::Future,
-    io,
+    mem,
     pin::Pin,
     task::{Context, Poll, ready},
 };
+
+use crate::io;
 
 use compio_buf::BufResult;
 use futures_io::{AsyncRead, AsyncWrite};
@@ -149,7 +152,7 @@ impl<S: Split> AsyncRead for CopyingPoll<S> {
                 ReadState::Idle { .. } if out.is_empty() => return Poll::Ready(Ok(0)),
                 ReadState::Idle { .. } => {
                     let ReadState::Idle { mut half, buf, .. } =
-                        std::mem::replace(&mut this.read, ReadState::Poisoned)
+                        mem::replace(&mut this.read, ReadState::Poisoned)
                     else {
                         unreachable!("matched as idle");
                     };
@@ -196,7 +199,7 @@ impl<S: Split> CopyingPoll<S> {
     /// sees the operation before the caller next polls.
     fn start(&mut self, cx: &mut Context<'_>, op: WriteOp) -> Poll<io::Result<()>> {
         let WriteState::Idle { mut half, buf } =
-            std::mem::replace(&mut self.write, WriteState::Poisoned)
+            mem::replace(&mut self.write, WriteState::Poisoned)
         else {
             unreachable!("started on an idle writer");
         };

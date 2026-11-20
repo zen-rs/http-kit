@@ -10,7 +10,8 @@
 //! A demand carries the consumer's [`PipeOffer`], if it made one, so the
 //! driver can answer with a pipe frame when the bytes are still in the socket.
 
-use std::{
+use alloc::boxed::Box;
+use core::{
     pin::Pin,
     task::{Context, Poll, ready},
 };

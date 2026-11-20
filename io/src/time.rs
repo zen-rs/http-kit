@@ -1,21 +1,23 @@
 //! Timers.
 
-use std::{
-    future::Future,
-    time::{Duration, Instant},
-};
+use core::{future::Future, time::Duration};
+
+#[cfg(feature = "std")]
+use std::time::Instant;
 
 /// Waits for deadlines on the implementation's own timer wheel.
 ///
-/// Deadlines are absolute, which is what protocol timers (an idle timeout, a
-/// QUIC loss-detection alarm) are expressed in; re-arming one is dropping the
-/// old future and creating a new one.
+/// Deadlines are relative — `core` has no monotonic clock, so the required
+/// primitive is [`sleep`](Self::sleep); an absolute deadline on `std`
+/// ([`sleep_until`](Self::sleep_until)) resolves to a relative wait at call
+/// time. Re-arming one is dropping the old future and creating a new one.
 pub trait Timer {
-    /// Completes at `deadline`, or at once if it has passed.
-    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()>;
-
     /// Completes after `duration`.
-    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
-        self.sleep_until(Instant::now() + duration)
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()>;
+
+    /// Completes at `deadline`, or at once if it has passed.
+    #[cfg(feature = "std")]
+    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
+        self.sleep(deadline.saturating_duration_since(Instant::now()))
     }
 }

@@ -14,7 +14,7 @@ use std::{
     net::{Shutdown, SocketAddr},
     pin::Pin,
     task::{Context, Poll, ready},
-    time::Instant,
+    time::Duration,
 };
 
 use ::async_io::Async;
@@ -48,8 +48,8 @@ pub type UnixListener = readiness::Listener<Async<std::os::unix::net::UnixListen
 pub type UdpSocket = readiness::Datagram<Async<std::net::UdpSocket>>;
 
 impl Timer for AsyncIo {
-    async fn sleep_until(&self, deadline: Instant) {
-        ::async_io::Timer::at(deadline).await;
+    async fn sleep(&self, duration: Duration) {
+        ::async_io::Timer::after(duration).await;
     }
 }
 

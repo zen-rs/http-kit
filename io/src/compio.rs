@@ -86,7 +86,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     num::NonZeroU16,
-    time::Instant,
+    time::Duration,
 };
 
 #[cfg(not(target_os = "linux"))]
@@ -439,8 +439,8 @@ impl FixedBuffers {
 }
 
 impl<R: Scope> Timer for Compio<R> {
-    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
-        ::compio::time::sleep_until(deadline)
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
+        ::compio::time::sleep(duration)
     }
 }
 

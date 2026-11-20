@@ -107,6 +107,9 @@
 //! # }
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(feature = "core-io", feature(core_io))]
+
 pub mod client;
 pub mod proto;
 pub mod server;
@@ -117,7 +120,13 @@ mod conn;
 mod error;
 mod splice;
 
-use std::fmt;
+#[macro_use]
+extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
+
+use core::fmt;
 
 use bytes::Bytes;
 
@@ -147,3 +156,13 @@ impl<R, W> fmt::Debug for Upgraded<R, W> {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(feature = "std")]
+pub use http_kit_io::SendFile;
+/// `SendFile` capability bound: a real trait on `std`, an always-implemented
+/// marker on no_std (there is no filesystem to send from).
+#[cfg(not(feature = "std"))]
+#[doc(hidden)]
+pub trait SendFile {}
+#[cfg(not(feature = "std"))]
+impl<T: ?Sized> SendFile for T {}
