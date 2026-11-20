@@ -9,17 +9,19 @@
 //! The handle is `Clone` and `Send`, so a connection pool can hold it while
 //! the connection itself, like every future here, stays on one thread.
 
-use std::{cell::Cell, fmt, time::Instant};
+use alloc::boxed::Box;
+use core::{cell::Cell, fmt, time::Duration};
 
 use async_channel::{Receiver, Sender};
 use bytes::BytesMut;
 use http::{Method, StatusCode};
 use http_kit::{Body, Deadlines, Request, Response};
-use http_kit_io::{ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write};
+use crate::SendFile;
+use http_kit_io::{ReadOwned, SpliceRead, SpliceWrite, Split, Timer, Write};
 
 use crate::{
     ClientConfig, Error, ParseError, Timeout, Upgraded, body,
-    conn::{Outbox, Pumped, Recv, deadline_after, pump_body, send_message, until, while_driving},
+    conn::{Deadline, Outbox, Pumped, Recv, deadline_after, pump_body, remaining, send_message, until, while_driving},
     proto::{BodyDecoder, BodyKind, ResponseHead, encode_request_head, parse_response_head},
 };
 
@@ -131,8 +133,8 @@ impl fmt::Display for TrySendError {
     }
 }
 
-impl std::error::Error for TrySendError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for TrySendError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         Some(&self.error)
     }
 }
@@ -397,7 +399,7 @@ where
             outbox.push(head.freeze());
             if expect_continue {
                 outbox.flush(writer).await?;
-                match until(timer, deadline_after(continue_timeout), proceed.recv()).await {
+                match until(timer, continue_timeout, proceed.recv()).await {
                     Some(Ok(())) => {}
                     // Withheld: the head announced a body that never follows,
                     // so the connection closes after the response.
@@ -507,14 +509,14 @@ async fn read_head<R: ReadOwned, T: Timer>(
     limits: &crate::Limits,
     method: &Method,
     timer: &T,
-    deadline: Option<Instant>,
+    deadline: Option<Deadline>,
 ) -> Result<ResponseHead, Error> {
     loop {
         if let Some(head) = parse_response_head(&mut recv.buf, limits, method)? {
             tracing::trace!(status = %head.parts.status, "response");
             return Ok(head);
         }
-        let read = until(timer, deadline, recv.fill())
+        let read = until(timer, remaining(deadline), recv.fill())
             .await
             .ok_or(Error::Timeout(Timeout::HeadRead))??;
         if read == 0 {

@@ -13,18 +13,27 @@ keywords = ["io-uring", "async", "io", "thread-per-core", "network"]
 categories = ["asynchronous", "network-programming"]
 
 [features]
+default = ["std"]
+## `std`: the operating system's I/O surface — `std::io`, `std::fs::File`,
+## `std::net` adoption traits and Unix-domain sockets. Off for no_std, where
+## an implementation brings its own equivalents.
+std = ["dep:futures-io", "futures-io/std", "compio-buf/std"]
+## `core::io` instead of `std::io` on no_std builds: nightly-only until
+## `core_io_fundamentals` stabilizes (rust-lang/rust#154046), which is what
+## embedded users opt into; it compiles to nothing once stable.
+core-io = ["compio-buf/core-io"]
 ## compio: io_uring on Linux (falling back to polling where io_uring is unavailable), IOCP on Windows, polling elsewhere.
-compio = ["dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core", "dep:io-uring", "dep:linux-raw-sys", "dep:offset-allocator", "dep:tracing"]
+compio = ["std", "dep:compio", "dep:libc", "dep:windows-sys", "dep:socket2", "dep:futures-core", "dep:io-uring", "dep:linux-raw-sys", "dep:offset-allocator", "dep:tracing"]
 ## tokio's reactor, adapted to owned buffers.
-tokio = ["dep:tokio", "dep:socket2", "dep:libc", "dep:windows-sys"]
+tokio = ["std", "dep:tokio", "dep:socket2", "dep:libc", "dep:windows-sys"]
 ## async-io's reactor, adapted to owned buffers.
-async-io = ["dep:async-io", "dep:socket2", "dep:libc", "dep:windows-sys"]
+async-io = ["std", "dep:async-io", "dep:socket2", "dep:libc", "dep:windows-sys"]
 
 [dependencies]
 bytes = { version = "1.12.1", default-features = false }
 compio-buf = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["bytes"] }
 futures-core = { version = "0.3.34", default-features = false }
-futures-io = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-io = { version = "0.3.34", default-features = false, optional = true }
 
 compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["runtime", "net", "time", "io-uring", "polling"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["net", "time"], optional = true }
@@ -71,7 +80,8 @@ libc = { version = "0.2.191", default-features = false, optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"], optional = true }
 
-[dev-dependencies]
+# Tests run on the host; keeps std deps out of none-elf feature resolution.
+[target.'cfg(any(unix, windows))'.dev-dependencies]
 socket2 = { version = "0.6.5", default-features = false }
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt"] }

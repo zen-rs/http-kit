@@ -1,6 +1,9 @@
 //! Name resolution.
 
-use std::{io, net::IpAddr};
+use alloc::vec::Vec;
+use core::net::IpAddr;
+
+use crate::io;
 
 /// An address family a lookup answers for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

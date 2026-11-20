@@ -14,7 +14,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll, ready},
-    time::Instant,
+    time::Duration,
 };
 
 use ::tokio::io::{Interest, ReadBuf};
@@ -49,8 +49,8 @@ pub type UnixListener = readiness::Listener<::tokio::net::UnixListener>;
 pub type UdpSocket = readiness::Datagram<::tokio::net::UdpSocket>;
 
 impl Timer for Tokio {
-    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
-        ::tokio::time::sleep_until(deadline.into())
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
+        ::tokio::time::sleep(duration)
     }
 }
 

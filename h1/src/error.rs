@@ -1,6 +1,10 @@
 //! Error types.
 
-use std::{io, sync::Arc};
+use alloc::sync::Arc;
+
+use alloc::boxed::Box;
+
+use http_kit_io::io;
 
 use http::{StatusCode, Version};
 use http_kit::{BodyError, ReceiveError};
@@ -235,6 +239,7 @@ impl From<Error> for BodyError {
                 detail: parse.framing_detail(),
             }
             .into(),
+            #[cfg(any(feature = "std", feature = "core-io"))]
             Error::Io(error) => ReceiveError::Connection(error).into(),
             other => Self::Other(Box::new(other)),
         }

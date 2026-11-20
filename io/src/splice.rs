@@ -20,7 +20,7 @@
 //! stream waits for readiness with its driver, then makes a non-blocking
 //! `splice(2)` call on the calling thread.
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 use std::{
     future::Future,
     io,
@@ -28,7 +28,7 @@ use std::{
     pin::Pin,
 };
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 use bytes::Bytes;
 
 use crate::stream::{Read, Write};
@@ -36,7 +36,7 @@ use crate::stream::{Read, Write};
 /// An empty pipe, ready to be filled by [`SpliceRead::splice_to_pipe`].
 ///
 /// It has the kernel's default capacity.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 #[derive(Debug)]
 pub struct Pipe {
     read: OwnedFd,
@@ -44,7 +44,7 @@ pub struct Pipe {
     capacity: usize,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 impl Pipe {
     /// Creates an empty pipe.
     ///
@@ -109,14 +109,14 @@ impl Pipe {
 }
 
 /// A pipe holding bytes spliced from a socket.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 #[derive(Debug)]
 pub struct FilledPipe {
     pipe: Pipe,
     len: usize,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 impl FilledPipe {
     /// Wraps a pipe that holds `len` bytes.
     pub(crate) const fn new(pipe: Pipe, len: usize) -> Self {
@@ -163,7 +163,7 @@ impl FilledPipe {
 }
 
 /// The outcome of [`SpliceRead::splice_to_pipe`].
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 #[derive(Debug)]
 pub enum Spliced {
     /// Bytes arrived: the pipe holds them.
@@ -177,7 +177,7 @@ pub trait SpliceRead: Read {
     /// Whether this stream's bytes can go through a pipe without being read
     /// into memory. A stream that answers `false` is forwarded by reading and
     /// writing.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
     fn can_splice(&self) -> bool;
 
     /// Waits until the stream has bytes, then moves up to `max` of them (and
@@ -187,7 +187,7 @@ pub trait SpliceRead: Read {
     /// # Errors
     ///
     /// The error comes with the pipe, still empty, so the caller keeps it.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
     fn splice_to_pipe(
         &mut self,
         pipe: Pipe,
@@ -200,7 +200,7 @@ pub trait SpliceWrite: Write {
     /// Whether bytes can go from a pipe to this stream without being read
     /// into memory. A stream that answers `false` is forwarded by reading and
     /// writing.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
     fn can_splice(&self) -> bool;
 
     /// Writes every byte of `filled` to the stream and returns the emptied
@@ -210,17 +210,17 @@ pub trait SpliceWrite: Write {
     ///
     /// Fails if the stream does; the bytes not yet written are lost with the
     /// pipe.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
     fn splice_from_pipe(&mut self, filled: FilledPipe) -> impl Future<Output = io::Result<Pipe>>;
 }
 
 /// A boxed future that need not be `Send`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// [`SpliceRead`] without generics, so a stream can be used behind a
 /// `Box<dyn DynSpliceRead>`. Every [`SpliceRead`] implements it.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 pub trait DynSpliceRead {
     /// [`SpliceRead::can_splice`].
     fn can_splice(&self) -> bool;
@@ -233,7 +233,7 @@ pub trait DynSpliceRead {
     ) -> LocalBoxFuture<'_, Result<Spliced, (io::Error, Pipe)>>;
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 impl<T: SpliceRead> DynSpliceRead for T {
     fn can_splice(&self) -> bool {
         SpliceRead::can_splice(self)
@@ -250,7 +250,7 @@ impl<T: SpliceRead> DynSpliceRead for T {
 
 /// [`SpliceWrite`] without generics, so a stream can be used behind a
 /// `Box<dyn DynSpliceWrite>`. Every [`SpliceWrite`] implements it.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 pub trait DynSpliceWrite {
     /// [`SpliceWrite::can_splice`].
     fn can_splice(&self) -> bool;
@@ -265,7 +265,7 @@ pub trait DynSpliceWrite {
     fn shutdown(&mut self) -> LocalBoxFuture<'_, io::Result<()>>;
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 impl<T: SpliceWrite> DynSpliceWrite for T {
     fn can_splice(&self) -> bool {
         SpliceWrite::can_splice(self)
@@ -290,14 +290,14 @@ impl<T: SpliceWrite> DynSpliceWrite for T {
 /// Both ends of an upgraded connection reach a forwarder through erased
 /// tokens, so erasure is the shape here; [`SpliceDuplex::join`] is its only
 /// use.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 pub struct SpliceDuplex {
     replay: Bytes,
     read: Box<dyn DynSpliceRead>,
     write: Box<dyn DynSpliceWrite>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 impl std::fmt::Debug for SpliceDuplex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpliceDuplex")
@@ -306,7 +306,7 @@ impl std::fmt::Debug for SpliceDuplex {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 impl SpliceDuplex {
     /// An end made of a connection's halves. `replay` is what was already
     /// read from the connection, which [`join`](Self::join) writes to the
@@ -369,7 +369,7 @@ impl SpliceDuplex {
 
 /// One direction of a tunnel: the replay bytes, then everything `read`
 /// yields, to `write`, which is shut down at the end of the stream.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "std", any(target_os = "linux", target_os = "android")))]
 async fn pump(
     replay: Bytes,
     mut read: Box<dyn DynSpliceRead>,

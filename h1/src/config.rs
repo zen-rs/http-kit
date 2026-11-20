@@ -6,7 +6,7 @@
 //! Each struct is `#[non_exhaustive]`, so a new setting never breaks a
 //! caller: start from `default()` and assign the fields that differ.
 
-use std::time::Duration;
+use core::time::Duration;
 
 use crate::proto::RequestTarget;
 
