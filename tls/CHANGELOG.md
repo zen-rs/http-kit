@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/zen-rs/http-kit/compare/tls/v0.4.2...tls/v0.4.3) - 2026-11-21
+
+### Other
+
+- replace the cargo-machete job with cargo::unused_dependencies
+- depend on compio from the lexoliu/compio skyzen branch
+
 ## [0.4.2](https://github.com/zen-rs/http-kit/compare/tls/v0.4.1...tls/v0.4.2) - 2026-11-11
 
 ### Other

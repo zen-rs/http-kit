@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/zen-rs/http-kit/compare/h1/v0.6.2...h1/v0.6.3) - 2026-11-21
+
+### Fixed
+
+- *(h1)* enable httparse std feature for SIMD parsing
+- *(h1)* record when a file region has been sent
+
+### Other
+
+- replace the cargo-machete job with cargo::unused_dependencies
+- *(h1)* transfer owned receive buffers into body frames
+- depend on compio from the lexoliu/compio skyzen branch
+
 ## [0.6.2](https://github.com/zen-rs/http-kit/compare/h1/v0.6.1...h1/v0.6.2) - 2026-11-11
 
 ### Other
