@@ -47,3 +47,6 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [package.metadata.docs.rs]
 all-features = true
+
+[lints.cargo]
+unused_dependencies = "deny"
