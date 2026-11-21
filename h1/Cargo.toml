@@ -44,3 +44,6 @@ unsafe_code = "forbid"
 
 [package.metadata.docs.rs]
 all-features = true
+
+[lints.cargo]
+unused_dependencies = "deny"
