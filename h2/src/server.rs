@@ -11,6 +11,7 @@ use std::{
     collections::HashMap,
     fmt,
     future::{Future, pending, poll_fn},
+    io,
     pin::{Pin, pin},
     task::Poll,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -262,6 +263,15 @@ where
                 || (peer_eof && proto.active_stream_count() == 0)
                 || (proto.is_closing() && proto.active_stream_count() == 0);
             if drained && streams.is_empty() && in_flight.is_empty() && outgoing.is_empty() {
+                if peer_eof {
+                    if let Some((w, o, _)) = write_task.finish().await {
+                        write_slot = Some((w, o));
+                    }
+                    if let Some((mut writer, _)) = write_slot.take() {
+                        let _ = writer.shutdown().await;
+                    }
+                    return Ok(());
+                }
                 if let Some((w, o, res)) = write_task.finish().await {
                     write_slot = Some((w, o));
                     res?;
@@ -419,32 +429,74 @@ where
             match wake {
                 ServerWake::Write(Ok(())) | ServerWake::Timer | ServerWake::Activity => {}
                 ServerWake::Write(Err(error)) => {
-                    return abort_server(
-                        error,
-                        &mut proto,
-                        &mut recv_slot,
-                        &mut write_slot,
-                        &mut write_task,
-                        &timer,
-                        &mut streams,
-                        &mut outgoing,
-                        &mut in_flight,
-                    )
-                    .await;
+                    let idle_disconnect = proto.is_handshake_complete()
+                        && streams.is_empty()
+                        && in_flight.is_empty()
+                        && outgoing.is_empty()
+                        && proto.active_stream_count() == 0
+                        && (peer_eof
+                            || matches!(
+                                &error,
+                                Error::Io(io_err)
+                                    if matches!(
+                                        io_err.kind(),
+                                        io::ErrorKind::BrokenPipe
+                                            | io::ErrorKind::ConnectionReset
+                                            | io::ErrorKind::NotConnected
+                                    )
+                            ));
+                    if idle_disconnect {
+                        peer_eof = true;
+                    } else {
+                        return abort_server(
+                            error,
+                            &mut proto,
+                            &mut recv_slot,
+                            &mut write_slot,
+                            &mut write_task,
+                            &timer,
+                            &mut streams,
+                            &mut outgoing,
+                            &mut in_flight,
+                        )
+                        .await;
+                    }
                 }
                 ServerWake::Read(Err(error)) => {
-                    return abort_server(
-                        error,
-                        &mut proto,
-                        &mut recv_slot,
-                        &mut write_slot,
-                        &mut write_task,
-                        &timer,
-                        &mut streams,
-                        &mut outgoing,
-                        &mut in_flight,
-                    )
-                    .await;
+                    // A post-handshake idle client that drops its TCP/TLS socket
+                    // without sending TLS `close_notify` (`UnexpectedEof`) or sends
+                    // `RST` (`ConnectionReset`) after all exchanges finished is a
+                    // clean connection teardown; mid-frame or active-stream drops
+                    // still fail via `proto.on_eof`.
+                    let clean_idle_disconnect =
+                        matches!(
+                            &error,
+                            Error::Io(io_err)
+                                if matches!(
+                                    io_err.kind(),
+                                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                                )
+                        ) && recv_slot.as_ref().is_some_and(|r| r.buf.is_empty())
+                            && streams.is_empty()
+                            && in_flight.is_empty()
+                            && outgoing.is_empty()
+                            && proto.on_eof(true).is_ok();
+                    if clean_idle_disconnect {
+                        peer_eof = true;
+                    } else {
+                        return abort_server(
+                            error,
+                            &mut proto,
+                            &mut recv_slot,
+                            &mut write_slot,
+                            &mut write_task,
+                            &timer,
+                            &mut streams,
+                            &mut outgoing,
+                            &mut in_flight,
+                        )
+                        .await;
+                    }
                 }
                 ServerWake::Read(Ok(done)) => {
                     idle_since = None;

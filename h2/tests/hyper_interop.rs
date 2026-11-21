@@ -482,7 +482,7 @@ where
                 .await
                 .expect("hyper connect");
             let _ = tcp.set_nodelay(true);
-            let mut sender = if let Some(tls_cfg) = client_tls {
+            let (mut sender, conn_task) = if let Some(tls_cfg) = client_tls {
                 let connector = tokio_rustls::TlsConnector::from(tls_cfg);
                 let name = "localhost".try_into().expect("sni");
                 let tls = connector.connect(name, tcp).await.expect("tls connect");
@@ -490,19 +490,19 @@ where
                     hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
                         .await
                         .expect("hyper h2 handshake");
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let _ = conn.await;
                 });
-                sender
+                (sender, task)
             } else {
                 let (sender, conn) =
                     hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
                         .await
                         .expect("hyper h2 handshake");
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let _ = conn.await;
                 });
-                sender
+                (sender, task)
             };
 
             // 16 concurrent streams + ~1.5 MiB body + trailers + SendFile.
@@ -571,8 +571,11 @@ where
                 assert_eq!(fs_bytes.as_ref(), cjk_payload(512).as_slice());
             }
 
-            // Trigger graceful two-phase GOAWAY on the server.
+            // Trigger graceful two-phase GOAWAY on the server and wait for hyper's
+            // client connection to answer the RTT PING and drain cleanly.
             shutdown_tx.close();
+            drop(sender);
+            let _ = conn_task.await;
             done_tx.send_blocking(()).expect("signal done");
         });
     });
@@ -585,6 +588,66 @@ where
     .await;
 }
 
+async fn run_abrupt_tls_idle_drop_check<I>(io: &I, pki: &TestPki)
+where
+    I: Dial + Listen + Timer + Clone + 'static,
+{
+    let listener = io.bind_tcp(loopback()).expect("bind abrupt tls");
+    let port = listener.local_addr().expect("local addr").port();
+    let acceptor = tls_acceptor(pki);
+    let srv_io = io.clone();
+    let server = async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let tls = acceptor.accept(stream, &srv_io).await.expect("tls accept");
+        ServerConnection::from_stream(tls, srv_io, ServerConfig::default())
+            .serve(&(|req: Request| async move { Response::new(req.into_body()) }))
+            .await
+            .expect("idle TLS drop without close_notify must close cleanly");
+    };
+
+    let client_tls = Arc::clone(&pki.client_rustls);
+    let (done_tx, done_rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("abrupt tls runtime");
+        rt.block_on(async move {
+            let tcp = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                .await
+                .expect("connect");
+            let connector = tokio_rustls::TlsConnector::from(client_tls);
+            let name = "localhost".try_into().expect("sni");
+            let tls = connector.connect(name, tcp).await.expect("tls connect");
+            let (mut sender, conn) =
+                hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                    .await
+                    .expect("handshake");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let req = http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("https://localhost:{port}/echo"))
+                .body(http_body_util::Full::new(Bytes::from(CJK[1])))
+                .expect("req");
+            let resp = sender.send_request(req).await.expect("send");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let out = resp.into_body().collect().await.expect("body").to_bytes();
+            assert_eq!(out.as_ref(), CJK[1].as_bytes());
+            // Exit `block_on` immediately without `close_notify` or `GOAWAY`!
+        });
+        done_tx.send_blocking(()).expect("done");
+    });
+
+    let ((), ()) = within(
+        io,
+        Duration::from_secs(15),
+        zip(server, async { done_rx.recv().await.expect("recv done") }),
+    )
+    .await;
+}
+
 #[test]
 fn server_interop_with_hyper_on_compio_and_tokio() {
     let pki = pki();
@@ -592,10 +655,12 @@ fn server_interop_with_hyper_on_compio_and_tokio() {
     on_compio(|io| async move {
         run_server_suite(&io, &pki_compio, false).await;
         run_server_suite(&io, &pki_compio, true).await;
+        run_abrupt_tls_idle_drop_check(&io, &pki_compio).await;
     });
     on_tokio(|io| async move {
         run_server_suite(&io, &pki, false).await;
         run_server_suite(&io, &pki, true).await;
+        run_abrupt_tls_idle_drop_check(&io, &pki).await;
     });
 }
 

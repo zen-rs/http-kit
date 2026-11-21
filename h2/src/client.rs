@@ -539,11 +539,23 @@ where
                 Wake::Read(Err(error)) => {
                     let clean_goaway =
                         proto.is_closing() && recv_slot.as_ref().is_some_and(|r| r.buf.is_empty());
+                    let clean_idle = matches!(
+                        &error,
+                        Error::Io(io_err)
+                            if matches!(
+                                io_err.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                            )
+                    ) && recv_slot.as_ref().is_some_and(|r| r.buf.is_empty())
+                        && streams.is_empty()
+                        && outgoing.is_empty()
+                        && proto.on_eof(true).is_ok();
                     let has_complete = streams.values().any(|s| {
                         s.respond.is_none()
                             && s.recv_body.as_ref().is_some_and(RecvStream::has_end_stream)
                     });
-                    if clean_goaway || has_complete {
+                    if clean_goaway || clean_idle || has_complete {
                         peer_eof = true;
                         accepting = false;
                         exchanges.close();
@@ -556,7 +568,7 @@ where
                         }
                         settle_peer_disconnect(
                             close_err,
-                            clean_goaway,
+                            clean_goaway || clean_idle,
                             &mut streams,
                             &mut outgoing,
                             &mut eof_error,
