@@ -25,13 +25,24 @@ fn find_http2_curl() -> Option<(PathBuf, bool)> {
             }
         }
     }
-    let default = PathBuf::from("curl");
-    if let Some(schannel) = probe_http2_curl(&default) {
-        return Some((default, schannel));
+    let candidates: &[&str] = &[
+        "curl",
+        #[cfg(windows)]
+        r"C:\Program Files\Git\mingw64\bin\curl.exe",
+        #[cfg(windows)]
+        r"C:\Program Files\Git\usr\bin\curl.exe",
+        #[cfg(windows)]
+        r"C:\Windows\System32\curl.exe",
+    ];
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if let Some(schannel) = probe_http2_curl(&path) {
+            return Some((path, schannel));
+        }
     }
     assert!(
-        std::env::var_os("CI").is_none(),
-        "CI requires an HTTP/2-capable curl binary"
+        !(cfg!(target_os = "linux") && std::env::var_os("CI").is_some()),
+        "Linux CI requires an HTTP/2-capable curl binary"
     );
     None
 }
@@ -43,7 +54,8 @@ fn probe_http2_curl(bin: &Path) -> Option<bool> {
         return None;
     }
     let info = String::from_utf8_lossy(&out.stdout);
-    info.contains("HTTP2").then(|| info.contains("Schannel"))
+    let lower = info.to_ascii_lowercase();
+    lower.contains("http2").then(|| lower.contains("schannel"))
 }
 
 fn extract_header<'a>(dumped: &'a str, name: &str) -> Option<&'a str> {
@@ -164,7 +176,14 @@ fn answers_curl_http2_tls_and_prior_knowledge() {
         let (done_tx, done_rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let mut cmd_tls = Command::new(&curl);
-            cmd_tls.args(["--http2", "--silent", "--show-error", "--fail"]);
+            cmd_tls.args([
+                "--http2",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "30",
+            ]);
             if schannel {
                 // Windows `System32\curl.exe` uses Schannel, which requires
                 // `--ssl-no-revoke` for ephemeral self-signed test CAs with no CRL/OCSP.
@@ -193,6 +212,8 @@ fn answers_curl_http2_tls_and_prior_knowledge() {
                     "--silent",
                     "--show-error",
                     "--fail",
+                    "--max-time",
+                    "30",
                 ])
                 .arg("--header")
                 .arg(format!("@{}", req_hdr_h2c.display()))

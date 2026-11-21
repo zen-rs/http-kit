@@ -272,16 +272,7 @@ where
                 return Ok(());
             }
 
-            // 4. Arm next socket read if idle and peer has not closed.
-            if !peer_eof
-                && !read_task.is_active()
-                && let Some(recv) = recv_slot.take()
-            {
-                let mode = choose_server_read_mode(&proto, &recv, &mut streams);
-                read_task.start(step_read(recv, mode));
-            }
-
-            // 5. Arm earliest timer across protocol, body-idle, and idle keep-alive deadlines.
+            // 4. Arm earliest timer across protocol, body-idle, and idle keep-alive deadlines.
             let idle_deadline =
                 idle_since.and_then(|start| deadline_after(start, config.keep_alive_timeout));
             let next_at = earliest_server_deadline(proto.next_deadline(), idle_deadline, &streams);
@@ -292,7 +283,7 @@ where
                 sleep_at = next_at;
             }
 
-            // 6. Poll every event source together without cancelling active socket I/O.
+            // 5. Poll every event source together without cancelling active socket I/O.
             let wake = poll_fn(|cx| {
                 let mut progressed = false;
 
@@ -360,6 +351,22 @@ where
                     }
                 }
 
+                // Drain any `BodyCommand`s emitted synchronously while `outgoing.poll_ready`
+                // polled an echoed `IncomingBody` (such as parking a `PipeOffer`) before
+                // choosing the next socket read mode.
+                while let Poll::Ready(Some(cmd)) = inbox_rx.as_mut().poll_next(cx) {
+                    commands.push(cmd);
+                    progressed = true;
+                }
+
+                if !commands.is_empty() {
+                    let tick_now = Instant::now();
+                    for cmd in commands.drain(..) {
+                        apply_server_body_command(cmd, tick_now, &mut proto, &mut streams);
+                    }
+                    settle_server_streams(&mut proto, &mut streams, &outgoing);
+                }
+
                 if !failed_outgoing.is_empty() {
                     for (stream_id, error) in failed_outgoing.drain(..) {
                         tracing::debug!(stream = %stream_id.get(), %error, "response body failed");
@@ -375,9 +382,15 @@ where
                     progressed = true;
                 }
 
-                if let Poll::Ready((writer, outbox, result)) = write_task.poll(cx) {
-                    write_slot = Some((writer, outbox));
-                    return Poll::Ready(ServerWake::Write(result));
+                // Arm next socket read after `Service` responses and `outgoing.poll_ready`
+                // have parked any `PipeOffer`s on incoming streams.
+                if !peer_eof
+                    && !read_task.is_active()
+                    && let Some(recv) = recv_slot.take()
+                {
+                    let write_busy = write_task.is_active() && !outgoing.is_empty();
+                    let mode = choose_server_read_mode(&proto, &recv, &mut streams, write_busy);
+                    read_task.start(step_read(recv, mode));
                 }
 
                 if let Poll::Ready((recv, result)) = read_task.poll(cx) {
@@ -385,12 +398,17 @@ where
                     return Poll::Ready(ServerWake::Read(result));
                 }
 
+                if let Poll::Ready((writer, outbox, result)) = write_task.poll(cx) {
+                    write_slot = Some((writer, outbox));
+                    return Poll::Ready(ServerWake::Write(result));
+                }
+
                 if sleep_at.is_some() && sleep.as_mut().poll(cx).is_ready() {
                     sleep_at = None;
                     return Poll::Ready(ServerWake::Timer);
                 }
 
-                if progressed || proto.has_pending_send() {
+                if progressed || (!write_task.is_active() && proto.has_pending_send()) {
                     return Poll::Ready(ServerWake::Activity);
                 }
 
@@ -482,6 +500,7 @@ fn choose_server_read_mode<R: SpliceRead>(
     proto: &ProtoConn<ServerSide>,
     recv: &Recv<R>,
     streams: &mut HashMap<StreamId, ServerStream>,
+    write_busy: bool,
 ) -> ReadMode {
     #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
     {
@@ -502,16 +521,18 @@ fn choose_server_read_mode<R: SpliceRead>(
             && proto.pending_data_run().is_none()
             && recv.buf.len() < 9
             && reader_can_splice(&recv.reader)
-            && streams
-                .values()
-                .any(|s| s.recv_body.as_ref().is_some_and(RecvStream::wants_pipe))
+            && streams.values().any(|s| {
+                s.recv_body
+                    .as_ref()
+                    .is_some_and(|b| b.wants_pipe() || (write_busy && b.may_want_pipe()))
+            })
         {
             return ReadMode::FrameHeader;
         }
     }
     #[cfg(not(all(feature = "pipe", any(target_os = "linux", target_os = "android"))))]
     {
-        let _ = (proto, recv, streams);
+        let _ = (proto, recv, streams, write_busy);
     }
     ReadMode::Normal
 }

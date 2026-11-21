@@ -372,16 +372,7 @@ where
                 };
             }
 
-            // 5. Arm the next socket read when idle and peer has not sent EOF.
-            if !peer_eof
-                && !read_task.is_active()
-                && let Some(recv) = recv_slot.take()
-            {
-                let mode = choose_read_mode(&proto, &recv, &mut streams);
-                read_task.start(step_read(recv, mode));
-            }
-
-            // 6. Arm the earliest timer across protocol and stream deadlines.
+            // 5. Arm the earliest timer across protocol and stream deadlines.
             let next_at = if peer_eof {
                 None
             } else {
@@ -394,7 +385,7 @@ where
                 sleep_at = next_at;
             }
 
-            // 7. Poll every source once per wakeup without cancelling active I/O.
+            // 6. Poll every source once per wakeup without cancelling active I/O.
             let wake = poll_fn(|cx| {
                 let mut progressed = false;
 
@@ -455,11 +446,40 @@ where
                     }
                 }
 
+                while let Poll::Ready(Some(cmd)) = inbox_rx.as_mut().poll_next(cx) {
+                    commands.push(cmd);
+                    progressed = true;
+                }
+
+                if !commands.is_empty() {
+                    let tick_now = Instant::now();
+                    for cmd in commands.drain(..) {
+                        apply_body_command(
+                            cmd,
+                            tick_now,
+                            write_dead,
+                            &mut proto,
+                            &mut streams,
+                            &mut outgoing,
+                        );
+                    }
+                }
+
                 if !failed_outgoing.is_empty() {
                     for (stream_id, error) in failed_outgoing.drain(..) {
                         fail_client_stream(stream_id, error, false, &mut streams, &mut outgoing);
                     }
                     progressed = true;
+                }
+
+                // Arm the next socket read after outgoing body polls have parked any `PipeOffer`s.
+                if !peer_eof
+                    && !read_task.is_active()
+                    && let Some(recv) = recv_slot.take()
+                {
+                    let write_busy = write_task.is_active() && !outgoing.is_empty();
+                    let mode = choose_read_mode(&proto, &recv, &mut streams, write_busy);
+                    read_task.start(step_read(recv, mode));
                 }
 
                 // Poll `read_task` ahead of `write_task` so frames sent by a closing peer
@@ -479,7 +499,9 @@ where
                     return Poll::Ready(Wake::Timer);
                 }
 
-                if progressed || (!write_dead && proto.has_pending_send()) {
+                if progressed
+                    || (!write_dead && !write_task.is_active() && proto.has_pending_send())
+                {
                     return Poll::Ready(Wake::Activity);
                 }
 
@@ -595,6 +617,7 @@ fn choose_read_mode<R: SpliceRead>(
     proto: &ProtoConn<ClientSide>,
     recv: &Recv<R>,
     streams: &mut HashMap<StreamId, ClientStream>,
+    write_busy: bool,
 ) -> ReadMode {
     #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
     {
@@ -615,16 +638,18 @@ fn choose_read_mode<R: SpliceRead>(
             && proto.pending_data_run().is_none()
             && recv.buf.len() < 9
             && reader_can_splice(&recv.reader)
-            && streams
-                .values()
-                .any(|s| s.recv_body.as_ref().is_some_and(RecvStream::wants_pipe))
+            && streams.values().any(|s| {
+                s.recv_body
+                    .as_ref()
+                    .is_some_and(|b| b.wants_pipe() || (write_busy && b.may_want_pipe()))
+            })
         {
             return ReadMode::FrameHeader;
         }
     }
     #[cfg(not(all(feature = "pipe", any(target_os = "linux", target_os = "android"))))]
     {
-        let _ = (proto, recv, streams);
+        let _ = (proto, recv, streams, write_busy);
     }
     ReadMode::Normal
 }

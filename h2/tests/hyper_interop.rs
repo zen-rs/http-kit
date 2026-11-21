@@ -1244,3 +1244,126 @@ fn linux_pipe_splice_echoes_zero_copy() {
         );
     });
 }
+
+/// Regression test simulating completion-based (`io_uring` / IOCP) socket writes
+/// where every `write_all_owned` yields `Poll::Pending` until the reactor wakes
+/// a timer, while incoming `SETTINGS`, `PING`, `HEADERS`, and `WINDOW_UPDATE`
+/// frames queue new control bytes onto `proto.control_buf` mid-write.
+#[test]
+fn async_completion_writes_never_spin_driver() {
+    use http_kit_io::{BufResult, IoBuf, IoVectoredBuf, SendFile, SpliceWrite, Split, Write};
+
+    struct AsyncDelayWrite<W, T> {
+        inner: W,
+        timer: T,
+    }
+
+    impl<W: Write, T: Timer> Write for AsyncDelayWrite<W, T> {
+        async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+            self.timer.sleep(Duration::from_millis(1)).await;
+            self.inner.write(buf).await
+        }
+        async fn write_vectored<B: IoVectoredBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+            self.timer.sleep(Duration::from_millis(1)).await;
+            self.inner.write_vectored(buf).await
+        }
+        async fn write_all_owned<B: IoVectoredBuf>(&mut self, buf: B) -> BufResult<(), Option<B>> {
+            self.timer.sleep(Duration::from_millis(1)).await;
+            self.inner.write_all_owned(buf).await
+        }
+        async fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush().await
+        }
+        async fn shutdown(&mut self) -> std::io::Result<()> {
+            self.inner.shutdown().await
+        }
+    }
+
+    impl<W: SendFile, T: Timer> SendFile for AsyncDelayWrite<W, T> {
+        fn send_file<F: std::borrow::Borrow<std::fs::File> + 'static>(
+            &mut self,
+            file: F,
+            offset: u64,
+            len: usize,
+        ) -> impl std::future::Future<Output = BufResult<usize, F>> {
+            self.inner.send_file(file, offset, len)
+        }
+    }
+
+    impl<W: SpliceWrite, T: Timer> SpliceWrite for AsyncDelayWrite<W, T> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fn can_splice(&self) -> bool {
+            self.inner.can_splice()
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fn splice_from_pipe(
+            &mut self,
+            filled: http_kit_io::splice::FilledPipe,
+        ) -> impl std::future::Future<Output = std::io::Result<http_kit_io::splice::Pipe>> {
+            self.inner.splice_from_pipe(filled)
+        }
+    }
+
+    on_compio(|io| async move {
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server_io = io.clone();
+        let server = async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (r, w) = stream.split();
+            let delayed_w = AsyncDelayWrite {
+                inner: w,
+                timer: server_io.clone(),
+            };
+            let echo = |req: Request| async move { Response::new(req.into_body()) };
+            ServerConnection::new(r, delayed_w, server_io, ServerConfig::default())
+                .serve(&echo)
+                .await
+                .expect("serve delayed writes");
+        };
+
+        let payload = Bytes::from(cjk_payload(512));
+        let client_io = io.clone();
+        let client = async move {
+            let stream = client_io.connect(addr).await.expect("connect");
+            let (r, w) = stream.split();
+            let delayed_w = AsyncDelayWrite {
+                inner: w,
+                timer: client_io.clone(),
+            };
+            let mut cli_cfg = ClientConfig::default();
+            cli_cfg.keep_alive_interval = Some(Duration::from_millis(5));
+            let (send, conn) = http_kit_h2::handshake(r, delayed_w, client_io, cli_cfg);
+            let ex = async move {
+                let mut tasks = Vec::new();
+                for i in 0..4usize {
+                    let s = send.clone();
+                    let body = payload.clone();
+                    tasks.push(async move {
+                        let mut req = Request::new(Body::from_bytes(body.clone()));
+                        *req.method_mut() = Method::POST;
+                        *req.uri_mut() = format!("http://{addr}/delayed/{i}").parse().unwrap();
+                        let resp = s.send(req).await.expect("send delayed");
+                        assert_eq!(resp.status(), StatusCode::OK);
+                        let got = resp.into_body().into_bytes().await.expect("body");
+                        assert_eq!(got, body);
+                    });
+                }
+                drop(send);
+                let mut it = tasks.into_iter();
+                let (t0, t1, t2, t3) = (
+                    it.next().unwrap(),
+                    it.next().unwrap(),
+                    it.next().unwrap(),
+                    it.next().unwrap(),
+                );
+                zip(zip(t0, t1), zip(t2, t3)).await;
+            };
+            let (ran, _) = zip(conn.run(), ex).await;
+            ran.expect("client delayed run");
+        };
+
+        within(&io, Duration::from_secs(15), zip(server, client)).await;
+    });
+}

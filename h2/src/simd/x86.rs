@@ -116,17 +116,15 @@ unsafe fn check_lut_256(
     mask_0f: __m256i,
     zero: __m256i,
 ) -> bool {
-    // SAFETY: Register-only AVX2 operations; note `_mm256_shuffle_epi8` zeroes
-    // any lane whose index has bit 7 set, so masking `hi` with `0x0F` ensures
-    // `hi` is in `0..=15` (`8..=15` maps to `0` in `HI_BIT_LUT`).
-    unsafe {
-        let lo = _mm256_and_si256(chunk, mask_0f);
-        let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(chunk), mask_0f);
-        let allowed = _mm256_shuffle_epi8(lo_tbl, lo);
-        let bit = _mm256_shuffle_epi8(hi_tbl, hi);
-        let invalid = _mm256_cmpeq_epi8(_mm256_and_si256(allowed, bit), zero);
-        _mm256_movemask_epi8(invalid) == 0
-    }
+    // `_mm256_shuffle_epi8` zeroes any lane whose index has bit 7 set, so
+    // masking `hi` with `0x0F` keeps `hi` in `0..=15` (`8..=15` maps to `0`
+    // in `HI_BIT_LUT`).
+    let lo = _mm256_and_si256(chunk, mask_0f);
+    let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(chunk), mask_0f);
+    let allowed = _mm256_shuffle_epi8(lo_tbl, lo);
+    let bit = _mm256_shuffle_epi8(hi_tbl, hi);
+    let invalid = _mm256_cmpeq_epi8(_mm256_and_si256(allowed, bit), zero);
+    _mm256_movemask_epi8(invalid) == 0
 }
 
 #[target_feature(enable = "sse4.2")]
@@ -182,15 +180,12 @@ unsafe fn check_lut_128(
     mask_0f: __m128i,
     zero: __m128i,
 ) -> bool {
-    // SAFETY: Register-only SSSE3/SSE2 operations.
-    unsafe {
-        let lo = _mm_and_si128(chunk, mask_0f);
-        let hi = _mm_and_si128(_mm_srli_epi16::<4>(chunk), mask_0f);
-        let allowed = _mm_shuffle_epi8(lo_tbl, lo);
-        let bit = _mm_shuffle_epi8(hi_tbl, hi);
-        let invalid = _mm_cmpeq_epi8(_mm_and_si128(allowed, bit), zero);
-        _mm_movemask_epi8(invalid) == 0
-    }
+    let lo = _mm_and_si128(chunk, mask_0f);
+    let hi = _mm_and_si128(_mm_srli_epi16::<4>(chunk), mask_0f);
+    let allowed = _mm_shuffle_epi8(lo_tbl, lo);
+    let bit = _mm_shuffle_epi8(hi_tbl, hi);
+    let invalid = _mm_cmpeq_epi8(_mm_and_si128(allowed, bit), zero);
+    _mm_movemask_epi8(invalid) == 0
 }
 
 #[target_feature(enable = "avx2")]
@@ -202,15 +197,12 @@ unsafe fn validate_value_avx2(bytes: &[u8]) -> bool {
     }
     let ptr = bytes.as_ptr();
 
-    // SAFETY: Register-only splats.
-    let (neg1, v20, v09, v7f) = unsafe {
-        (
-            _mm256_set1_epi8(-1),
-            _mm256_set1_epi8(0x20),
-            _mm256_set1_epi8(0x09),
-            _mm256_set1_epi8(0x7F),
-        )
-    };
+    let (neg1, v20, v09, v7f) = (
+        _mm256_set1_epi8(-1),
+        _mm256_set1_epi8(0x20),
+        _mm256_set1_epi8(0x09),
+        _mm256_set1_epi8(0x7F),
+    );
 
     let mut offset = 0usize;
     while offset + 32 <= len {
@@ -245,19 +237,17 @@ unsafe fn check_value_256(
     v09: __m256i,
     v7f: __m256i,
 ) -> bool {
-    // SAFETY: Register-only signed `i8` comparisons: `(chunk > -1) & (0x20 > chunk)`
-    // selects `0x00..=0x1F` exclusively while leaving `0x80..=0xFF` (`-128..=-1`)
+    // Signed `i8` comparisons: `(chunk > -1) & (0x20 > chunk)` selects
+    // `0x00..=0x1F` exclusively while leaving `0x80..=0xFF` (`-128..=-1`)
     // untouched.
-    unsafe {
-        let non_neg = _mm256_cmpgt_epi8(chunk, neg1);
-        let lt_20 = _mm256_cmpgt_epi8(v20, chunk);
-        let ctl = _mm256_and_si256(non_neg, lt_20);
-        let is_09 = _mm256_cmpeq_epi8(chunk, v09);
-        let bad_ctl = _mm256_andnot_si256(is_09, ctl);
-        let is_7f = _mm256_cmpeq_epi8(chunk, v7f);
-        let bad = _mm256_or_si256(bad_ctl, is_7f);
-        _mm256_movemask_epi8(bad) == 0
-    }
+    let non_neg = _mm256_cmpgt_epi8(chunk, neg1);
+    let lt_20 = _mm256_cmpgt_epi8(v20, chunk);
+    let ctl = _mm256_and_si256(non_neg, lt_20);
+    let is_09 = _mm256_cmpeq_epi8(chunk, v09);
+    let bad_ctl = _mm256_andnot_si256(is_09, ctl);
+    let is_7f = _mm256_cmpeq_epi8(chunk, v7f);
+    let bad = _mm256_or_si256(bad_ctl, is_7f);
+    _mm256_movemask_epi8(bad) == 0
 }
 
 #[target_feature(enable = "sse4.2")]
@@ -268,15 +258,12 @@ unsafe fn validate_value_sse42(bytes: &[u8]) -> bool {
     }
     let ptr = bytes.as_ptr();
 
-    // SAFETY: Register-only splats.
-    let (neg1, v20, v09, v7f) = unsafe {
-        (
-            _mm_set1_epi8(-1),
-            _mm_set1_epi8(0x20),
-            _mm_set1_epi8(0x09),
-            _mm_set1_epi8(0x7F),
-        )
-    };
+    let (neg1, v20, v09, v7f) = (
+        _mm_set1_epi8(-1),
+        _mm_set1_epi8(0x20),
+        _mm_set1_epi8(0x09),
+        _mm_set1_epi8(0x7F),
+    );
 
     let mut offset = 0usize;
     while offset + 16 <= len {
@@ -312,15 +299,12 @@ unsafe fn check_value_128(
     v09: __m128i,
     v7f: __m128i,
 ) -> bool {
-    // SAFETY: Register-only SSE2 operations.
-    unsafe {
-        let non_neg = _mm_cmpgt_epi8(chunk, neg1);
-        let lt_20 = _mm_cmpgt_epi8(v20, chunk);
-        let ctl = _mm_and_si128(non_neg, lt_20);
-        let is_09 = _mm_cmpeq_epi8(chunk, v09);
-        let bad_ctl = _mm_andnot_si128(is_09, ctl);
-        let is_7f = _mm_cmpeq_epi8(chunk, v7f);
-        let bad = _mm_or_si128(bad_ctl, is_7f);
-        _mm_movemask_epi8(bad) == 0
-    }
+    let non_neg = _mm_cmpgt_epi8(chunk, neg1);
+    let lt_20 = _mm_cmpgt_epi8(v20, chunk);
+    let ctl = _mm_and_si128(non_neg, lt_20);
+    let is_09 = _mm_cmpeq_epi8(chunk, v09);
+    let bad_ctl = _mm_andnot_si128(is_09, ctl);
+    let is_7f = _mm_cmpeq_epi8(chunk, v7f);
+    let bad = _mm_or_si128(bad_ctl, is_7f);
+    _mm_movemask_epi8(bad) == 0
 }

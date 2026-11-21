@@ -115,6 +115,13 @@ impl RecvStream {
         !self.done && self.queue.is_empty() && matches!(self.demand, Some(Some(_)))
     }
 
+    /// Whether this stream has not yet parked a non-pipe demand and may offer a
+    /// pipe as soon as an in-flight write returns the connection's pipe.
+    #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn may_want_pipe(&self) -> bool {
+        !self.done && self.queue.is_empty() && self.demand.is_none()
+    }
+
     /// Takes the waiting [`PipeOffer`] to perform a socket-to-pipe splice.
     #[cfg(all(feature = "pipe", any(target_os = "linux", target_os = "android")))]
     pub(crate) fn take_pipe_offer(&mut self) -> Option<PipeOffer> {
