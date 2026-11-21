@@ -590,7 +590,8 @@ where
 
 async fn run_abrupt_tls_idle_drop_check<I>(io: &I, pki: &TestPki)
 where
-    I: Dial + Listen + Timer + Clone + 'static,
+    I: Listen + Timer + Clone + 'static,
+    <I::Listener as http_kit_io::Listener>::Stream: http_kit_tls::Transport + StreamSocket,
 {
     let listener = io.bind_tcp(loopback()).expect("bind abrupt tls");
     let port = listener.local_addr().expect("local addr").port();
