@@ -18,6 +18,7 @@ use std::{
 };
 
 use async_channel::Sender;
+use bytes::BytesMut;
 use futures_lite::Stream as _;
 use http::{HeaderValue, Method, StatusCode, response};
 use http_kit::{Body, Request, Response};
@@ -79,8 +80,25 @@ where
 {
     /// Creates an HTTP/2 server connection over split read and write halves.
     pub fn new(reader: R, writer: W, timer: T, config: ServerConfig) -> Self {
+        Self::with_read_buf(reader, writer, BytesMut::new(), timer, config)
+    }
+
+    /// Creates an HTTP/2 server connection over split read and write halves,
+    /// seeded with opening bytes already read from `reader` into `read_buf`
+    /// (such as a sniffed 24-byte client connection preface).
+    ///
+    /// Buffered bytes are parsed before reading further from `reader`, leaving
+    /// `reader` untouched for owned-buffer reads and `DATA` frame splicing once
+    /// `read_buf` drains.
+    pub fn with_read_buf(
+        reader: R,
+        writer: W,
+        read_buf: BytesMut,
+        timer: T,
+        config: ServerConfig,
+    ) -> Self {
         Self {
-            recv: Recv::new(reader, config.read_buffer_size),
+            recv: Recv::with_buf(reader, read_buf, config.read_buffer_size),
             writer,
             timer,
             config,
@@ -93,8 +111,22 @@ where
     where
         S: Split<ReadHalf = R, WriteHalf = W>,
     {
+        Self::from_stream_with_read_buf(stream, BytesMut::new(), timer, config)
+    }
+
+    /// [`from_stream`](Self::from_stream) seeded with opening bytes already
+    /// read from `stream` into `read_buf`.
+    pub fn from_stream_with_read_buf<S>(
+        stream: S,
+        read_buf: BytesMut,
+        timer: T,
+        config: ServerConfig,
+    ) -> Self
+    where
+        S: Split<ReadHalf = R, WriteHalf = W>,
+    {
         let (reader, writer) = stream.split();
-        Self::new(reader, writer, timer, config)
+        Self::with_read_buf(reader, writer, read_buf, timer, config)
     }
 
     /// Serves HTTP/2 requests until the peer closes the connection or a fatal

@@ -96,6 +96,7 @@ pub use crate::{
     config::{ClientConfig, FlowControlConfig, Limits, ServerConfig},
     error::{Error, Malformed, Reason, Timeout, TrySendError},
     fields::{InvalidProtocol, Protocol},
+    frame::CLIENT_PREFACE,
     proto::StreamId,
     server::{ServerConnection, Service},
 };

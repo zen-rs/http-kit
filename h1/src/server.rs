@@ -116,8 +116,25 @@ where
     /// A connection over a socket's read and write halves, with its
     /// deadlines (see [`ServerConfig`]) driven by `timer`.
     pub fn new(reader: R, writer: W, timer: T, config: ServerConfig) -> Self {
+        Self::with_read_buf(reader, writer, BytesMut::new(), timer, config)
+    }
+
+    /// A connection over a socket's read and write halves whose opening
+    /// bytes were already read into `read_buf` (for example while sniffing a
+    /// protocol preface).
+    ///
+    /// Those bytes are parsed ahead of reading further from `reader`, leaving
+    /// `reader` untouched for zero-copy body reads and splicing once `read_buf`
+    /// drains.
+    pub fn with_read_buf(
+        reader: R,
+        writer: W,
+        read_buf: BytesMut,
+        timer: T,
+        config: ServerConfig,
+    ) -> Self {
         Self {
-            recv: Recv::new(reader, config.read_buffer_size),
+            recv: Recv::with_buf(reader, read_buf, config.read_buffer_size),
             writer,
             timer,
             config,
@@ -434,8 +451,22 @@ where
     where
         S: Split<ReadHalf = R, WriteHalf = W>,
     {
+        Self::from_stream_with_read_buf(stream, BytesMut::new(), timer, config)
+    }
+
+    /// [`from_stream`](Self::from_stream) seeded with opening bytes already
+    /// read from `stream` into `read_buf`.
+    pub fn from_stream_with_read_buf<S>(
+        stream: S,
+        read_buf: BytesMut,
+        timer: T,
+        config: ServerConfig,
+    ) -> Self
+    where
+        S: Split<ReadHalf = R, WriteHalf = W>,
+    {
         let (reader, writer) = stream.split();
-        Self::new(reader, writer, timer, config)
+        Self::with_read_buf(reader, writer, read_buf, timer, config)
     }
 }
 

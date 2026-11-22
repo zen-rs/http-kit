@@ -1433,3 +1433,59 @@ fn async_completion_writes_never_spin_driver() {
         within(&io, Duration::from_secs(15), zip(server, client)).await;
     });
 }
+
+#[test]
+fn seeded_read_buf_serves_after_preface_sniff_on_compio() {
+    on_compio(|io| async move {
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server_io = io.clone();
+        let server = async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut prefix = bytes::BytesMut::with_capacity(24);
+            while prefix.len() < http_kit_h2::CLIENT_PREFACE.len() {
+                use http_kit_io::{IntoInner as _, IoBuf as _, Read as _};
+                let len = prefix.len();
+                let rem = http_kit_h2::CLIENT_PREFACE.len() - len;
+                prefix.reserve(rem);
+                let http_kit_io::BufResult(res, slice) =
+                    stream.read(prefix.slice(len..len + rem)).await;
+                prefix = slice.into_inner();
+                assert!(res.expect("sniff read") > 0, "unexpected EOF during sniff");
+            }
+            assert_eq!(&prefix[..], http_kit_h2::CLIENT_PREFACE);
+            let echo = |req: Request| async move { Response::new(req.into_body()) };
+            ServerConnection::from_stream_with_read_buf(
+                stream,
+                prefix,
+                server_io,
+                ServerConfig::default(),
+            )
+            .serve(&echo)
+            .await
+            .expect("serve seeded h2c");
+        };
+
+        let payload = Bytes::from(cjk_payload(256));
+        let client_io = io.clone();
+        let client = async move {
+            let stream = client_io.connect(addr).await.expect("connect");
+            let (send, conn) = handshake_stream(stream, client_io, ClientConfig::default());
+            let ex = async move {
+                let mut req = Request::new(Body::from_bytes(payload.clone()));
+                *req.method_mut() = Method::POST;
+                *req.uri_mut() = format!("http://{addr}/sniffed").parse().unwrap();
+                let resp = send.send(req).await.expect("send");
+                assert_eq!(resp.status(), StatusCode::OK);
+                let got = resp.into_body().into_bytes().await.expect("body");
+                assert_eq!(got, payload);
+                drop(send);
+            };
+            let (ran, ()) = zip(conn.run(), ex).await;
+            ran.expect("client run");
+        };
+
+        within(&io, Duration::from_secs(10), zip(server, client)).await;
+    });
+}
