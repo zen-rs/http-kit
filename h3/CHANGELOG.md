@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/zen-rs/http-kit/compare/h3/v0.6.2...h3/v0.6.3) - 2026-11-22
+
+### Fixed
+
+- *(h3)* point quiche at ERR_error_string_n return-type fix
+
+### Other
+
+- replace the cargo-machete job with cargo::unused_dependencies
+- depend on compio from the lexoliu/compio skyzen branch
+
 ## [0.6.2](https://github.com/zen-rs/http-kit/compare/h3/v0.6.1...h3/v0.6.2) - 2026-11-11
 
 ### Other

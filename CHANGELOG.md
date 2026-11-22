@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3](https://github.com/zen-rs/http-kit/compare/v0.8.2...v0.8.3) - 2026-11-22
+
+### Added
+
+- seed h1 and h2 ServerConnection with pre-read prefix bytes
+- support no_std + alloc in http-kit and http-kit-h1 proto
+- *(h2)* add owned-buffer I/O driver, client/server API, and conformance suites
+
+### Fixed
+
+- base http no_std patch branch on released v1.5.0 tag
+- *(h2)* treat post-handshake idle TLS disconnects without close_notify as clean EOF
+- *(h2)* prevent pending-write poll spin, order pipe splice reads, and fix x86/Windows CI
+- *(h2)* tighten stream teardown, HPACK size updates, and target gates
+
+### Other
+
+- Move http-body-util to dev-dependencies: only test and doc-test code uses it
+- replace the cargo-machete job with cargo::unused_dependencies
+- *(h2)* add Linux kTLS Transport bound on abrupt TLS drop helper
+- Merge remote-tracking branch 'origin/main' into feat/http-kit-h2
+
 ## [0.8.2](https://github.com/zen-rs/http-kit/compare/v0.8.1...v0.8.2) - 2026-11-11
 
 ### Other

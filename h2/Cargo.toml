@@ -20,8 +20,8 @@ fs = ["http-kit/fs"]
 pipe = ["http-kit/pipe"]
 
 [dependencies]
-http-kit = { version = "0.8.2", path = "..", default-features = false, features = ["std"] }
-http-kit-io = { version = "0.6.2", path = "../io" }
+http-kit = { version = "0.8.3", path = "..", default-features = false, features = ["std"] }
+http-kit-io = { version = "0.7.0", path = "../io" }
 http = { version = "1.5.0", default-features = false, features = ["std"] }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
@@ -30,9 +30,9 @@ thiserror = { version = "2.0.21", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-http-kit = { version = "0.8.2", path = "..", default-features = false, features = ["std", "fs"] }
-http-kit-io = { version = "0.6.2", path = "../io", features = ["tokio", "compio"] }
-http-kit-tls = { version = "0.4.2", path = "../tls", features = ["kernel"] }
+http-kit = { version = "0.8.3", path = "..", default-features = false, features = ["std", "fs"] }
+http-kit-io = { version = "0.7.0", path = "../io", features = ["tokio", "compio"] }
+http-kit-tls = { version = "0.4.3", path = "../tls", features = ["kernel"] }
 compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["runtime"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "io-util", "time"] }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
