@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
 //! HTTP/1.1 server and client: a sans-IO protocol core, driven over
 //! owned-buffer I/O.
 //!
@@ -107,26 +109,36 @@
 //! # }
 //! ```
 
+extern crate alloc;
+
+#[cfg(feature = "std")]
 pub mod client;
 pub mod proto;
+#[cfg(feature = "std")]
 pub mod server;
 
+#[cfg(feature = "std")]
 mod body;
 mod config;
+#[cfg(feature = "std")]
 mod conn;
 mod error;
+#[cfg(feature = "std")]
 mod splice;
 
-use std::fmt;
+use core::fmt;
 
 use bytes::Bytes;
 
+#[cfg(feature = "std")]
 pub use crate::{
     client::{ClientOutcome, Connection, SendRequest, TrySendError, handshake, handshake_stream},
+    server::{ServerConnection, ServerOutcome, Service},
+};
+pub use crate::{
     config::{ClientConfig, Limits, ServerConfig},
     error::{Error, ParseError, Timeout},
     proto::RequestTarget,
-    server::{ServerConnection, ServerOutcome, Service},
 };
 
 /// A connection handed over to another protocol after a switch.

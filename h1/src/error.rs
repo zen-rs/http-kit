@@ -1,6 +1,8 @@
 //! Error types.
 
-use std::{io, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
+#[cfg(feature = "std")]
+use std::io;
 
 use http::{StatusCode, Version};
 use http_kit::{BodyError, ReceiveError};
@@ -121,6 +123,7 @@ impl ParseError {
 #[non_exhaustive]
 pub enum Error {
     /// The transport failed.
+    #[cfg(feature = "std")]
     #[error("I/O error: {0}")]
     Io(#[source] Arc<io::Error>),
     /// The peer sent an invalid message.
@@ -203,6 +206,7 @@ pub enum Timeout {
     BodyRead,
 }
 
+#[cfg(feature = "std")]
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         Self::Io(Arc::new(error))
@@ -235,6 +239,7 @@ impl From<Error> for BodyError {
                 detail: parse.framing_detail(),
             }
             .into(),
+            #[cfg(feature = "std")]
             Error::Io(error) => ReceiveError::Connection(error).into(),
             other => Self::Other(Box::new(other)),
         }

@@ -199,13 +199,6 @@ impl From<BodyFrozen> for Error {
     }
 }
 
-#[cfg(not(feature = "std"))]
-impl From<futures_lite::io::Error> for Error {
-    fn from(error: futures_lite::io::Error) -> Self {
-        Self::Other(Box::new(error))
-    }
-}
-
 impl From<core::convert::Infallible> for Error {
     fn from(_: core::convert::Infallible) -> Self {
         unreachable!()

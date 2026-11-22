@@ -1,6 +1,7 @@
 //! Parsing message heads and deciding how their bodies are framed.
 
-use std::{mem::MaybeUninit, ops::Range};
+use alloc::vec::Vec;
+use core::{mem::MaybeUninit, ops::Range};
 
 use bytes::{Bytes, BytesMut};
 use http::{
