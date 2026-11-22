@@ -252,6 +252,8 @@ pub struct Connection<R, W, T> {
     config: ClientConfig,
     /// Queued writes, and the pipe request bodies reuse.
     outbox: Outbox,
+    /// Shared body slot reused across keep-alive exchanges.
+    body_pool: body::BodyPool,
 }
 
 impl<R, W, T> fmt::Debug for Connection<R, W, T> {
@@ -286,6 +288,7 @@ where
             exchanges: Queue(exchanges),
             config,
             outbox: Outbox::default(),
+            body_pool: body::BodyPool::default(),
         },
     )
 }
@@ -411,6 +414,7 @@ where
         };
 
         let recv = &mut self.recv;
+        let body_pool = &mut self.body_pool;
         let receive = async {
             let head = loop {
                 let head = read_head(recv, limits, &method, timer, head_deadline).await?;
@@ -428,8 +432,18 @@ where
             }
             let (response, pump) = match head.body {
                 BodyKind::Empty => (Response::from_parts(head.parts, Body::empty()), None),
+                BodyKind::Length(len)
+                    if usize::try_from(len).is_ok_and(|n| recv.buf.len() >= n) =>
+                {
+                    let n = usize::try_from(len).expect("checked above");
+                    let bytes = recv.buf.split_to(n).freeze();
+                    (
+                        Response::from_parts(head.parts, Body::from_bytes(bytes)),
+                        None,
+                    )
+                }
                 kind => {
-                    let (sender, incoming) = body::channel();
+                    let (sender, incoming) = body_pool.stream();
                     (
                         Response::from_parts(head.parts, Body::from_source(incoming)),
                         Some((sender, BodyDecoder::new(kind))),

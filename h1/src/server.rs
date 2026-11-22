@@ -27,7 +27,9 @@ use http_kit_io::{ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, Timer, Wr
 
 use crate::{
     Error, ParseError, ServerConfig, Timeout, Upgraded, body,
-    conn::{Outbox, Pumped, Recv, deadline_after, pump_body, send_message, until, while_driving},
+    conn::{
+        Outbox, Pumped, Recv, deadline_after, pump_body, send_message, until, while_driving, within,
+    },
     proto::{
         BodyDecoder, BodyKind, RequestHead, RequestInfo, encode_response_head, parse_request_head,
     },
@@ -93,6 +95,8 @@ pub struct ServerConnection<R, W, T> {
     /// Where response heads are encoded; each is split off as `Bytes`, and
     /// the space comes back once those are written and dropped.
     head_buf: BytesMut,
+    /// Shared body slot reused across keep-alive exchanges.
+    body_pool: body::BodyPool,
 }
 
 /// Room reserved for a response head.
@@ -141,6 +145,7 @@ where
             date: DateCache::default(),
             outbox: Outbox::default(),
             head_buf: BytesMut::with_capacity(RESPONSE_HEAD_CAPACITY),
+            body_pool: body::BodyPool::default(),
         }
     }
 
@@ -215,36 +220,44 @@ where
         stopping: &mut bool,
         served: bool,
     ) -> Result<Option<RequestHead>, Error> {
+        if let Some(head) = parse_request_head(&mut self.recv.buf, &self.config.limits)? {
+            tracing::trace!(method = %head.parts.method, uri = %head.parts.uri, "request");
+            return Ok(Some(head));
+        }
         let header_timeout = self.config.header_read_timeout;
         // Waiting idle between keep-alive requests ends the connection
         // normally at its deadline; any other wait is for a head.
-        let (mut deadline, mut idle_wait) = if self.recv.buf.is_empty() && served {
-            (deadline_after(self.config.keep_alive_timeout), true)
-        } else {
-            (deadline_after(header_timeout), false)
-        };
+        let mut idle_wait = self.recv.buf.is_empty() && served;
+        let mut deadline = (!idle_wait && !self.recv.buf.is_empty())
+            .then(|| deadline_after(header_timeout))
+            .flatten();
         loop {
-            if let Some(head) = parse_request_head(&mut self.recv.buf, &self.config.limits)? {
-                tracing::trace!(method = %head.parts.method, uri = %head.parts.uri, "request");
-                return Ok(Some(head));
-            }
             let idle = self.recv.buf.is_empty();
-            let fill = until(&self.timer, deadline, self.recv.fill());
-            let read = if idle && !*stopping {
-                let fill = async { Some(fill.await) };
-                let stop = async {
-                    shutdown.as_mut().await;
-                    None
+            let read = if idle {
+                let timeout = if idle_wait {
+                    self.config.keep_alive_timeout
+                } else {
+                    header_timeout
                 };
-                match or(fill, stop).await {
-                    Some(read) => read,
-                    None => {
-                        *stopping = true;
-                        return Ok(None);
+                let fill = within(&self.timer, timeout, self.recv.fill());
+                if !*stopping {
+                    let fill = async { Some(fill.await) };
+                    let stop = async {
+                        shutdown.as_mut().await;
+                        None
+                    };
+                    match or(fill, stop).await {
+                        Some(read) => read,
+                        None => {
+                            *stopping = true;
+                            return Ok(None);
+                        }
                     }
+                } else {
+                    fill.await
                 }
             } else {
-                fill.await
+                until(&self.timer, deadline, self.recv.fill()).await
             };
             let Some(read) = read else {
                 if idle_wait {
@@ -258,17 +271,22 @@ where
                 return Err(Error::Timeout(Timeout::HeadRead));
             };
             let read = read?;
-            if idle && read > 0 {
-                // The head's own clock starts at its first byte.
-                deadline = deadline_after(header_timeout);
-                idle_wait = false;
-            }
             if read == 0 {
                 return if self.recv.buf.is_empty() {
                     Ok(None)
                 } else {
                     Err(ParseError::Incomplete.into())
                 };
+            }
+            if let Some(head) = parse_request_head(&mut self.recv.buf, &self.config.limits)? {
+                tracing::trace!(method = %head.parts.method, uri = %head.parts.uri, "request");
+                return Ok(Some(head));
+            }
+            if idle {
+                // The head's own clock starts at its first byte when a second
+                // read is needed to finish it.
+                deadline = deadline_after(header_timeout);
+                idle_wait = false;
             }
         }
     }
@@ -279,57 +297,63 @@ where
         head: RequestHead,
         stopping: bool,
     ) -> Result<Next, Error> {
+        enum BodyState<'a> {
+            Empty,
+            Buffered(&'a body::BufferedBody),
+            Stream(&'a Cell<bool>),
+        }
+
+        impl BodyState<'_> {
+            fn is_unread(&self) -> bool {
+                match self {
+                    Self::Empty => false,
+                    Self::Buffered(buffered) => !buffered.was_demanded(),
+                    Self::Stream(demanded) => !demanded.get(),
+                }
+            }
+        }
+
         let info = head.info();
         let limits = &self.config.limits;
         let body_timeout = self.config.body_read_timeout;
         let timer = &self.timer;
         let expect_continue = head.expect_continue && head.body != BodyKind::Empty;
+        let mut buffered_handle = None;
         let (body, pump) = match head.body {
             BodyKind::Empty => (Body::empty(), None),
+            BodyKind::Length(len)
+                if !expect_continue
+                    && usize::try_from(len).is_ok_and(|n| self.recv.buf.len() >= n) =>
+            {
+                let n = usize::try_from(len).expect("checked above");
+                let bytes = self.recv.buf.split_to(n).freeze();
+                let (buffered, incoming) = self.body_pool.buffered(bytes);
+                buffered_handle = Some(buffered);
+                (Body::from_source(incoming), None)
+            }
             kind => {
-                let (sender, incoming) = body::channel();
+                let (sender, incoming) = self.body_pool.stream();
                 (
                     Body::from_source(incoming),
                     Some((sender, BodyDecoder::new(kind))),
                 )
             }
         };
-        let has_body = pump.is_some();
         let request = Request::from_parts(head.parts, body);
 
-        // Whether the body has been asked for, and whether it was read to its end.
+        // Whether a streamed body has been asked for.
         let demanded = Cell::new(false);
+        let body_state = if let Some(buffered) = &buffered_handle {
+            BodyState::Buffered(buffered)
+        } else if pump.is_some() {
+            BodyState::Stream(&demanded)
+        } else {
+            BodyState::Empty
+        };
         // The pump asks for `100 Continue` here, and waits until it was sent
         // or a final response made it moot (the channel closes).
         // Only a request that asked for it gets the channels.
         let handshake = expect_continue.then(ContinueHandshake::new);
-
-        let recv = &mut self.recv;
-        let pump = async {
-            let Some((sender, decoder)) = pump else {
-                return Ok(Pumped::Complete);
-            };
-            let first_read = async {
-                demanded.set(true);
-                if let Some(handshake) = &handshake {
-                    // The responder may already have committed to a final
-                    // response and closed both channels; either way, read.
-                    if handshake.want_continue.send(()).await.is_ok() {
-                        handshake.continued.recv().await.ok();
-                    }
-                }
-            };
-            pump_body(
-                recv,
-                decoder,
-                limits,
-                sender,
-                timer,
-                body_timeout,
-                first_read,
-            )
-            .await
-        };
 
         let writer = &mut self.writer;
         let outbox = &mut self.outbox;
@@ -366,7 +390,7 @@ where
             let (parts, body) = response.into_parts();
             // A body nobody asked for is unread: the connection cannot be
             // reused, since the client may or may not still send it.
-            let unread = has_body && !demanded.get();
+            let unread = body_state.is_unread();
             // The previous head's bytes are gone by now, so this reclaims
             // the connection's allocation instead of making a new one.
             head_buf.clear();
@@ -379,7 +403,7 @@ where
                 date.as_ref(),
                 head_buf,
             )?;
-            if plan.upgrade && has_body && !demanded.get() {
+            if plan.upgrade && unread {
                 return Err(Error::UpgradeBeforeBodyRead);
             }
             outbox.push(head_buf.split().freeze());
@@ -387,12 +411,42 @@ where
             Ok::<_, Error>((plan, parts))
         };
 
-        let (responded, pumped) = while_driving(respond, pump).await;
-        let (plan, parts) = responded?;
-        let complete = match pumped {
-            Some(Ok(Pumped::Complete)) => true,
-            Some(Ok(Pumped::Abandoned)) | None => false,
-            Some(Err(error)) => return Err(error),
+        let (plan, parts, complete) = if let Some((sender, decoder)) = pump {
+            let recv = &mut self.recv;
+            let pump = async {
+                let first_read = async {
+                    demanded.set(true);
+                    if let Some(handshake) = &handshake {
+                        // The responder may already have committed to a final
+                        // response and closed both channels; either way, read.
+                        if handshake.want_continue.send(()).await.is_ok() {
+                            handshake.continued.recv().await.ok();
+                        }
+                    }
+                };
+                pump_body(
+                    recv,
+                    decoder,
+                    limits,
+                    sender,
+                    timer,
+                    body_timeout,
+                    first_read,
+                )
+                .await
+            };
+            let (responded, pumped) = while_driving(respond, pump).await;
+            let (plan, parts) = responded?;
+            let complete = match pumped {
+                Some(Ok(Pumped::Complete)) => true,
+                Some(Ok(Pumped::Abandoned)) | None => false,
+                Some(Err(error)) => return Err(error),
+            };
+            (plan, parts, complete)
+        } else {
+            let (plan, parts) = respond.await?;
+            let complete = !body_state.is_unread();
+            (plan, parts, complete)
         };
         if plan.upgrade {
             if !complete {

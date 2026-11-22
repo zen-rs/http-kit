@@ -118,6 +118,33 @@ pub(crate) async fn until<T: Timer, F: Future>(
     deadline: Option<Instant>,
     future: F,
 ) -> Option<F::Output> {
+    let mut future = pin!(future);
+    if let Some(output) = poll_once(future.as_mut()).await {
+        return Some(output);
+    }
+    let done = async { Some(future.await) };
+    let expired = async {
+        match deadline {
+            Some(deadline) => timer.sleep_until(deadline).await,
+            None => pending().await,
+        }
+        None
+    };
+    or(done, expired).await
+}
+
+/// Runs `future` bounded by `timeout`, computing the deadline and arming the
+/// timer only when `future` does not complete on its first poll.
+pub(crate) async fn within<T: Timer, F: Future>(
+    timer: &T,
+    timeout: Option<Duration>,
+    future: F,
+) -> Option<F::Output> {
+    let mut future = pin!(future);
+    if let Some(output) = poll_once(future.as_mut()).await {
+        return Some(output);
+    }
+    let deadline = deadline_after(timeout);
     let done = async { Some(future.await) };
     let expired = async {
         match deadline {
@@ -159,19 +186,58 @@ impl Outbox {
         self.bufs.len() >= MAX_WRITE_BUFFERS
     }
 
-    /// Writes everything queued. The buffers go to the writer, which may
-    /// keep them until the kernel has sent them (a zero-copy send); a writer
-    /// that hands them back has their allocation reused for the next message.
+    /// Writes everything queued. Small vectored batches go out as fixed-size
+    /// arrays so `self.bufs` keeps its allocation across zero-copy sends that
+    /// hold their buffers until the kernel's notification arrives.
     pub(crate) async fn flush<W: Write>(&mut self, writer: &mut W) -> Result<(), Error> {
-        if self.bufs.is_empty() {
-            return Ok(());
-        }
-        let bufs = mem::take(&mut self.bufs);
-        let BufResult(result, returned) = writer.write_all_owned(bufs).await;
-        if let Some(mut bufs) = returned {
-            bufs.clear();
-            self.bufs = bufs;
-        }
+        let result = match self.bufs.len() {
+            0 => return Ok(()),
+            1 => {
+                let mut drain = self.bufs.drain(..);
+                let batch = [drain.next().expect("checked len")];
+                drop(drain);
+                writer.write_all_owned(batch).await.0
+            }
+            2 => {
+                let mut drain = self.bufs.drain(..);
+                let batch = [
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                ];
+                drop(drain);
+                writer.write_all_owned(batch).await.0
+            }
+            3 => {
+                let mut drain = self.bufs.drain(..);
+                let batch = [
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                ];
+                drop(drain);
+                writer.write_all_owned(batch).await.0
+            }
+            4 => {
+                let mut drain = self.bufs.drain(..);
+                let batch = [
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                ];
+                drop(drain);
+                writer.write_all_owned(batch).await.0
+            }
+            _ => {
+                let bufs = mem::take(&mut self.bufs);
+                let BufResult(result, returned) = writer.write_all_owned(bufs).await;
+                if let Some(mut bufs) = returned {
+                    bufs.clear();
+                    self.bufs = bufs;
+                }
+                result
+            }
+        };
         result.map_err(Error::from)
     }
 }
@@ -374,20 +440,20 @@ pub(crate) async fn pump_body<R: ReadOwned + SpliceRead, T: Timer, F: Future<Out
         {
             Ok(frame) => frame,
             Err(error) => {
-                sender.send(Message::Error(error.clone())).await;
+                sender.send(Message::Error(error.clone()));
                 return Err(error);
             }
         };
         // A send to a dropped body fails; the next demand then reports it.
         if let Some(frame) = frame {
-            sender.send(Message::Frame(frame, offer.take())).await;
+            sender.send(Message::Frame(frame, offer.take()));
         }
         // The end is queued behind the last frame without waiting for a
         // demand: the connection is past the body as soon as it is decoded,
         // however slowly the consumer reads. It carries the offer of a demand
         // the end itself answered.
         if decoder.is_done() {
-            sender.send(Message::End(offer)).await;
+            sender.send(Message::End(offer));
             return Ok(Pumped::Complete);
         }
     }
@@ -421,7 +487,7 @@ async fn next_frame<R: ReadOwned + SpliceRead, T: Timer>(
                 Attempt::End => return Ok(None),
             }
         }
-        let (read, owned) = until(timer, deadline_after(body_idle), recv.receive())
+        let (read, owned) = within(timer, body_idle, recv.receive())
             .await
             .ok_or(Error::Timeout(Timeout::BodyRead))??;
         if let Some(mut bytes) = owned {
