@@ -1,10 +1,10 @@
-#[cfg(feature = "std")]
-extern crate std;
 
 use super::BodyFrozen;
 use alloc::boxed::Box;
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "core-io"))]
 use alloc::sync::Arc;
+#[cfg(any(feature = "std", feature = "core-io"))]
+use crate::io;
 use core::fmt::Display;
 use core::str::Utf8Error;
 
@@ -34,8 +34,8 @@ pub enum Error {
     /// An I/O error occurred during body operations.
     ///
     /// This typically happens when reading from streams, files, or other I/O sources.
-    #[cfg(feature = "std")]
-    Io(std::io::Error),
+    #[cfg(any(feature = "std", feature = "core-io"))]
+    Io(io::Error),
     /// Invalid UTF-8 data was encountered when converting body to string.
     ///
     /// This error occurs when trying to interpret body bytes as UTF-8 text
@@ -102,8 +102,8 @@ pub enum ReceiveError {
     },
     /// The connection failed under the body. The error keeps its kind; on a
     /// TLS connection a TLS-layer failure is `InvalidData`.
-    #[cfg(feature = "std")]
-    Connection(Arc<std::io::Error>),
+    #[cfg(any(feature = "std", feature = "core-io"))]
+    Connection(Arc<io::Error>),
 }
 
 impl Display for ReceiveError {
@@ -118,7 +118,7 @@ impl Display for ReceiveError {
             Self::TooManyTrailers { limit } => {
                 write!(f, "trailer section has more than {limit} fields")
             }
-            #[cfg(feature = "std")]
+            #[cfg(any(feature = "std", feature = "core-io"))]
             Self::Connection(error) => write!(f, "connection failed under the body: {error}"),
         }
     }
@@ -127,7 +127,7 @@ impl Display for ReceiveError {
 impl core::error::Error for ReceiveError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            #[cfg(feature = "std")]
+            #[cfg(any(feature = "std", feature = "core-io"))]
             Self::Connection(error) => Some(&**error),
             _ => None,
         }
@@ -172,9 +172,9 @@ macro_rules! impl_body_error {
     };
 }
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", feature = "core-io"))]
 impl_body_error![
-    (Io, std::io::Error),
+    (Io, io::Error),
     (Utf8, Utf8Error),
     (Receive, ReceiveError),
     (Other, Box<dyn core::error::Error + Send + Sync + 'static>),
@@ -183,7 +183,7 @@ impl_body_error![
     (DeserializeForm, serde_urlencoded::de::Error, "form")
 ];
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(any(feature = "std", feature = "core-io")))]
 impl_body_error![
     (Utf8, Utf8Error),
     (Receive, ReceiveError),
@@ -196,13 +196,6 @@ impl_body_error![
 impl From<BodyFrozen> for Error {
     fn from(_error: BodyFrozen) -> Self {
         Self::BodyFrozen
-    }
-}
-
-#[cfg(not(feature = "std"))]
-impl From<futures_lite::io::Error> for Error {
-    fn from(error: futures_lite::io::Error) -> Self {
-        Self::Other(Box::new(error))
     }
 }
 

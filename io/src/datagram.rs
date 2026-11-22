@@ -8,13 +8,14 @@
 //! send per segment and every receive returns one datagram, so callers write
 //! one code path.
 
-use std::{
+use core::{
     future::Future,
-    io,
     net::{IpAddr, SocketAddr},
     num::NonZeroU16,
     ops::Range,
 };
+
+use crate::io;
 
 use compio_buf::{BufResult, IoBuf, IoBufMut};
 

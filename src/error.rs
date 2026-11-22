@@ -31,14 +31,23 @@ use http::StatusCode;
 ///
 /// Note that this type doesn't implement `HttpError` directly, but also provide `status` method
 /// to get the associated status code.
+#[cfg(feature = "std")]
+use eyre::Report;
+#[cfg(not(feature = "std"))]
+type Report = alloc::boxed::Box<dyn core::error::Error + Send + Sync + 'static>;
+
 #[derive(Debug)]
 pub struct Error {
+    #[cfg(feature = "std")]
     inner: eyre::Report,
+    #[cfg(not(feature = "std"))]
+    inner: alloc::boxed::Box<dyn core::error::Error + Send + Sync>,
     status: StatusCode,
 }
 
 impl Error {
     /// Create a new error with a custom message.
+    #[cfg(feature = "std")]
     pub fn msg(msg: impl Display + Send + Sync + Debug + 'static) -> Self {
         Self {
             inner: eyre::Report::msg(msg),
@@ -46,7 +55,29 @@ impl Error {
         }
     }
 
+    /// Create a new error with a custom message.
+    #[cfg(not(feature = "std"))]
+    pub fn msg(msg: impl Display + Send + Sync + 'static) -> Self {
+        struct M(alloc::string::String);
+        impl core::fmt::Display for M {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                core::fmt::Display::fmt(&self.0, f)
+            }
+        }
+        impl core::fmt::Debug for M {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                core::fmt::Display::fmt(&self.0, f)
+            }
+        }
+        impl core::error::Error for M {}
+        Self {
+            inner: alloc::boxed::Box::new(M(alloc::string::ToString::to_string(&msg))),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
     /// Create a new error from any standard error type.
+    #[cfg(feature = "std")]
     pub fn new(e: impl Into<eyre::Report>) -> Self {
         Self {
             inner: e.into(),
@@ -54,7 +85,23 @@ impl Error {
         }
     }
 
+    /// Create a new error from any standard error type.
+    #[cfg(not(feature = "std"))]
+    pub fn new(e: impl Into<alloc::boxed::Box<dyn core::error::Error + Send + Sync>>) -> Self {
+        Self {
+            inner: e.into(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Consume the error and return the inner error.
+    #[cfg(not(feature = "std"))]
+    pub fn into_inner(self) -> alloc::boxed::Box<dyn core::error::Error + Send + Sync> {
+        self.inner
+    }
+
     /// Consume the error and return the inner `eyre::Report`.
+    #[cfg(feature = "std")]
     pub fn into_inner(self) -> eyre::Report {
         self.inner
     }
@@ -151,7 +198,7 @@ pub trait ResultExt<T> {
 
 impl<T, E> ResultExt<T> for core::result::Result<T, E>
 where
-    E: Into<eyre::Report>,
+    E: Into<Report>,
 {
     fn status(self, status: StatusCode) -> Result<T, Error> {
         self.map_err(|e| Error::new(e).set_status(status))
@@ -171,7 +218,7 @@ pub type BoxHttpError = Box<dyn HttpError>;
 
 impl<E> From<E> for Error
 where
-    E: Into<eyre::Report>,
+    E: Into<Report>,
 {
     fn from(e: E) -> Self {
         Error::new(e)

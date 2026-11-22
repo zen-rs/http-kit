@@ -13,7 +13,7 @@ use std::{
     io,
     ops::Range,
     rc::Rc,
-    time::Instant,
+    time::Duration,
 };
 
 use async_channel::{Receiver, Sender};
@@ -27,7 +27,7 @@ use http_kit_io::{
 pub struct NeverTimer;
 
 impl Timer for NeverTimer {
-    fn sleep_until(&self, _deadline: Instant) -> impl Future<Output = ()> {
+    fn sleep(&self, _duration: Duration) -> impl Future<Output = ()> {
         pending()
     }
 }

@@ -1,20 +1,24 @@
 //! The I/O both drivers share: the receive buffer, sending a message, and
 //! pumping a received body to its consumer.
 
-use std::{
+use alloc::vec::Vec;
+use core::{
     future::{Future, pending, poll_fn},
-    io, mem,
+    mem,
     pin::{Pin, pin},
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use http_kit_io::io;
 
 use bytes::{Bytes, BytesMut};
 use futures_lite::future::{or, poll_once};
 use http_kit::{Body, BodyError, BodyFrame, PipeOffer};
+use crate::SendFile;
 use http_kit_io::{
-    BufResult, IntoInner as _, IoBuf as _, ReadOwned, Received, SendFile, SpliceRead, SpliceWrite,
-    Timer, Write,
+    BufResult, IntoInner as _, IoBuf as _, ReadOwned, Received, SpliceRead, SpliceWrite, Timer,
+    Write,
 };
 
 use crate::{
@@ -103,21 +107,49 @@ impl<R: ReadOwned> Recv<R> {
 
 /// The instant `timeout` from now, or `None` when there is no timeout or it
 /// is too long to represent (which is no deadline at all).
-pub(crate) fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
-    Instant::now().checked_add(timeout?)
+
+
+/// A head deadline: `Instant` on `std` so a dribble of bytes cannot
+/// extend it; a per-await `Duration` on no_std, which lacks a monotonic
+/// clock and instead bounds each individual wait.
+#[cfg(feature = "std")]
+pub(crate) type Deadline = std::time::Instant;
+#[cfg(not(feature = "std"))]
+pub(crate) type Deadline = Duration;
+
+/// `timeout` from now as an absolute [`Deadline`]; `None` if there is no
+/// timeout.
+#[cfg(feature = "std")]
+pub(crate) fn deadline_after(timeout: Option<Duration>) -> Option<Deadline> {
+    timeout.map(|d| std::time::Instant::now() + d)
+}
+#[cfg(not(feature = "std"))]
+pub(crate) fn deadline_after(timeout: Option<Duration>) -> Option<Deadline> {
+    timeout
+}
+
+/// The time [`until`] still has: what remains of the deadline on `std`, or
+/// the per-await duration itself on no_std.
+#[cfg(feature = "std")]
+pub(crate) fn remaining(deadline: Option<Deadline>) -> Option<Duration> {
+    deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()))
+}
+#[cfg(not(feature = "std"))]
+pub(crate) fn remaining(deadline: Option<Deadline>) -> Option<Duration> {
+    deadline
 }
 
 /// Runs `future` until `deadline`; `None` if the deadline came first. A
 /// future that is ready at the same time as its deadline wins.
 pub(crate) async fn until<T: Timer, F: Future>(
     timer: &T,
-    deadline: Option<Instant>,
+    timeout: Option<Duration>,
     future: F,
 ) -> Option<F::Output> {
     let done = async { Some(future.await) };
     let expired = async {
-        match deadline {
-            Some(deadline) => timer.sleep_until(deadline).await,
+        match timeout {
+            Some(timeout) => timer.sleep(timeout).await,
             None => pending().await,
         }
         None
@@ -417,7 +449,7 @@ async fn next_frame<R: ReadOwned + SpliceRead, T: Timer>(
                 Attempt::End => return Ok(None),
             }
         }
-        let (read, owned) = until(timer, deadline_after(body_idle), recv.receive())
+        let (read, owned) = until(timer, body_idle, recv.receive())
             .await
             .ok_or(Error::Timeout(Timeout::BodyRead))??;
         if let Some(mut bytes) = owned {
@@ -471,7 +503,7 @@ mod owned_receive_tests {
     use super::*;
     use crate::proto::BodyKind;
     use http_kit_io::{IoBufMut, NoBuf, Read};
-    use std::collections::VecDeque;
+    use alloc::collections::VecDeque;
 
     struct Reader(VecDeque<Bytes>);
 
@@ -506,7 +538,7 @@ mod owned_receive_tests {
 
     struct NoTimer;
     impl Timer for NoTimer {
-        async fn sleep_until(&self, _: Instant) {
+        async fn sleep(&self, _: Duration) {
             pending().await
         }
     }

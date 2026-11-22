@@ -1,6 +1,6 @@
 //! Moving a received body's raw bytes from the socket into a pipe.
 
-use std::time::Duration;
+use core::time::Duration;
 
 use http_kit::PipeOffer;
 use http_kit_io::{SpliceRead, Timer};
@@ -40,7 +40,7 @@ pub(crate) async fn try_splice<R: SpliceRead, T: Timer>(
 
     use crate::{
         Timeout,
-        conn::{deadline_after, until},
+        conn::until,
     };
 
     if !recv.buf.is_empty() || !recv.reader.can_splice() {

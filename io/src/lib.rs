@@ -60,14 +60,42 @@
 //! - `tokio` ([`tokio::Tokio`]) and `async-io` ([`async_io::AsyncIo`]):
 //!   readiness reactors adapted to owned buffers. The kernel still reads into
 //!   and writes from the caller's buffer directly; only the wait differs.
+//!
+//! # `no_std`
+//!
+//! With `default-features = false` the crate is `no_std` + `alloc`: the socket
+//! traits stay, while `DialUnix`, `ListenUnix`, `FromStd`, `FromStdUnix`,
+//! `WriteControl`, `SendFile` and the driver implementations — all OS-bound —
+//! go with `std`. Errors then come from [`core::io`], nightly-only until
+//! `core_io_fundamentals` stabilizes (rust-lang/rust#154046), which the
+//! `core-io` feature enables; `std` and `core-io` builds see the same
+//! [`io::Error`] type either way.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(all(not(feature = "std"), feature = "core-io"), feature(core_io))]
+
+#[cfg(all(not(feature = "std"), not(feature = "core-io")))]
+compile_error!(
+    "`http-kit-io` without `std` needs `core-io` for `core::io` (nightly-only \
+     until `core_io_fundamentals` stabilizes)"
+);
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
+pub use std::io;
+#[cfg(not(feature = "std"))]
+pub use core::io;
 
 pub mod datagram;
+#[cfg(feature = "std")]
 pub mod poll;
 pub mod resolve;
 pub mod splice;
 pub mod stream;
 pub mod time;
 
+#[cfg(feature = "std")]
 mod sys;
 
 #[cfg(any(feature = "tokio", feature = "async-io"))]
@@ -80,23 +108,27 @@ pub mod compio;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 
-use std::{future::Future, io, net::SocketAddr};
+use core::{future::Future, net::SocketAddr};
 
 pub use compio_buf::{self, BufResult, IntoInner, IoBuf, IoBufMut, IoVectoredBuf, SetLen};
 
+#[cfg(feature = "std")]
+pub use crate::poll::{CopyingPoll, IntoPoll};
+
 pub use crate::{
     datagram::{DatagramSocket, RecvMeta},
-    poll::{CopyingPoll, IntoPoll},
     resolve::{Answer, Family, Resolve},
     splice::{SpliceRead, SpliceWrite},
     stream::{
-        Listener, NoBuf, Read, ReadAhead, ReadHalf, ReadOwned, Received, SendFile, Split,
-        TcpOptions, Write, WriteHalf,
+        Listener, NoBuf, Read, ReadAhead, ReadOwned, Received, Split, TcpOptions, Write,
     },
     time::Timer,
 };
 
-#[cfg(unix)]
+#[cfg(feature = "std")]
+pub use crate::stream::{ReadHalf, SendFile, WriteHalf};
+
+#[cfg(all(unix, feature = "std"))]
 pub use crate::stream::WriteControl;
 
 /// A connected stream socket: whole for a handshake, split for full-duplex
@@ -104,6 +136,7 @@ pub use crate::stream::WriteControl;
 ///
 /// It is the bound the protocol crates put on the halves of a stream, named
 /// once. It is implemented for every type that meets it.
+#[cfg(feature = "std")]
 pub trait StreamSocket:
     ReadOwned
     + ReadAhead
@@ -113,11 +146,30 @@ pub trait StreamSocket:
 {
 }
 
+#[cfg(feature = "std")]
 impl<S> StreamSocket for S where
     S: ReadOwned
         + ReadAhead
         + Write
         + Split<ReadHalf: ReadOwned + ReadAhead + SpliceRead, WriteHalf: SendFile + SpliceWrite>
+        + 'static
+{
+}
+
+/// [`StreamSocket`], without the `std`-only [`SendFile`] requirement.
+#[cfg(not(feature = "std"))]
+pub trait StreamSocket:
+    ReadOwned + ReadAhead + Write + Split<ReadHalf: ReadOwned + ReadAhead + SpliceRead, WriteHalf: SpliceWrite>
+    + 'static
+{
+}
+
+#[cfg(not(feature = "std"))]
+impl<S> StreamSocket for S where
+    S: ReadOwned
+        + ReadAhead
+        + Write
+        + Split<ReadHalf: ReadOwned + ReadAhead + SpliceRead, WriteHalf: SpliceWrite>
         + 'static
 {
 }
@@ -132,7 +184,7 @@ pub trait Dial {
 }
 
 /// Opens Unix-domain stream connections.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 pub trait DialUnix {
     /// A connected Unix-domain stream socket.
     type UnixConnection: StreamSocket;
@@ -158,7 +210,7 @@ pub trait Listen {
 }
 
 /// Accepts Unix-domain stream connections.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 pub trait ListenUnix {
     /// A listening Unix-domain socket.
     type UnixListener: Listener<Addr = std::os::unix::net::SocketAddr, Stream: StreamSocket>
@@ -190,6 +242,7 @@ pub trait Datagram {
 
 /// Adopts sockets the operating system created and the caller configured
 /// (`SO_REUSEPORT` for one listener per thread, a backlog, ...).
+#[cfg(feature = "std")]
 pub trait FromStd: Listen + Datagram {
     /// Adopts a bound, listening std socket.
     ///
@@ -208,7 +261,7 @@ pub trait FromStd: Listen + Datagram {
 
 /// Adopts Unix-domain sockets the operating system created and the caller
 /// configured.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 pub trait FromStdUnix: ListenUnix {
     /// Adopts a bound, listening std Unix-domain socket, as
     /// [`FromStd::tcp_listener`] adopts a TCP one.

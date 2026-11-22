@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(feature = "core-io", feature(core_io))]
 #![warn(missing_docs, missing_debug_implementations)]
 //! A flexible and ergonomic HTTP toolkit for Rust.
 //!
@@ -42,6 +43,11 @@
 //! - `http_body` - Implementation of http_body traits
 //! - `std` - Enable standard library support (enabled by default)
 extern crate alloc;
+
+#[cfg(feature = "std")]
+pub(crate) use std::io;
+#[cfg(all(not(feature = "std"), feature = "core-io"))]
+pub(crate) use core::io;
 
 #[macro_use]
 mod macros;

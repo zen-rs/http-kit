@@ -1,6 +1,17 @@
 //! Stream sockets.
 
-use std::{borrow::Borrow, fmt, fs::File, future::Future, io, ops::Deref, rc::Rc};
+use core::{future::Future, ops::Deref};
+
+#[cfg(feature = "std")]
+use core::{borrow::Borrow, fmt};
+
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use alloc::rc::Rc;
+
+use crate::io;
+#[cfg(feature = "std")]
+use std::fs::File;
 
 use compio_buf::{BufResult, IntoInner, IoBuf, IoBufMut, IoVectoredBuf};
 
@@ -217,7 +228,7 @@ pub trait Listener {
 /// A protocol the kernel frames takes per-message metadata this way: kernel
 /// TLS, for one, sends a record of a type other than application data when
 /// the record type comes as a `TLS_SET_RECORD_TYPE` control message.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 pub trait WriteControl {
     /// Writes some of `buf`'s initialized bytes with `control`, an encoded
     /// control-message buffer (`cmsghdr`s, as `CMSG_SPACE` lays them out),
@@ -253,6 +264,7 @@ pub trait TcpOptions {
 ///
 /// Which mechanism an implementation uses is stated on its type; where none
 /// exists the region is read into a buffer and written.
+#[cfg(feature = "std")]
 pub trait SendFile {
     /// Sends up to `len` bytes of `file` starting at `offset`, returning how
     /// many were sent. `Ok(0)` for a non-zero `len` means `offset` is at or
@@ -306,6 +318,7 @@ pub trait SendFile {
     }
 }
 
+#[cfg(feature = "std")]
 pub(crate) mod sealed {
     use std::{borrow::Borrow, fs::File, future::Future, io};
 
@@ -367,12 +380,15 @@ pub(crate) mod sealed {
     }
 }
 
+#[cfg(feature = "std")]
 use sealed::SharedStream;
 
 /// [`Write`] over a shared reference to a socket, for the copying paths
 /// that reuse the trait's provided methods.
+#[cfg(feature = "std")]
 pub(crate) struct ByRef<'a, S>(pub(crate) &'a S);
 
+#[cfg(feature = "std")]
 impl<S: SharedStream> Write for ByRef<'_, S> {
     fn write<B: IoBuf>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
         self.0.write(buf)
@@ -538,11 +554,14 @@ pub(crate) fn split_shared<S: SharedStream>(stream: S) -> (ReadHalf<S>, WriteHal
 }
 
 /// The reading half of a split stream.
+#[cfg(feature = "std")]
 pub struct ReadHalf<S>(Rc<S>);
 
 /// The writing half of a split stream.
+#[cfg(feature = "std")]
 pub struct WriteHalf<S>(Rc<S>);
 
+#[cfg(feature = "std")]
 impl<S> ReadHalf<S> {
     /// The stream both halves share.
     #[must_use]
@@ -551,6 +570,7 @@ impl<S> ReadHalf<S> {
     }
 }
 
+#[cfg(feature = "std")]
 impl<S> WriteHalf<S> {
     /// The stream both halves share.
     #[must_use]
@@ -559,38 +579,42 @@ impl<S> WriteHalf<S> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 impl<S: std::os::fd::AsFd> std::os::fd::AsFd for ReadHalf<S> {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.0.as_fd()
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 impl<S: std::os::fd::AsFd> std::os::fd::AsFd for WriteHalf<S> {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.0.as_fd()
     }
 }
 
+#[cfg(feature = "std")]
 impl<S: fmt::Debug> fmt::Debug for ReadHalf<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("ReadHalf").field(&self.0).finish()
     }
 }
 
+#[cfg(feature = "std")]
 impl<S: fmt::Debug> fmt::Debug for WriteHalf<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("WriteHalf").field(&self.0).finish()
     }
 }
 
+#[cfg(feature = "std")]
 impl<S: SharedStream> Read for ReadHalf<S> {
     fn read<B: IoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
         self.0.read(buf)
     }
 }
 
+#[cfg(feature = "std")]
 impl<S: SharedStream> ReadOwned for ReadHalf<S> {
     type Buf = S::Buf;
 
@@ -599,12 +623,14 @@ impl<S: SharedStream> ReadOwned for ReadHalf<S> {
     }
 }
 
+#[cfg(feature = "std")]
 impl<S: SharedStream> ReadAhead for ReadHalf<S> {
     fn stop_read_ahead(&mut self) -> impl Future<Output = Vec<u8>> {
         self.0.stop_read_ahead()
     }
 }
 
+#[cfg(feature = "std")]
 impl<S: SharedStream> Write for WriteHalf<S> {
     fn write<B: IoBuf>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
         self.0.write(buf)
@@ -633,6 +659,7 @@ impl<S: SharedStream> Write for WriteHalf<S> {
     }
 }
 
+#[cfg(feature = "std")]
 impl<S: SharedStream> SendFile for WriteHalf<S> {
     fn send_file<F: Borrow<File> + 'static>(
         &mut self,
@@ -644,6 +671,7 @@ impl<S: SharedStream> SendFile for WriteHalf<S> {
     }
 }
 
+#[cfg(feature = "std")]
 impl<S: SharedStream> crate::splice::SpliceRead for ReadHalf<S> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn can_splice(&self) -> bool {
@@ -661,6 +689,7 @@ impl<S: SharedStream> crate::splice::SpliceRead for ReadHalf<S> {
     }
 }
 
+#[cfg(feature = "std")]
 impl<S: SharedStream> crate::splice::SpliceWrite for WriteHalf<S> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn can_splice(&self) -> bool {
@@ -676,7 +705,7 @@ impl<S: SharedStream> crate::splice::SpliceWrite for WriteHalf<S> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 impl<S: SharedStream> WriteControl for WriteHalf<S> {
     fn write_control<B: IoBuf, C: IoBuf>(
         &mut self,

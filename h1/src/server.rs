@@ -12,22 +12,27 @@
 //! future here is required to be `Send`: a connection lives on the thread
 //! that accepted it.
 
-use std::{
+use core::{
     cell::Cell,
     future::{Future, pending},
     pin::pin,
-    time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(feature = "std")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use futures_lite::future::{or, poll_once};
-use http::{HeaderValue, Method, StatusCode, Version, response};
+#[cfg(feature = "std")]
+use http::HeaderValue;
+use http::{Method, StatusCode, Version, response};
 use http_kit::{Body, Request, Response};
-use http_kit_io::{ReadOwned, SendFile, SpliceRead, SpliceWrite, Split, Timer, Write};
+use crate::SendFile;
+use http_kit_io::{ReadOwned, SpliceRead, SpliceWrite, Split, Timer, Write};
 
 use crate::{
     Error, ParseError, ServerConfig, Timeout, Upgraded, body,
-    conn::{Outbox, Pumped, Recv, deadline_after, pump_body, send_message, until, while_driving},
+    conn::{Deadline, Outbox, Pumped, Recv, deadline_after, pump_body, remaining, send_message, until, while_driving},
     proto::{
         BodyDecoder, BodyKind, RequestHead, RequestInfo, encode_response_head, parse_request_head,
     },
@@ -68,8 +73,8 @@ pub enum ServerOutcome<R, W> {
     },
 }
 
-impl<R, W> std::fmt::Debug for ServerOutcome<R, W> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<R, W> core::fmt::Debug for ServerOutcome<R, W> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Closed => f.write_str("Closed"),
             Self::Upgraded { upgraded, response } => f
@@ -87,6 +92,7 @@ pub struct ServerConnection<R, W, T> {
     writer: W,
     timer: T,
     config: ServerConfig,
+    #[cfg(feature = "std")]
     date: DateCache,
     /// Queued writes, kept so each message reuses the allocation.
     outbox: Outbox,
@@ -98,8 +104,8 @@ pub struct ServerConnection<R, W, T> {
 /// Room reserved for a response head.
 const RESPONSE_HEAD_CAPACITY: usize = 256;
 
-impl<R, W, T> std::fmt::Debug for ServerConnection<R, W, T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<R, W, T> core::fmt::Debug for ServerConnection<R, W, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ServerConnection")
             .field("buffered", &self.recv.buf.len())
             .field("config", &self.config)
@@ -121,6 +127,7 @@ where
             writer,
             timer,
             config,
+            #[cfg(feature = "std")]
             date: DateCache::default(),
             outbox: Outbox::default(),
             head_buf: BytesMut::with_capacity(RESPONSE_HEAD_CAPACITY),
@@ -194,7 +201,7 @@ where
     /// timeout with part of a head received is answered with `408`.
     async fn next_head<F: Future<Output = ()>>(
         &mut self,
-        shutdown: &mut std::pin::Pin<&mut F>,
+        shutdown: &mut core::pin::Pin<&mut F>,
         stopping: &mut bool,
         served: bool,
     ) -> Result<Option<RequestHead>, Error> {
@@ -212,7 +219,7 @@ where
                 return Ok(Some(head));
             }
             let idle = self.recv.buf.is_empty();
-            let fill = until(&self.timer, deadline, self.recv.fill());
+            let fill = until(&self.timer, remaining(deadline), self.recv.fill());
             let read = if idle && !*stopping {
                 let fill = async { Some(fill.await) };
                 let stop = async {
@@ -317,7 +324,10 @@ where
         let writer = &mut self.writer;
         let outbox = &mut self.outbox;
         let head_buf = &mut self.head_buf;
+        #[cfg(feature = "std")]
         let date = self.config.date_header.then(|| self.date.get()).cloned();
+        #[cfg(not(feature = "std"))]
+        let date = None;
         let respond = async {
             let mut call = pin!(service.call(request));
             let response = if let Some(handshake) = &handshake {
@@ -413,7 +423,7 @@ where
     async fn close(mut self) -> Result<ServerOutcome<R, W>, Error> {
         match self.writer.shutdown().await {
             // The peer reset the connection first: it is already closed.
-            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {
+            Err(error) if error.kind() == http_kit_io::io::ErrorKind::NotConnected => {
                 tracing::debug!("the peer closed the connection before its shutdown");
             }
             result => result?,
@@ -463,11 +473,13 @@ fn rejection(status: StatusCode) -> Bytes {
 
 /// The `Date` value, formatted once per second.
 #[derive(Debug, Default)]
+#[cfg(feature = "std")]
 struct DateCache {
     second: u64,
     value: Option<HeaderValue>,
 }
 
+#[cfg(feature = "std")]
 impl DateCache {
     fn get(&mut self) -> &HeaderValue {
         let now = SystemTime::now();
