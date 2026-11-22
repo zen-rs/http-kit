@@ -16,11 +16,14 @@
 //! stated, so one implementation can serve either.
 
 use alloc::boxed::Box;
+#[cfg(feature = "http-body")]
 use bytes::Bytes;
 use core::pin::Pin;
 use futures_lite::{Stream, StreamExt};
 
-use crate::body::{into_bytes::IntoBytes, source::StreamSource, BodyFrame, Error, FrameSource};
+#[cfg(feature = "http-body")]
+use crate::body::into_bytes::IntoBytes;
+use crate::body::{source::StreamSource, BodyFrame, Error, FrameSource};
 
 mod sealed {
     pub trait Sealed {}
@@ -35,6 +38,7 @@ pub trait Flavor: sealed::Sealed + Sized + 'static {
     #[doc(hidden)]
     type Frames: ?Sized + FrameSource;
     /// An `http_body::Body`, as a body of this flavour holds it.
+    #[cfg(feature = "http-body")]
     #[doc(hidden)]
     type HttpBody: ?Sized + http_body::Body<Data = Bytes, Error = Error>;
 }
@@ -52,11 +56,13 @@ impl sealed::Sealed for Local {}
 
 impl Flavor for Shared {
     type Frames = dyn FrameSource + Send + Sync;
+    #[cfg(feature = "http-body")]
     type HttpBody = dyn http_body::Body<Data = Bytes, Error = Error> + Send + Sync;
 }
 
 impl Flavor for Local {
     type Frames = dyn FrameSource;
+    #[cfg(feature = "http-body")]
     type HttpBody = dyn http_body::Body<Data = Bytes, Error = Error>;
 }
 
@@ -83,6 +89,7 @@ pub trait Holds<T>: Flavor {
         T: FrameSource + 'static;
 
     /// Boxes an `http_body::Body`.
+    #[cfg(feature = "http-body")]
     #[doc(hidden)]
     fn http_body(body: T) -> Pin<Box<Self::HttpBody>>
     where
@@ -120,6 +127,7 @@ impl<T: Send + Sync> Holds<T> for Shared {
         Box::pin(source)
     }
 
+    #[cfg(feature = "http-body")]
     fn http_body(body: T) -> Pin<Box<Self::HttpBody>>
     where
         T: http_body::Body + 'static,
@@ -148,6 +156,7 @@ impl<T> Holds<T> for Local {
         Box::pin(source)
     }
 
+    #[cfg(feature = "http-body")]
     fn http_body(body: T) -> Pin<Box<Self::HttpBody>>
     where
         T: http_body::Body + 'static,

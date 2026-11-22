@@ -27,18 +27,24 @@ use core::convert::Infallible;
 use core::fmt::{self, Debug, Display};
 use http::StatusCode;
 
+#[cfg(feature = "std")]
+use eyre::Report;
+#[cfg(not(feature = "std"))]
+type Report = Box<dyn core::error::Error + Send + Sync + 'static>;
+
 /// A concrete error type for HTTP operations.
 ///
 /// Note that this type doesn't implement `HttpError` directly, but also provide `status` method
 /// to get the associated status code.
 #[derive(Debug)]
 pub struct Error {
-    inner: eyre::Report,
+    inner: Report,
     status: StatusCode,
 }
 
 impl Error {
     /// Create a new error with a custom message.
+    #[cfg(feature = "std")]
     pub fn msg(msg: impl Display + Send + Sync + Debug + 'static) -> Self {
         Self {
             inner: eyre::Report::msg(msg),
@@ -46,16 +52,37 @@ impl Error {
         }
     }
 
+    /// Create a new error with a custom message.
+    #[cfg(not(feature = "std"))]
+    pub fn msg(msg: impl Display + Send + Sync + 'static) -> Self {
+        struct Message(alloc::string::String);
+        impl Display for Message {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                Display::fmt(&self.0, f)
+            }
+        }
+        impl Debug for Message {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                Display::fmt(&self.0, f)
+            }
+        }
+        impl core::error::Error for Message {}
+        Self {
+            inner: Box::new(Message(alloc::string::ToString::to_string(&msg))),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
     /// Create a new error from any standard error type.
-    pub fn new(e: impl Into<eyre::Report>) -> Self {
+    pub fn new(e: impl Into<Report>) -> Self {
         Self {
             inner: e.into(),
             status: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
-    /// Consume the error and return the inner `eyre::Report`.
-    pub fn into_inner(self) -> eyre::Report {
+    /// Consume the error and return the inner error report.
+    pub fn into_inner(self) -> Report {
         self.inner
     }
 
@@ -151,7 +178,7 @@ pub trait ResultExt<T> {
 
 impl<T, E> ResultExt<T> for core::result::Result<T, E>
 where
-    E: Into<eyre::Report>,
+    E: Into<Report>,
 {
     fn status(self, status: StatusCode) -> Result<T, Error> {
         self.map_err(|e| Error::new(e).set_status(status))
@@ -171,7 +198,7 @@ pub type BoxHttpError = Box<dyn HttpError>;
 
 impl<E> From<E> for Error
 where
-    E: Into<eyre::Report>,
+    E: Into<Report>,
 {
     fn from(e: E) -> Self {
         Error::new(e)

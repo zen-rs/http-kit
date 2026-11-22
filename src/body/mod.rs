@@ -79,6 +79,7 @@
 mod convert;
 mod error_type;
 mod frame;
+#[cfg(feature = "http-body")]
 pub(crate) mod into_bytes;
 pub(crate) mod source;
 use crate::flavor::{Flavor, Holds, Local, Shared};
@@ -91,7 +92,9 @@ pub use source::{FrameSource, PipeOffer};
 #[cfg(feature = "std")]
 extern crate std;
 use futures_lite::{ready, Stream, StreamExt};
+#[cfg(feature = "http-body")]
 use http_body::Frame;
+#[cfg(feature = "mime")]
 use mime::Mime;
 
 use bytestr::ByteStr;
@@ -104,6 +107,7 @@ use core::mem::{replace, swap, take};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+#[cfg(feature = "http-body")]
 pub use http_body::Body as HttpBody;
 
 /// A body whose sources are `Send + Sync`, so it may cross threads.
@@ -148,6 +152,7 @@ pub type LocalBody = GenericBody<Local>;
 /// }
 /// ```
 pub struct GenericBody<F: Flavor> {
+    #[cfg(feature = "mime")]
     mime: Option<Mime>,
     inner: BodyInner<F>,
 }
@@ -172,6 +177,7 @@ enum BodyInner<F: Flavor> {
     #[cfg(feature = "fs")]
     Reading(FileRegionStream),
     Frames(Frames<F>),
+    #[cfg(feature = "http-body")]
     HttpBody(Pin<Box<F::HttpBody>>),
     Freeze,
 }
@@ -187,6 +193,7 @@ struct Frames<F: Flavor> {
 }
 
 /// Converts an `http_body` frame, which is either data or trailers.
+#[cfg(feature = "http-body")]
 fn from_http_frame(frame: Frame<Bytes>) -> BodyFrame {
     match frame.into_data() {
         Ok(data) => BodyFrame::Data(data),
@@ -219,6 +226,7 @@ impl<F: Flavor> GenericBody<F> {
     /// ```
     pub const fn empty() -> Self {
         Self {
+            #[cfg(feature = "mime")]
             mime: None,
             inner: BodyInner::Once(Bytes::new()),
         }
@@ -244,6 +252,7 @@ impl<F: Flavor> GenericBody<F> {
     /// let http_body = Full::new(Bytes::from("Hello, world!"));
     /// let body = Body::new(http_body);
     /// ```
+    #[cfg(feature = "http-body")]
     pub fn new<B>(body: B) -> Self
     where
         B: http_body::Body + 'static,
@@ -252,6 +261,7 @@ impl<F: Flavor> GenericBody<F> {
         F: Holds<B>,
     {
         Self {
+            #[cfg(feature = "mime")]
             mime: None,
             inner: BodyInner::HttpBody(F::http_body(body)),
         }
@@ -275,6 +285,7 @@ impl<F: Flavor> GenericBody<F> {
     /// ```
     pub const fn frozen() -> Self {
         Self {
+            #[cfg(feature = "mime")]
             mime: None,
             inner: BodyInner::Freeze,
         }
@@ -326,6 +337,7 @@ impl<F: Flavor> GenericBody<F> {
         F: Holds<S>,
     {
         Self {
+            #[cfg(feature = "mime")]
             mime: None,
             inner: BodyInner::Frames(Frames {
                 stream: F::source(source),
@@ -344,6 +356,7 @@ impl<F: Flavor> GenericBody<F> {
         F: Holds<S>,
     {
         Self {
+            #[cfg(feature = "mime")]
             mime: None,
             inner: BodyInner::Frames(Frames {
                 stream: F::frames(stream, map),
@@ -446,6 +459,7 @@ impl<F: Flavor> GenericBody<F> {
     /// ```
     pub fn from_bytes(data: impl Into<Bytes>) -> Self {
         Self {
+            #[cfg(feature = "mime")]
             mime: Some(mime::APPLICATION_OCTET_STREAM),
             inner: BodyInner::Once(data.into()),
         }
@@ -474,6 +488,7 @@ impl<F: Flavor> GenericBody<F> {
     /// ```
     pub fn from_text(str: impl Into<ByteStr>) -> Self {
         Self {
+            #[cfg(feature = "mime")]
             mime: Some(mime::TEXT_PLAIN_UTF_8),
             inner: BodyInner::Once(str.into().into()),
         }
@@ -571,6 +586,7 @@ impl<F: Flavor> GenericBody<F> {
     #[cfg(feature = "json")]
     pub fn from_json<T: serde::Serialize>(value: T) -> Result<Self, serde_json::Error> {
         Ok(Self {
+            #[cfg(feature = "mime")]
             mime: Some(mime::APPLICATION_JSON),
             ..Self::from_bytes(serde_json::to_string(&value)?)
         })
@@ -617,6 +633,7 @@ impl<F: Flavor> GenericBody<F> {
     #[cfg(feature = "form")]
     pub fn from_form<T: serde::Serialize>(value: T) -> Result<Self, serde_urlencoded::ser::Error> {
         Ok(Self {
+            #[cfg(feature = "mime")]
             mime: Some(mime::APPLICATION_WWW_FORM_URLENCODED),
             ..Self::from_bytes(serde_urlencoded::to_string(value)?)
         })
@@ -655,6 +672,7 @@ impl<F: Flavor> GenericBody<F> {
         F: Holds<S>,
     {
         Self {
+            #[cfg(feature = "mime")]
             mime: Some(mime::TEXT_EVENT_STREAM),
             ..Self::from_mapped_frames(s, |result: Result<Event, E>| {
                 result.map(|event| BodyFrame::Data(Bytes::from(event.encode().into_bytes())))
@@ -663,11 +681,13 @@ impl<F: Flavor> GenericBody<F> {
     }
 
     /// Returns the MIME type of the body, if known.
+    #[cfg(feature = "mime")]
     pub fn mime(&self) -> Option<&Mime> {
         self.mime.as_ref()
     }
 
     /// Sets the MIME type of the body.
+    #[cfg(feature = "mime")]
     pub fn with_mime(mut self, mime: Mime) -> Self {
         self.mime = Some(mime);
         self
@@ -702,7 +722,9 @@ impl<F: Flavor> GenericBody<F> {
             BodyInner::File(region) => usize::try_from(region.len()).ok(),
             #[cfg(feature = "fs")]
             BodyInner::Reading(stream) => usize::try_from(stream.remaining()).ok(),
-            BodyInner::Frames(_) | BodyInner::HttpBody(_) | BodyInner::Freeze => None,
+            #[cfg(feature = "http-body")]
+            BodyInner::HttpBody(_) => None,
+            BodyInner::Frames(_) | BodyInner::Freeze => None,
         }
     }
 
@@ -765,8 +787,7 @@ impl<F: Flavor> GenericBody<F> {
         let Some(second) = data.try_next().await? else {
             return Ok(first);
         };
-        let remaining = http_body::Body::size_hint(&data.body);
-        let remaining = remaining.upper().unwrap_or(remaining.lower());
+        let remaining = data.body.remaining_hint();
         let mut vec = Vec::with_capacity(
             first.len() + second.len() + usize::try_from(remaining).unwrap_or_default(),
         );
@@ -1154,10 +1175,32 @@ impl<F: Flavor> GenericBody<F> {
     pub fn try_clone(&self) -> Option<Self> {
         match &self.inner {
             BodyInner::Once(bytes) => Some(Self {
+                #[cfg(feature = "mime")]
                 mime: self.mime.clone(),
                 inner: BodyInner::Once(bytes.clone()),
             }),
             _ => None,
+        }
+    }
+
+    fn remaining_hint(&self) -> u64 {
+        match &self.inner {
+            BodyInner::Once(bytes) => bytes.len() as u64,
+            #[cfg(feature = "fs")]
+            BodyInner::File(region) => region.len(),
+            #[cfg(feature = "fs")]
+            BodyInner::Reading(stream) => stream.remaining(),
+            #[cfg(feature = "fs")]
+            BodyInner::Frames(Frames {
+                reading: Some(reading),
+                ..
+            }) => reading.remaining(),
+            #[cfg(feature = "http-body")]
+            BodyInner::HttpBody(body) => {
+                let hint = body.size_hint();
+                hint.upper().unwrap_or(hint.lower())
+            }
+            BodyInner::Frames(_) | BodyInner::Freeze => 0,
         }
     }
 
@@ -1172,16 +1215,12 @@ impl<F: Flavor> GenericBody<F> {
         }
     }
 
-    /// Polls the next frame with every file region read out as data: the
-    /// shape of `http_body::Body`, which has no frame for a file.
-    ///
-    /// A pipe frame is read out whole (it holds bytes already, so this never
-    /// waits); no offer is made, so a source only produces one that ignores
-    /// that.
-    fn poll_read_frame(
+    /// Polls the next data or trailers frame, with every file region and pipe
+    /// frame read out as data.
+    fn poll_data_or_trailers(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+    ) -> Poll<Option<Result<BodyFrame, Error>>> {
         #[cfg(any(
             feature = "fs",
             all(feature = "pipe", any(target_os = "linux", target_os = "android"))
@@ -1194,11 +1233,11 @@ impl<F: Flavor> GenericBody<F> {
                 Some(Ok(BodyFrame::Pipe(pipe))) => {
                     let data = pipe
                         .read_out()
-                        .map(|(data, _pipe)| Frame::data(data))
+                        .map(|(data, _pipe)| BodyFrame::Data(data))
                         .map_err(Error::from);
                     return Poll::Ready(Some(data));
                 }
-                frame => return Poll::Ready(frame.map(|frame| frame.map(into_http_frame))),
+                frame => return Poll::Ready(frame),
             }
         }
         #[cfg(not(any(
@@ -1206,6 +1245,20 @@ impl<F: Flavor> GenericBody<F> {
             all(feature = "pipe", any(target_os = "linux", target_os = "android"))
         )))]
         self.poll_frames(cx, None)
+    }
+
+    /// Polls the next frame with every file region read out as data: the
+    /// shape of `http_body::Body`, which has no frame for a file.
+    ///
+    /// A pipe frame is read out whole (it holds bytes already, so this never
+    /// waits); no offer is made, so a source only produces one that ignores
+    /// that.
+    #[cfg(feature = "http-body")]
+    fn poll_read_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        self.poll_data_or_trailers(cx)
             .map(|frame| frame.map(|frame| frame.map(into_http_frame)))
     }
 
@@ -1272,6 +1325,7 @@ impl<F: Flavor> GenericBody<F> {
                 }
                 frames.stream.as_mut().poll_next_frame(cx, offer)
             }
+            #[cfg(feature = "http-body")]
             BodyInner::HttpBody(body) => body
                 .as_mut()
                 .poll_frame(cx)
@@ -1283,6 +1337,7 @@ impl<F: Flavor> GenericBody<F> {
 
 /// Converts a data or trailers frame; file regions and pipes are read out
 /// before this.
+#[cfg(feature = "http-body")]
 fn into_http_frame(frame: BodyFrame) -> Frame<Bytes> {
     match frame {
         BodyFrame::Data(data) => Frame::data(data),
@@ -1315,11 +1370,11 @@ impl<F: Flavor> Stream for DataStream<F> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            let Some(frame) = ready!(self.body.poll_read_frame(cx)) else {
-                return Poll::Ready(None);
-            };
-            if let Ok(data) = frame?.into_data() {
-                return Poll::Ready(Some(Ok(data)));
+            match ready!(self.body.poll_data_or_trailers(cx)) {
+                None => return Poll::Ready(None),
+                Some(Ok(BodyFrame::Data(data))) => return Poll::Ready(Some(Ok(data))),
+                Some(Ok(_)) => {}
+                Some(Err(err)) => return Poll::Ready(Some(Err(err))),
             }
         }
     }
@@ -1348,6 +1403,7 @@ impl From<Body> for LocalBody {
                     reading: frames.reading,
                 })
             }
+            #[cfg(feature = "http-body")]
             BodyInner::HttpBody(body) => {
                 let body: Pin<Box<<Local as Flavor>::HttpBody>> = body;
                 BodyInner::HttpBody(body)
@@ -1355,6 +1411,7 @@ impl From<Body> for LocalBody {
             BodyInner::Freeze => BodyInner::Freeze,
         };
         Self {
+            #[cfg(feature = "mime")]
             mime: body.mime,
             inner,
         }
@@ -1394,13 +1451,16 @@ impl<F: Flavor> Stream for GenericBody<F> {
                 }
                 (lower, upper)
             }
-            BodyInner::HttpBody(_) | BodyInner::Freeze => (0, None),
+            #[cfg(feature = "http-body")]
+            BodyInner::HttpBody(_) => (0, None),
+            BodyInner::Freeze => (0, None),
         }
     }
 }
 
 /// Data and trailers, with each file region read out into data frames
 /// through [`FileRegion::into_stream`].
+#[cfg(feature = "http-body")]
 impl<F: Flavor> http_body::Body for GenericBody<F> {
     type Data = Bytes;
 

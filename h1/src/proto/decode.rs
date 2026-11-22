@@ -1,6 +1,8 @@
 //! Decoding received message bodies.
 
+use alloc::{vec, vec::Vec};
 use bytes::{Buf, Bytes, BytesMut};
+use core::ops::Range;
 use http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::{Limits, ParseError, proto::BodyKind};
@@ -301,7 +303,7 @@ fn trailer_section(buf: &mut BytesMut, limits: &Limits) -> Result<Option<HeaderM
     Ok(Some(map))
 }
 
-type FieldRanges = Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>;
+type FieldRanges = Vec<(Range<usize>, Range<usize>)>;
 
 /// The trailer section's length and the ranges of each field's name and
 /// value, or `None` while it is incomplete.

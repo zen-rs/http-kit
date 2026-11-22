@@ -1,6 +1,7 @@
 //! Encoding outgoing message heads and framing their bodies.
 
-use std::fmt::Write as _;
+use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use http::{
