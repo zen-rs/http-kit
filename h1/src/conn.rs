@@ -39,9 +39,13 @@ pub(crate) struct Recv<R> {
 
 impl<R: ReadOwned> Recv<R> {
     pub(crate) fn new(reader: R, read_size: usize) -> Self {
+        Self::with_buf(reader, BytesMut::new(), read_size)
+    }
+
+    pub(crate) fn with_buf(reader: R, buf: BytesMut, read_size: usize) -> Self {
         Self {
             reader,
-            buf: BytesMut::new(),
+            buf,
             read_size,
         }
     }

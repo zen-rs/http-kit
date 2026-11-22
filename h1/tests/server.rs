@@ -4,7 +4,7 @@ mod support;
 
 use std::{cell::RefCell, rc::Rc};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_lite::{StreamExt as _, future::block_on, future::zip, stream};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use http_kit::{Body, BodyFrame, Request, Response};
@@ -71,6 +71,54 @@ fn pipelined_requests_are_answered_in_order() {
         );
         assert_eq!(text(&wire), expected);
     });
+}
+
+#[test]
+fn seeded_read_buf_serves_partial_and_complete_heads_with_body_intact() {
+    for split_at in [4, 24] {
+        block_on(async {
+            let ends = connection();
+            let (reader, writer) = ends.server;
+            let (mut client_in, mut client_out) = ends.client;
+            let service = |request: Request| async move {
+                let path = request.uri().path().to_owned();
+                let body = request
+                    .into_body()
+                    .into_bytes()
+                    .await
+                    .expect("request body");
+                Response::new(Body::from_bytes(format!(
+                    "{path}:{}",
+                    std::str::from_utf8(&body).expect("UTF-8 body")
+                )))
+            };
+            let full = format!(
+                "POST /sniffed HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{CJK}",
+                CJK.len()
+            );
+            let (seeded, rest) = full.as_bytes().split_at(split_at);
+            client_out.send(rest);
+            client_out.close();
+
+            let conn = ServerConnection::with_read_buf(
+                reader,
+                writer,
+                BytesMut::from(seeded),
+                NeverTimer,
+                config(),
+            );
+            let (outcome, wire) = zip(conn.serve(&service), client_in.read_to_end()).await;
+            assert!(matches!(outcome.unwrap(), ServerOutcome::Closed));
+            let reply = format!("/sniffed:{CJK}");
+            assert_eq!(
+                text(&wire),
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{reply}",
+                    reply.len()
+                )
+            );
+        });
+    }
 }
 
 #[test]
