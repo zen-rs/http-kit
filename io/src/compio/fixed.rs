@@ -367,7 +367,7 @@ async fn probe_vectored(region: &Region) -> io::Result<bool> {
         INDEX,
         SendFlags::empty(),
     );
-    let res = super::zero_copy::send(op).await;
+    let res = super::zero_copy::send(op, None).await;
     Ok(!matches!(res, Err(e) if e.raw_os_error() == Some(libc::EINVAL)))
 }
 
@@ -660,7 +660,7 @@ async fn send<S: Socket, T: ::compio::driver::OpCode + 'static>(
     op: T,
 ) -> io::Result<usize> {
     match stream.file.address(op) {
-        Ok(op) => super::zero_copy::send(op).await,
+        Ok(op) => super::zero_copy::send(op, Some(&stream.zc_reaper)).await,
         Err((e, _)) => Err(e),
     }
 }

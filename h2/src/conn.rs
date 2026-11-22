@@ -175,15 +175,54 @@ impl Outbox {
     }
 
     pub(crate) async fn flush<W: Write>(&mut self, writer: &mut W) -> Result<(), Error> {
-        if self.bufs.is_empty() {
-            return Ok(());
-        }
-        let bufs = mem::take(&mut self.bufs);
-        let BufResult(result, returned) = writer.write_all_owned(bufs).await;
-        if let Some(mut bufs) = returned {
-            bufs.clear();
-            self.bufs = bufs;
-        }
+        let result = match self.bufs.len() {
+            0 => return Ok(()),
+            1 => {
+                let mut drain = self.bufs.drain(..);
+                let batch = [drain.next().expect("checked len")];
+                drop(drain);
+                writer.write_all_owned(batch).await.0
+            }
+            2 => {
+                let mut drain = self.bufs.drain(..);
+                let batch = [
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                ];
+                drop(drain);
+                writer.write_all_owned(batch).await.0
+            }
+            3 => {
+                let mut drain = self.bufs.drain(..);
+                let batch = [
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                ];
+                drop(drain);
+                writer.write_all_owned(batch).await.0
+            }
+            4 => {
+                let mut drain = self.bufs.drain(..);
+                let batch = [
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                    drain.next().expect("checked len"),
+                ];
+                drop(drain);
+                writer.write_all_owned(batch).await.0
+            }
+            _ => {
+                let bufs = mem::take(&mut self.bufs);
+                let BufResult(result, returned) = writer.write_all_owned(bufs).await;
+                if let Some(mut bufs) = returned {
+                    bufs.clear();
+                    self.bufs = bufs;
+                }
+                result
+            }
+        };
         result.map_err(Error::from)
     }
 

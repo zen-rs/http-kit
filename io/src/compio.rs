@@ -664,6 +664,10 @@ pub struct Stream<S> {
     /// zero-copy write whose bytes lie in it is sent from.
     #[cfg(target_os = "linux")]
     fixed: Option<FixedRegion>,
+    /// Pending zero-copy notifications for sends whose buffers are still held
+    /// by the kernel.
+    #[cfg(target_os = "linux")]
+    zc_reaper: zero_copy::Reaper,
 }
 
 #[expect(
@@ -696,6 +700,8 @@ impl<S: Socket> Stream<S> {
             recv_empty: std::cell::Cell::new(false),
             #[cfg(target_os = "linux")]
             fixed: sealed::Scope::fixed_region(&io.scope).and_then(FixedRegion::for_stream),
+            #[cfg(target_os = "linux")]
+            zc_reaper: zero_copy::Reaper::default(),
         }
     }
 
@@ -1725,7 +1731,14 @@ mod files {
 /// Zero-copy sends on io_uring.
 #[cfg(target_os = "linux")]
 mod zero_copy {
-    use std::{io, rc::Rc};
+    use std::{
+        cell::RefCell,
+        future::poll_fn,
+        io,
+        pin::Pin,
+        rc::Rc,
+        task::{Context, Poll, Waker},
+    };
 
     use ::compio::driver::{
         OpCode,
@@ -1733,9 +1746,88 @@ mod zero_copy {
     };
     use compio_buf::{BufResult, IoVectoredBuf};
     use futures_core::stream::FusedStream as _;
-    use futures_lite::StreamExt as _;
+    use futures_lite::{StreamExt as _, future::poll_once};
 
     use super::{Socket, Stream};
+
+    /// Reaps `IORING_CQE_F_NOTIF` completions for one stream without spawning
+    /// a runtime task per write. Allocates nothing unless a send completes
+    /// before its notification CQE has arrived.
+    #[derive(Default)]
+    pub(super) struct Reaper(RefCell<Option<Rc<RefCell<ReaperState>>>>);
+
+    #[derive(Default)]
+    struct ReaperState {
+        pending: Vec<Pin<Box<dyn PendingNotif>>>,
+        waker: Option<Waker>,
+        running: bool,
+        closed: bool,
+    }
+
+    trait PendingNotif {
+        fn poll_done(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()>;
+    }
+
+    impl<T: OpCode + 'static> PendingNotif for ::compio::runtime::SubmitMulti<T> {
+        fn poll_done(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            while !self.is_terminated() {
+                if std::task::ready!(futures_core::Stream::poll_next(self.as_mut(), cx)).is_none() {
+                    break;
+                }
+            }
+            Poll::Ready(())
+        }
+    }
+
+    impl Reaper {
+        fn push<T: OpCode + 'static>(&self, op: ::compio::runtime::SubmitMulti<T>) {
+            let shared = {
+                let mut slot = self.0.borrow_mut();
+                Rc::clone(slot.get_or_insert_with(|| Rc::new(RefCell::new(ReaperState::default()))))
+            };
+            let mut state = shared.borrow_mut();
+            state.pending.push(Box::pin(op));
+            if !state.running {
+                state.running = true;
+                let task_state = Rc::clone(&shared);
+                drop(state);
+                ::compio::runtime::spawn(async move {
+                    poll_fn(|cx| {
+                        let mut s = task_state.borrow_mut();
+                        s.pending
+                            .retain_mut(|item| item.as_mut().poll_done(cx).is_pending());
+                        if s.pending.is_empty() && s.closed {
+                            s.running = false;
+                            Poll::Ready(())
+                        } else {
+                            s.waker = Some(cx.waker().clone());
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                })
+                .detach();
+            } else if let Some(waker) = state.waker.take() {
+                drop(state);
+                waker.wake();
+            }
+        }
+    }
+
+    impl Drop for Reaper {
+        fn drop(&mut self) {
+            if let Some(shared) = self.0.get_mut().take() {
+                let waker = {
+                    let mut state = shared.borrow_mut();
+                    state.closed = true;
+                    state.waker.take()
+                };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
+        }
+    }
 
     /// The caller's buffers, shared by the sends of one write: a short send
     /// is continued by another while the first still holds what it sent.
@@ -1770,7 +1862,7 @@ mod zero_copy {
             let res = if zero_copy {
                 let op = SendVectoredZc::new(stream.inner.shared_fd(), rest, flags);
                 match stream.file.address(op) {
-                    Ok(op) => send(op).await,
+                    Ok(op) => send(op, Some(&stream.zc_reaper)).await,
                     Err((e, _)) => Err(e),
                 }
             } else {
@@ -1797,23 +1889,33 @@ mod zero_copy {
     }
 
     /// Submits a zero-copy send and returns what the send itself completed
-    /// with, as soon as it has. The operation, with the buffers it holds,
-    /// goes to a task of the runtime until the kernel's notification that it
-    /// no longer reads them, which drops them.
-    ///
-    /// It takes any zero-copy operation, whatever buffers it sends from.
-    pub(super) async fn send<T: OpCode + 'static>(op: T) -> io::Result<usize> {
+    /// with, as soon as it has. Any notification CQE already delivered in the
+    /// same batch is drained immediately; otherwise the operation goes to the
+    /// stream's single reaper until the kernel releases its buffers.
+    pub(super) async fn send<T: OpCode + 'static>(
+        op: T,
+        reaper: Option<&Reaper>,
+    ) -> io::Result<usize> {
         let mut op = ::compio::runtime::submit_multi(op);
         let BufResult(res, _) = op
             .next()
             .await
             .expect("a submitted operation completes at least once");
+        // Drain a notification CQE already sitting in the proactor so `op`
+        // finishes in place without touching the reaper.
+        while !op.is_terminated() && poll_once(op.next()).await.is_some() {}
         // The send's own completion carries `IORING_CQE_F_MORE` when a
         // notification follows. Without one (an error the kernel posts
         // alone, or a kernel without the operation, where compio sends by
         // copying) the first completion is the last.
         if !op.is_terminated() {
-            ::compio::runtime::spawn(async move { while op.next().await.is_some() {} }).detach();
+            match reaper {
+                Some(reaper) => reaper.push(op),
+                None => {
+                    ::compio::runtime::spawn(async move { while op.next().await.is_some() {} })
+                        .detach();
+                }
+            }
         }
         res
     }
